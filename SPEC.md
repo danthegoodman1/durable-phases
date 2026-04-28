@@ -110,14 +110,16 @@ const Workflow = defineWorkflow({
 A phase has exactly one mode:
 
 ```ts
-phase({ state, on })
+phase({ state?, on })
 ```
 
 or:
 
 ```ts
-phase({ state, run })
+phase({ state?, run })
 ```
+
+If `state` is omitted, it is treated as an empty object schema.
 
 `on` phases wait for external/durable events.
 

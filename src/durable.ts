@@ -195,7 +195,7 @@ export function defineWorkflow<Input, Output, Common>(
 }
 
 export function phase(definition: {
-  state: Schema<any>
+  state?: Schema<any>
   run?: (args: RunArgs) => Promise<TransitionCommand> | TransitionCommand
   on?: Record<string, WaitDefinition>
 }): PhaseDefinition {
@@ -204,7 +204,7 @@ export function phase(definition: {
   }
 
   return {
-    state: definition.state,
+    state: definition.state ?? z.object({}),
     mode: definition.run ? "run" : "on",
     run: definition.run,
     on: definition.on,

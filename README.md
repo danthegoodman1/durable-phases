@@ -10,13 +10,11 @@ npm run demo
 npm test
 ```
 
-The hello-world demo in [`src/hello-world.ts`](src/hello-world.ts) shows:
+The demos in [`src/demos/`](src/demos/) are intentionally small:
 
-- immediate `run` phases
-- timer waits that survive runtime reconstruction
-- signal delivery and atomic consumption
-- `stay()` and `checkpoint()` as committed transitions
-- the bounded unbound-loop pattern
+- immediate `run` phases plus signal delivery
+- timer waits that survive runtime reconstruction plus `stay()`
+- `checkpoint()` and the bounded unbound-loop pattern
 - a tiny local child workflow
 
 This is intentionally not production-ready. It does not implement migrations,

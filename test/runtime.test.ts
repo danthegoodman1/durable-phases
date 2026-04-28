@@ -52,7 +52,6 @@ function makeWorkflowSuite(counters = { reminders: 0, processed: 0 }) {
     },
     phases: {
       done: phase({
-        state: z.object({}),
         run: async ({ common }) => complete({ value: `child:${common.value}` }),
       }),
     },
@@ -416,7 +415,6 @@ describe("durable workflow PoC", () => {
       },
       phases: {
         unstable: phase({
-          state: z.object({}),
           run: async ({ ctx }) => {
             const result = await ctx.activity("side_effect_once", () => {
               calls.activity += 1
