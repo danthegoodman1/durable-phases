@@ -1,0 +1,21 @@
+{
+  "name": "nodetsesmtemplate",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Node TS ESM Template",
+  "dependencies": {
+  },
+  "devDependencies": {
+      "@types/node": "^22.0.0",
+      "tsx": "^4.19.0",
+      "typescript": "~5.8.0"
+  },
+  "scripts": {
+      "start": "node dist/index.js",
+      "dev": "tsx src/index.ts",
+      "watch": "tsx watch src/index.ts",
+      "build": "tsc"
+  },
+  "author": "danthegoodman1",
+  "license": "ISC"
+}
