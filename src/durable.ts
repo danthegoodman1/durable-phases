@@ -98,6 +98,23 @@ export type QueryArgs<Output = unknown> = {
   snapshot: InstanceStatus<Output>
 }
 
+export type MigrationArgs = {
+  common: JsonObject
+  phase: PhaseSnapshot
+  fromVersion: number
+  toVersion: number
+}
+
+export type MigrationResult = {
+  common?: unknown
+  phase?: {
+    name: string
+    data: unknown
+  }
+}
+
+type MigrationDefinition = (args: MigrationArgs) => MigrationResult | Promise<MigrationResult>
+
 type SignalWait<Event = unknown> = {
   kind: "signal"
   schema: Schema<Event>
@@ -140,6 +157,7 @@ export type WorkflowDefinition<Input = any, Output = any, Common = any> = {
   phases: Record<string, PhaseDefinition>
   on?: Record<string, SignalWait>
   queries?: Record<string, QueryDefinition>
+  migrations?: Record<number, MigrationDefinition>
 }
 
 export type AnyWorkflow = WorkflowDefinition<any, any, any>
@@ -338,6 +356,7 @@ type CommitCheckpointInput = {
   runId: string
   expectedSequence: number
   activationId: string
+  workflowVersion: number
   next: InstanceStatus<any>
   waits: DurableWait[]
   now: string
@@ -346,6 +365,13 @@ type CommitCheckpointInput = {
 }
 
 type ReadyActivation =
+  | {
+      kind: "migration"
+      workflow: AnyWorkflow
+      instance: PersistedInstance
+      activationId: string
+      sort: string[]
+    }
   | {
       kind: "run"
       workflow: AnyWorkflow
@@ -652,6 +678,7 @@ export class JsonFileDurabilityProvider {
     }
 
     instance.sequence = nextSequence
+    instance.workflowVersion = input.workflowVersion
     instance.waits = clone(input.waits)
     instance.updatedAt = input.now
 
@@ -873,6 +900,27 @@ export class DurableRuntime {
         continue
       }
 
+      if (instance.workflowVersion < workflow.version) {
+        ready.push({
+          kind: "migration",
+          workflow,
+          instance,
+          activationId: activationId(
+            instance,
+            "migration",
+            `${instance.workflowVersion}->${workflow.version}`,
+          ),
+          sort: [instance.updatedAt, "migration", instance.workflowId],
+        })
+        continue
+      }
+
+      if (instance.workflowVersion > workflow.version) {
+        throw new Error(
+          `Workflow ${workflow.name} instance ${instance.workflowId}/${instance.runId} is at newer version ${instance.workflowVersion}; worker only has version ${workflow.version}`,
+        )
+      }
+
       for (const wait of instance.waits) {
         if (wait.kind === "run") {
           ready.push({
@@ -977,6 +1025,23 @@ export class DurableRuntime {
     }
 
     const workflow = activation.workflow
+
+    if (activation.kind === "migration") {
+      const next = await this.migrateSnapshot(workflow, latest)
+      const waits = this.materializeWaits(workflow, latest, next)
+      await this.provider.commitCheckpoint({
+        workflowId: latest.workflowId,
+        runId: latest.runId,
+        expectedSequence: latest.sequence,
+        activationId: activation.activationId,
+        workflowVersion: workflow.version,
+        next,
+        waits,
+        now: this.now(),
+      })
+      return
+    }
+
     const common = commonSchema(workflow).parse(latest.common)
     const phaseSnapshot = latest.phase
     if (!phaseSnapshot) {
@@ -1037,6 +1102,7 @@ export class DurableRuntime {
       runId: latest.runId,
       expectedSequence: latest.sequence,
       activationId: activation.activationId,
+      workflowVersion: workflow.version,
       next,
       waits,
       now: this.now(),
@@ -1200,6 +1266,57 @@ export class DurableRuntime {
     }
 
     return { status: "failed", error: transition.error }
+  }
+
+  private async migrateSnapshot(
+    workflow: AnyWorkflow,
+    instance: PersistedInstance,
+  ): Promise<InstanceStatus<any>> {
+    if (instance.workflowVersion > workflow.version) {
+      throw new Error(
+        `Cannot migrate ${workflow.name} ${instance.workflowId}/${instance.runId} from newer version ${instance.workflowVersion} to worker version ${workflow.version}`,
+      )
+    }
+
+    if (!instance.phase) {
+      throw new Error(`Running workflow ${instance.workflowId} has no phase to migrate`)
+    }
+
+    let common = clone(instance.common ?? {})
+    let phaseSnapshot = clone(instance.phase)
+
+    for (let version = instance.workflowVersion; version < workflow.version; version += 1) {
+      const migration = workflow.migrations?.[version]
+      if (!migration) {
+        continue
+      }
+
+      const result = await migration({
+        common,
+        phase: phaseSnapshot,
+        fromVersion: version,
+        toVersion: version + 1,
+      })
+
+      common = toJsonObject(result.common ?? common)
+      phaseSnapshot = normalizePhaseSnapshot(result.phase ?? phaseSnapshot)
+    }
+
+    const phaseDefinition = workflow.phases[phaseSnapshot.name]
+    if (!phaseDefinition) {
+      throw new Error(
+        `Migration for ${workflow.name} did not produce a known phase: ${phaseSnapshot.name}`,
+      )
+    }
+
+    return {
+      status: "running",
+      common: toJsonObject(commonSchema(workflow).parse(common)),
+      phase: {
+        name: phaseSnapshot.name,
+        data: toJsonObject(phaseDefinition.state.parse(phaseSnapshot.data)),
+      },
+    }
   }
 
   private materializeWaits(
@@ -1399,6 +1516,17 @@ function snapshotFromInstance(instance: PersistedInstance): InstanceStatus<any> 
   return { status: "failed", error: clone(instance.error ?? { message: "failed" }) }
 }
 
+function normalizePhaseSnapshot(value: unknown): PhaseSnapshot {
+  if (!isPlainObject(value) || typeof value.name !== "string") {
+    throw new Error("Migration must return a phase with a string name")
+  }
+
+  return {
+    name: value.name,
+    data: toJsonObject(value.data ?? {}),
+  }
+}
+
 function childHandle(record: ChildRecord): ChildHandle {
   return {
     workflowName: record.workflowName,
@@ -1421,7 +1549,14 @@ function compareSignals(left: SignalRecord, right: SignalRecord): number {
 }
 
 function compareActivations(left: ReadyActivation, right: ReadyActivation): number {
-  for (let index = 0; index < left.sort.length; index += 1) {
+  const length = Math.max(left.sort.length, right.sort.length)
+  for (let index = 0; index < length; index += 1) {
+    if (left.sort[index] === undefined) {
+      return -1
+    }
+    if (right.sort[index] === undefined) {
+      return 1
+    }
     const compared = left.sort[index].localeCompare(right.sort[index])
     if (compared !== 0) {
       return compared

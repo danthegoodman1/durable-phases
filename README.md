@@ -16,7 +16,7 @@ The demos in [`src/demos/`](src/demos/) are intentionally small:
 - timer waits that survive runtime reconstruction plus `stay()`
 - `checkpoint()` and the bounded unbound-loop pattern
 - a tiny local child workflow
+- checkpoint-boundary workflow migration
 
-This is intentionally not production-ready. It does not implement migrations,
-dispatch shards, leases, retries, heartbeats, remote children, or multi-writer
-storage.
+This is intentionally not production-ready. It does not implement dispatch
+shards, leases, retries, heartbeats, remote children, or multi-writer storage.

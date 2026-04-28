@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url"
 import { runChildWorkflowDemo } from "./child-workflow.js"
 import { runCheckpointLoopDemo } from "./checkpoint-loop.js"
 import { runImmediateAndSignalDemo } from "./immediate-and-signal.js"
+import { runMigrationDemo } from "./migration.js"
 import { runTimerStayRestartDemo } from "./timer-stay-restart.js"
 
 export async function runAllDemos(): Promise<void> {
@@ -9,6 +10,7 @@ export async function runAllDemos(): Promise<void> {
   await runTimerStayRestartDemo()
   await runCheckpointLoopDemo()
   await runChildWorkflowDemo()
+  await runMigrationDemo()
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

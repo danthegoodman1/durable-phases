@@ -51,6 +51,7 @@ function summarize(instance: PersistedInstance | null): unknown {
 
   if (instance.status === "running") {
     return {
+      workflowVersion: instance.workflowVersion,
       sequence: instance.sequence,
       status: instance.status,
       phase: instance.phase?.name,
@@ -60,6 +61,7 @@ function summarize(instance: PersistedInstance | null): unknown {
   }
 
   return {
+    workflowVersion: instance.workflowVersion,
     sequence: instance.sequence,
     status: instance.status,
     output: instance.output,

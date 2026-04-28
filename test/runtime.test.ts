@@ -452,4 +452,120 @@ describe("durable workflow PoC", () => {
       output: { ok: true },
     })
   })
+
+  it("migrates a running instance at a checkpoint boundary and recomputes waits", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const WorkflowV1 = defineWorkflow({
+      name: "migrating_order",
+      version: 1,
+      input: z.object({ customerId: z.string() }),
+      output: z.object({ message: z.string() }),
+      common: z.object({ customerId: z.string() }),
+      initial(input) {
+        return start({
+          common: { customerId: input.customerId },
+          phase: "waiting",
+          data: { salutation: "hello" },
+        })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ salutation: z.string() }),
+          on: {
+            finish: signal(z.object({ punctuation: z.string() }), async ({ common, data, event }) =>
+              complete({
+                message: `${data.salutation}, ${common.customerId}${event.punctuation}`,
+              }),
+            ),
+          },
+        }),
+      },
+    })
+
+    const WorkflowV2 = defineWorkflow({
+      name: "migrating_order",
+      version: 2,
+      input: z.object({ customerId: z.string() }),
+      output: z.object({ message: z.string() }),
+      common: z.object({ customerId: z.string(), plan: z.string() }),
+      initial(input) {
+        return start({
+          common: { customerId: input.customerId, plan: "pro" },
+          phase: "waiting_for_finish",
+          data: { greeting: "hello", migratedFrom: "initial" },
+        })
+      },
+      migrations: {
+        1: ({ common, phase }) => ({
+          common: {
+            ...common,
+            plan: "starter",
+          },
+          phase: {
+            name: "waiting_for_finish",
+            data: {
+              greeting: phase.data.salutation,
+              migratedFrom: phase.name,
+            },
+          },
+        }),
+      },
+      phases: {
+        waiting_for_finish: phase({
+          state: z.object({
+            greeting: z.string(),
+            migratedFrom: z.string(),
+          }),
+          on: {
+            finish: signal(z.object({ punctuation: z.string() }), async ({ common, data, event }) =>
+              complete({
+                message: `${data.greeting}, ${common.customerId} on ${common.plan}${event.punctuation}`,
+              }),
+            ),
+          },
+        }),
+      },
+    })
+
+    const providerV1 = new JsonFileDurabilityProvider(path)
+    const runtimeV1 = new DurableRuntime(providerV1, { clock: clock.clock, workflows: [WorkflowV1] })
+    const ref = await runtimeV1.start(
+      WorkflowV1,
+      { customerId: "Ada" },
+      { workflowId: "migration-1" },
+    )
+
+    expect(await providerV1.loadInstance(ref)).toMatchObject({
+      workflowVersion: 1,
+      sequence: 0,
+      phase: { name: "waiting", data: { salutation: "hello" } },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+    })
+
+    const providerV2 = new JsonFileDurabilityProvider(path)
+    const runtimeV2 = new DurableRuntime(providerV2, { clock: clock.clock, workflows: [WorkflowV2] })
+    await runtimeV2.drain({ maxActivations: 1 })
+
+    expect(await providerV2.loadInstance(ref)).toMatchObject({
+      workflowVersion: 2,
+      sequence: 1,
+      common: { customerId: "Ada", plan: "starter" },
+      phase: {
+        name: "waiting_for_finish",
+        data: { greeting: "hello", migratedFrom: "waiting" },
+      },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+    })
+
+    await runtimeV2.signal(WorkflowV2, ref, "finish", { punctuation: "!" })
+    await runtimeV2.drain()
+
+    expect(await providerV2.loadInstance(ref)).toMatchObject({
+      workflowVersion: 2,
+      sequence: 2,
+      status: "completed",
+      output: { message: "hello, Ada on starter!" },
+    })
+  })
 })
