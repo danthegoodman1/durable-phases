@@ -20,5 +20,5 @@ The hello-world demo in [`src/hello-world.ts`](src/hello-world.ts) shows:
 - a tiny local child workflow
 
 This is intentionally not production-ready. It does not implement migrations,
-dispatch shards, leases, retries, heartbeats, `.any(...)`, remote children, or
-multi-writer storage.
+dispatch shards, leases, retries, heartbeats, remote children, or multi-writer
+storage.

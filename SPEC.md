@@ -350,33 +350,32 @@ type ChildEvent<W> =
   | { ok: false; error: SerializedError }
 ```
 
-### Any wait ordering
+### Wait ordering
 
-A phase may race multiple waits using `.any(...)`.
+A phase's `on` map is a durable race across its declared signal, timer, and child waits.
 
-Conceptually, `.any(...)` is one named wait with multiple named branches:
+For example:
 
 ```ts
-first_response: any(
-  {
-    document_uploaded: signal(DocumentSchema),
-    customer_canceled: signal(CancelSchema),
-    reminder_due: timer(({ data }) => data.nextReminderAt),
-  },
-  async ({ data, event }) => {
-    switch (event.name) {
-      case "document_uploaded":
-        return stay({ documents: addDocument(data.documents, event.data) })
-      case "customer_canceled":
-        return cancel(event.data.reason)
-      case "reminder_due":
-        return stay({ nextReminderAt: daysFromNow(7) })
+on: {
+  document_uploaded: signal(DocumentSchema, async ({ data, event }) => {
+    return stay({ documents: addDocument(data.documents, event) })
+  }),
+
+  customer_canceled: signal(CancelSchema, async ({ event }) => {
+    return cancel(event.reason)
+  }),
+
+  reminder_due: timer(
+    ({ data }) => data.nextReminderAt,
+    async () => {
+      return stay({ nextReminderAt: daysFromNow(7) })
     }
-  }
-)
+  ),
+}
 ```
 
-The branch name becomes part of the delivered event. The runtime still consumes only the branch that wins the race.
+Each wait has its own handler. The runtime still consumes only the wait that wins the race.
 
 When more than one wait is ready, the runtime chooses the earliest ready event by a canonical ordering key.
 
@@ -395,7 +394,7 @@ time
 + durable event id
 ```
 
-This makes `.any(...)` deterministic even when two external events have the same timestamp.
+This makes phase wait selection deterministic even when two external events have the same timestamp.
 
 ---
 
@@ -910,7 +909,7 @@ completed children
 run phases that should execute immediately
 ```
 
-When more than one wait is ready for an instance, the provider and runtime must select the winner using the `.any(...)` ordering rules.
+When more than one wait is ready for an instance, the provider and runtime must select the winner using the canonical wait ordering rules.
 
 Claims are leased. If a worker crashes, another worker may claim the activation after the lease expires.
 
