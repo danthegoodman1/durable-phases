@@ -336,6 +336,10 @@ fn parse_migrations(input: ParseStream<'_>) -> Result<Vec<MigrationDef>> {
 
 fn expand_workflow(workflow: WorkflowDef) -> Result<TokenStream2> {
     let vis = workflow.vis;
+    let inner_workflow_vis = match &vis {
+        Visibility::Inherited => quote! { pub(super) },
+        _ => quote! { #vis },
+    };
     let workflow_ident = workflow.ident;
     let workflow_name = workflow.name;
     let workflow_version = workflow.version;
@@ -474,14 +478,14 @@ fn expand_workflow(workflow: WorkflowDef) -> Result<TokenStream2> {
         mod #module_ident {
             use super::*;
 
-            #[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize, PartialEq)]
+            #[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
             pub enum #phase_enum_ident {
                 #(#variant_defs,)*
             }
 
             #(#helper_defs)*
 
-            #vis struct #workflow_ident;
+            #inner_workflow_vis struct #workflow_ident;
 
             impl ::durable::DurablePhase for #phase_enum_ident {
                 fn phase_name(&self) -> &'static str {
@@ -578,7 +582,7 @@ fn expand_workflow(workflow: WorkflowDef) -> Result<TokenStream2> {
         }
 
         #[allow(unused_imports)]
-        #vis use #module_ident::{#workflow_ident, #phase_enum_ident};
+        #vis use self::#module_ident::{#workflow_ident, #phase_enum_ident};
     })
 }
 
