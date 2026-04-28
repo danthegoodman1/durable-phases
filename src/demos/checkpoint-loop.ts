@@ -19,11 +19,9 @@ const BatchWorkflow = defineWorkflow({
   version: 1,
   input: z.object({ items: z.array(z.string()) }),
   output: z.object({ processed: z.array(z.string()) }),
-  common: z.object({}),
 
   initial(input) {
     return start({
-      common: {},
       phase: "process_batch",
       data: {
         cursor: 0,

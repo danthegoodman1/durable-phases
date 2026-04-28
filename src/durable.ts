@@ -44,7 +44,7 @@ export type ChildHandle<W = AnyWorkflow> = InstanceRef & {
 
 export type StartCommand<Common = unknown, Data = unknown> = {
   kind: "start"
-  common: Common
+  common?: Common
   phase: string
   data: Data
 }
@@ -135,7 +135,7 @@ export type WorkflowDefinition<Input = any, Output = any, Common = any> = {
   version: number
   input: Schema<Input>
   output: Schema<Output>
-  common: Schema<Common>
+  common?: Schema<Common>
   initial(input: Input): StartCommand<Common, any>
   phases: Record<string, PhaseDefinition>
   on?: Record<string, SignalWait>
@@ -151,7 +151,7 @@ export type ChildEvent =
   | { ok: false; error: SerializedError }
 
 export function start<Common, Data>(input: {
-  common: Common
+  common?: Common
   phase: string
   data: Data
 }): StartCommand<Common, Data> {
@@ -977,7 +977,7 @@ export class DurableRuntime {
     }
 
     const workflow = activation.workflow
-    const common = workflow.common.parse(latest.common)
+    const common = commonSchema(workflow).parse(latest.common)
     const phaseSnapshot = latest.phase
     if (!phaseSnapshot) {
       throw new Error(`Running workflow ${latest.workflowId} has no phase`)
@@ -1299,7 +1299,7 @@ export class DurableRuntime {
 
     const snapshot: InstanceStatus = {
       status: "running",
-      common: toJsonObject(workflow.common.parse(startCommand.common)),
+      common: toJsonObject(commonSchema(workflow).parse(startCommand.common ?? {})),
       phase: {
         name: startCommand.phase,
         data: toJsonObject(phaseDefinition.state.parse(startCommand.data)),
@@ -1373,6 +1373,10 @@ function instanceKey(ref: InstanceRef): string {
 
 function normalizeRef(ref: InstanceRef | string): InstanceRef {
   return typeof ref === "string" ? { workflowId: ref, runId: "run-1" } : ref
+}
+
+function commonSchema(workflow: AnyWorkflow): Schema<any> {
+  return workflow.common ?? z.object({})
 }
 
 function snapshotFromInstance(instance: PersistedInstance): InstanceStatus<any> {

@@ -405,10 +405,8 @@ describe("durable workflow PoC", () => {
       version: 1,
       input: z.object({}),
       output: z.object({ ok: z.boolean() }),
-      common: z.object({}),
       initial() {
         return start({
-          common: {},
           phase: "unstable",
           data: {},
         })

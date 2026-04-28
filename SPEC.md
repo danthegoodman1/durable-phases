@@ -61,11 +61,11 @@ const Workflow = defineWorkflow({
 
   input: InputSchema,
   output: OutputSchema,
-  common: CommonSchema,
+  common: CommonSchema, // optional; defaults to an empty object schema
 
   initial(input) {
     return start({
-      common: { ... },
+      common: { ... }, // optional when the workflow has no common state
       phase: "some_phase",
       data: { ... },
     })
@@ -120,6 +120,8 @@ phase({ state?, run })
 ```
 
 If `state` is omitted, it is treated as an empty object schema.
+
+If workflow `common` is omitted, it is treated as an empty object schema, and `start(...)` may omit `common`.
 
 `on` phases wait for external/durable events.
 
