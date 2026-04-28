@@ -5,6 +5,7 @@
  * phase that records an activity and completes.
  */
 
+use chrono::TimeZone;
 use durable::{
     complete, go, start, workflow, DrainOptions, DurablePhase, DurableRuntime, InstanceRef,
     InstanceSnapshot, JsonFileDurabilityProvider, PersistedInstance, PersistedStatus, StartOptions,
@@ -13,6 +14,7 @@ use durable::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ImmediateInput {
@@ -125,8 +127,9 @@ workflow! {
 
 pub async fn run_immediate_and_signal_demo() -> Result<(), WorkflowError> {
     let path = reset_demo_store("immediate-and-signal")?;
+    let clock = ManualClock::new();
     let provider = JsonFileDurabilityProvider::new(path)?;
-    let runtime = DurableRuntime::new(provider.clone());
+    let runtime = DurableRuntime::with_clock(provider.clone(), clock.closure());
 
     let ref_ = runtime
         .start::<ImmediateApprovalWorkflow>(
@@ -170,6 +173,30 @@ async fn main() -> Result<(), WorkflowError> {
 
 fn demo_store_path(name: &str) -> PathBuf {
     PathBuf::from(".durable-demo").join(format!("rust-{name}.json"))
+}
+
+#[derive(Clone)]
+struct ManualClock {
+    now: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl ManualClock {
+    fn new() -> Self {
+        Self {
+            now: Arc::new(Mutex::new(
+                chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        }
+    }
+
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.now.lock().unwrap()
+    }
+
+    fn closure(&self) -> impl Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static {
+        let clock = self.clone();
+        move || clock.now()
+    }
 }
 
 fn reset_demo_store(name: &str) -> Result<PathBuf, std::io::Error> {
