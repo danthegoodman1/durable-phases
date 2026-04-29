@@ -700,7 +700,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.000Z",
         leaseMs: 1_000,
       }),
-    ).resolves.toBeNull()
+    ).resolves.toEqual({ activation: null })
 
     await expect(
       provider.claimDispatchShard({
@@ -756,13 +756,15 @@ describe("durable workflow PoC", () => {
       }),
     ).resolves.toMatchObject({ ownerId: "worker-a" })
 
-    const activationA = await providerA.claimReadyActivation({
-      workerId: "worker-a",
-      shardIds: [0],
-      workflows: { activation_owner: { version: 1 } },
-      now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 1_000,
-    })
+    const activationA = (
+      await providerA.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activation_owner: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 1_000,
+      })
+    ).activation
     expect(activationA).toMatchObject({ kind: "run", activationId: expect.any(String) })
 
     await expect(
@@ -782,7 +784,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.011Z",
         leaseMs: 1_000,
       }),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ activation: null })
 
     await expect(
       providerB.claimReadyActivation({
@@ -793,8 +795,10 @@ describe("durable workflow PoC", () => {
         leaseMs: 1_000,
       }),
     ).resolves.toMatchObject({
-      kind: "run",
-      activationId: activationA!.activationId,
+      activation: {
+        kind: "run",
+        activationId: activationA!.activationId,
+      },
     })
   })
 
@@ -891,13 +895,15 @@ describe("durable workflow PoC", () => {
       now: "2026-01-01T00:00:00.000Z",
       leaseMs: 10,
     })
-    const activation = await provider.claimReadyActivation({
-      workerId: "worker-a",
-      shardIds: [0],
-      workflows: { commit_conflict: { version: 1 } },
-      now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 10,
-    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { commit_conflict: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 10,
+      })
+    ).activation
     expect(activation?.kind).toBe("event")
 
     await expect(
@@ -933,27 +939,61 @@ describe("durable workflow PoC", () => {
 
   it("throws when effect mutation targets an unknown effect", async () => {
     const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "unknown_effect",
+      workflowVersion: 1,
+      workflowId: "unknown-effect",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 1_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { unknown_effect: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 1_000,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "run" })
 
     await expect(
       provider.completeEffect({
-        workflowId: "missing",
-        runId: "run-1",
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
         effectId: "effect-missing",
         result: {},
+        now: "2026-01-01T00:00:00.000Z",
       }),
     ).rejects.toThrow("Unknown effect: effect-missing")
 
     await expect(
       provider.failEffect({
-        workflowId: "missing",
-        runId: "run-1",
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
         effectId: "effect-missing",
         error: { message: "nope" },
+        now: "2026-01-01T00:00:00.000Z",
       }),
     ).rejects.toThrow("Unknown effect: effect-missing")
 
     await expect(
       provider.heartbeatEffect({
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
         effectId: "effect-missing",
         now: "2026-01-01T00:00:00.000Z",
         details: {},
@@ -1083,13 +1123,15 @@ describe("durable workflow PoC", () => {
       now: "2026-01-01T00:00:00.000Z",
       leaseMs: 60_000,
     })
-    const childRun = await provider.claimReadyActivation({
-      workerId: "worker-a",
-      shardIds: [0],
-      workflows: { ordering_parent: { version: 1 }, ordering_child: { version: 1 } },
-      now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 60_000,
-    })
+    const childRun = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { ordering_parent: { version: 1 }, ordering_child: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
     expect(childRun).toMatchObject({ kind: "run", workflowId: "ordering-child" })
     await provider.commitCheckpoint({
       workflowId: "ordering-child",
@@ -1109,19 +1151,647 @@ describe("durable workflow PoC", () => {
       receivedAt: eventAt,
     })
 
-    const parentEvent = await provider.claimReadyActivation({
-      workerId: "worker-a",
-      shardIds: [0],
-      workflows: { ordering_parent: { version: 1 }, ordering_child: { version: 1 } },
-      now: eventAt,
-      leaseMs: 60_000,
-    })
+    const parentEvent = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { ordering_parent: { version: 1 }, ordering_child: { version: 1 } },
+        now: eventAt,
+        leaseMs: 60_000,
+      })
+    ).activation
 
     expect(parentEvent).toMatchObject({
       kind: "event",
       workflowId: "ordering-parent",
       waitName: "child_done",
       event: { kind: "child" },
+    })
+  })
+
+  it("returns nextWakeAt for future timers and preserves timer readiness across provider restart", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    await provider.createInstance({
+      workflowName: "future_timer",
+      workflowVersion: 1,
+      workflowId: "future-timer",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [{ kind: "timer", name: "wake", fireAt: "2026-01-01T00:00:05.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { future_timer: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toEqual({
+      activation: null,
+      nextWakeAt: "2026-01-01T00:00:05.000Z",
+    })
+
+    const restartedProvider = testProvider(path)
+    await restartedProvider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:01:00.000Z",
+      leaseMs: 60_000,
+    })
+    await expect(
+      restartedProvider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { future_timer: { version: 1 } },
+        now: "2026-01-01T00:01:00.000Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toMatchObject({
+      activation: {
+        kind: "event",
+        event: { kind: "timer", firedAt: "2026-01-01T00:00:05.000Z" },
+      },
+    })
+  })
+
+  it("runWorker sleeps from nextWakeAt and uses bounded polling for later signals", async () => {
+    const timerClock = manualClock()
+    const TimerWorkflow = defineWorkflow({
+      name: "worker_timer_sleep",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: { wakeAt: "2026-01-01T00:00:05.000Z" } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ wakeAt: z.string() }),
+          on: {
+            wake: timer(({ data }) => data.wakeAt, async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+
+    const timerRuntime = new DurableRuntime(testProvider(await storePath()), {
+      clock: timerClock.clock,
+      workflows: [TimerWorkflow],
+      workerId: "timer-worker",
+    })
+    const timerAbort = new AbortController()
+    const timerSleeps: number[] = []
+    await timerRuntime.start(TimerWorkflow, {}, { workflowId: "worker-timer-sleep" })
+    await timerRuntime.runWorker({
+      signal: timerAbort.signal,
+      minPollIntervalMs: 10,
+      maxPollIntervalMs: 10_000,
+      jitterRatio: 0,
+      sleep: async (ms) => {
+        timerSleeps.push(ms)
+        timerAbort.abort()
+      },
+    })
+    expect(timerSleeps).toEqual([5_000])
+
+    const signalClock = manualClock()
+    const SignalWorkflow = defineWorkflow({
+      name: "worker_signal_poll",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const signalProvider = testProvider(await storePath())
+    const signalRuntime = new DurableRuntime(signalProvider, {
+      clock: signalClock.clock,
+      workflows: [SignalWorkflow],
+      workerId: "signal-poll-worker",
+    })
+    const ref = await signalRuntime.start(SignalWorkflow, {}, { workflowId: "worker-signal-poll" })
+    const signalAbort = new AbortController()
+    const signalSleeps: number[] = []
+    await signalRuntime.runWorker({
+      signal: signalAbort.signal,
+      maxActivationsPerDrain: 1,
+      minPollIntervalMs: 1,
+      maxPollIntervalMs: 50,
+      jitterRatio: 0,
+      sleep: async (ms) => {
+        signalSleeps.push(ms)
+        if (signalSleeps.length === 1) {
+          await signalRuntime.signal(SignalWorkflow, ref, "finish", {})
+        } else {
+          signalAbort.abort()
+        }
+      },
+    })
+    expect(signalSleeps[0]).toBe(50)
+    expect(await signalProvider.loadInstance(ref)).toMatchObject({ status: "completed" })
+  })
+
+  it("heartbeats long activations and releases dispatch shards after drain", async () => {
+    const clock = manualClock()
+    let releaseHandler: (() => void) | undefined
+    const handlerStarted = new Promise<void>((resolve) => {
+      releaseHandler = resolve
+    })
+    const LongWorkflow = defineWorkflow({
+      name: "long_activation",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async () => {
+            await handlerStarted
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const path = await storePath()
+    const provider = testProvider(path)
+    const workerA = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [LongWorkflow],
+      workerId: "long-worker-a",
+      dispatchLeaseMs: 10,
+      activationLeaseMs: 10,
+      leaseHeartbeatIntervalMs: 1,
+    })
+    const ref = await workerA.start(LongWorkflow, {}, { workflowId: "long-activation" })
+    const draining = workerA.drain({ maxActivations: 1 })
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    clock.advance(8)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const workerBProvider = testProvider(path)
+    await expect(
+      workerBProvider.claimDispatchShard({
+        shardId: workflowPartitionShard(ref.workflowId, ref.runId, 1),
+        ownerId: "long-worker-b",
+        now: clock.clock().toISOString(),
+        leaseMs: 10,
+      }),
+    ).resolves.toBeNull()
+
+    releaseHandler?.()
+    await expect(draining).resolves.toEqual({ activations: 1 })
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "completed" })
+    await expect(
+      workerBProvider.claimDispatchShard({
+        shardId: 0,
+        ownerId: "long-worker-b",
+        now: clock.clock().toISOString(),
+        leaseMs: 10,
+      }),
+    ).resolves.toMatchObject({ ownerId: "long-worker-b" })
+  })
+
+  it("requires a live activation lease for effect mutation and prevents terminal overwrites", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "effect_authority",
+      workflowVersion: 1,
+      workflowId: "effect-authority",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { effect_authority: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 100,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "run" })
+
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "once",
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    expect(reservation.status).toBe("reserved")
+    if (reservation.status !== "reserved") {
+      throw new Error("expected reserved effect")
+    }
+
+    await provider.completeEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      effectId: reservation.effectId,
+      result: { ok: true },
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await expect(
+      provider.failEffect({
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        effectId: reservation.effectId,
+        error: { message: "late" },
+        now: "2026-01-01T00:00:00.000Z",
+      }),
+    ).rejects.toThrow("Effect is already terminal")
+    await expect(
+      provider.completeEffect({
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-b",
+        effectId: reservation.effectId,
+        result: { ok: false },
+        now: "2026-01-01T00:00:00.000Z",
+      }),
+    ).rejects.toThrow("Lost activation lease")
+    await expect(
+      provider.heartbeatEffect({
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        effectId: reservation.effectId,
+        now: "2026-01-01T00:00:00.101Z",
+      }),
+    ).rejects.toThrow("Lost activation lease")
+  })
+
+  it("rejects checkpoint commits with the wrong activation or selected event", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "commit_event_match",
+      workflowVersion: 1,
+      workflowId: "commit-event-match",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    const otherRef = await provider.createInstance({
+      workflowName: "commit_event_match",
+      workflowVersion: 1,
+      workflowId: "commit-event-other",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:10:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    const firstSignal = await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: { n: 1 },
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    })
+    const secondSignal = await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: { n: 2 },
+      receivedAt: "2026-01-01T00:00:01.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { commit_event_match: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "event" })
+
+    await expect(
+      provider.commitCheckpoint({
+        ...otherRef,
+        expectedSequence: 0,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        workflowVersion: 1,
+        next: { status: "completed", output: { ok: true } },
+        waits: [],
+        now: "2026-01-01T00:00:00.000Z",
+      }),
+    ).resolves.toEqual({ ok: false, sequence: 0 })
+    await expect(
+      provider.commitCheckpoint({
+        ...ref,
+        expectedSequence: 0,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        workflowVersion: 1,
+        next: { status: "completed", output: { ok: true } },
+        waits: [],
+        now: "2026-01-01T00:00:00.000Z",
+        consumeSignalId: secondSignal.signalId,
+      }),
+    ).resolves.toEqual({ ok: false, sequence: 0 })
+    expect((await provider.listSignals()).find((record) => record.signalId === firstSignal.signalId)?.consumedBySequence).toBeUndefined()
+    expect((await provider.listSignals()).find((record) => record.signalId === secondSignal.signalId)?.consumedBySequence).toBeUndefined()
+  })
+
+  it("rejects checkpoint commits that consume a different child record than the claimed event", async () => {
+    const provider = testProvider(await storePath())
+    const parentRef = await provider.createInstance({
+      workflowName: "child_consume_parent",
+      workflowVersion: 1,
+      workflowId: "child-consume-parent",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [
+        {
+          kind: "child",
+          name: "child_done",
+          workflowName: "child_consume_child",
+          workflowVersion: 1,
+          workflowId: "child-consume-1",
+          runId: "run-1",
+        },
+      ],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.createChildInstance({
+      workflowName: "child_consume_child",
+      workflowVersion: 1,
+      workflowId: "child-consume-1",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+      parentWorkflowId: parentRef.workflowId,
+      parentRunId: parentRef.runId,
+      activationId: "setup",
+      key: "child-1",
+    })
+    await provider.createChildInstance({
+      workflowName: "child_consume_child",
+      workflowVersion: 1,
+      workflowId: "child-consume-2",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:10:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+      parentWorkflowId: parentRef.workflowId,
+      parentRunId: parentRef.runId,
+      activationId: "setup",
+      key: "child-2",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const childRun = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { child_consume_parent: { version: 1 }, child_consume_child: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(childRun).toMatchObject({ kind: "run", workflowId: "child-consume-1" })
+    await provider.commitCheckpoint({
+      workflowId: "child-consume-1",
+      runId: "run-1",
+      expectedSequence: 0,
+      activationId: childRun!.activationId,
+      workerId: "worker-a",
+      workflowVersion: 1,
+      next: { status: "completed", output: { ok: true } },
+      waits: [],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+
+    const parentActivation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { child_consume_parent: { version: 1 }, child_consume_child: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const wrongChild = (await provider.listChildren()).find((record) => record.workflowId === "child-consume-2")
+    expect(parentActivation).toMatchObject({
+      kind: "event",
+      event: { kind: "child", childRecordId: expect.not.stringMatching(wrongChild!.childRecordId) },
+    })
+
+    await expect(
+      provider.commitCheckpoint({
+        ...parentRef,
+        expectedSequence: 0,
+        activationId: parentActivation!.activationId,
+        workerId: "worker-a",
+        workflowVersion: 1,
+        next: { status: "completed", output: { ok: true } },
+        waits: [],
+        now: "2026-01-01T00:00:00.000Z",
+        consumeChildRecordId: wrongChild!.childRecordId,
+      }),
+    ).resolves.toEqual({ ok: false, sequence: 0 })
+    expect(wrongChild?.deliveredBySequence).toBeUndefined()
+  })
+
+  it("blocks migration while an old-version activation is uncompleted", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "migration_pin",
+      workflowVersion: 1,
+      workflowId: "migration-pin",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-v1",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 1,
+    })
+    const oldActivation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-v1",
+        shardIds: [0],
+        workflows: { migration_pin: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(oldActivation).toMatchObject({ kind: "run" })
+
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-v2",
+      now: "2026-01-01T00:00:00.002Z",
+      leaseMs: 60_000,
+    })
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-v2",
+        shardIds: [0],
+        workflows: { migration_pin: { version: 2 } },
+        now: "2026-01-01T00:00:00.002Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toMatchObject({ activation: null })
+
+    await provider.commitCheckpoint({
+      ...ref,
+      expectedSequence: 0,
+      activationId: oldActivation!.activationId,
+      workerId: "worker-v1",
+      workflowVersion: 1,
+      next: {
+        status: "running",
+        common: {},
+        phase: { name: "waiting", data: {} },
+      },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+      now: "2026-01-01T00:00:00.002Z",
+    })
+
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-v2",
+        shardIds: [0],
+        workflows: { migration_pin: { version: 2 } },
+        now: "2026-01-01T00:00:00.002Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toMatchObject({ activation: { kind: "migration" } })
+  })
+
+  it("validates duplicate signal names against the current durable wait", async () => {
+    const FirstSchema = z.object({ a: z.string() })
+    const SecondSchema = z.object({ b: z.string() })
+    const DuplicateSignalWorkflow = defineWorkflow({
+      name: "duplicate_signal",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ b: z.string() }),
+      initial() {
+        return start({ phase: "second", data: {} })
+      },
+      phases: {
+        first: phase({
+          on: {
+            same: signal(FirstSchema, async ({ event }) => complete({ b: event.a })),
+          },
+        }),
+        second: phase({
+          on: {
+            same: signal(SecondSchema, async ({ event }) => complete({ b: event.b })),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [DuplicateSignalWorkflow],
+      workerId: "duplicate-signal-worker",
+    })
+    const ref = await runtime.start(DuplicateSignalWorkflow, {}, { workflowId: "duplicate-signal" })
+    await expect(runtime.signal(DuplicateSignalWorkflow, ref, "same", { b: "current" })).resolves.toMatchObject({
+      type: "same",
+    })
+    await runtime.drain()
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { b: "current" },
+    })
+  })
+
+  it("does not expose ctx.child.run", async () => {
+    let childKeys: string[] = []
+    const NoChildRunWorkflow = defineWorkflow({
+      name: "no_child_run",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            childKeys = Object.keys(ctx.child).sort()
+            return complete({ ok: !("run" in ctx.child) })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [NoChildRunWorkflow],
+      workerId: "no-child-run-worker",
+    })
+    const ref = await runtime.start(NoChildRunWorkflow, {}, { workflowId: "no-child-run" })
+    await runtime.drain()
+    expect(childKeys).toEqual(["result", "start"])
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { ok: true },
     })
   })
 })

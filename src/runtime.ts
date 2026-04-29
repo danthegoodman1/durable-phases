@@ -41,8 +41,23 @@ export type DurableRuntimeOptions = {
   shardCount?: number
   dispatchLeaseMs?: number
   activationLeaseMs?: number
+  leaseHeartbeatIntervalMs?: number
   clock?: () => Date
   workflows?: AnyWorkflow[]
+}
+
+export type DrainResult = {
+  activations: number
+  nextWakeAt?: string
+}
+
+export type RunWorkerOptions = {
+  maxActivationsPerDrain?: number
+  minPollIntervalMs?: number
+  maxPollIntervalMs?: number
+  jitterRatio?: number
+  signal?: AbortSignal
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 export class DurableRuntime {
@@ -52,6 +67,7 @@ export class DurableRuntime {
   private readonly shardCount: number
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
+  private readonly leaseHeartbeatIntervalMs: number
 
   constructor(
     private readonly provider: DurabilityProvider,
@@ -62,6 +78,9 @@ export class DurableRuntime {
     this.shardCount = options.shardCount ?? 1
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
     this.activationLeaseMs = options.activationLeaseMs ?? 30_000
+    this.leaseHeartbeatIntervalMs =
+      options.leaseHeartbeatIntervalMs ??
+      Math.max(1, Math.floor(Math.min(this.dispatchLeaseMs, this.activationLeaseMs) / 3))
     this.registerWorkflows(options.workflows ?? [])
   }
 
@@ -105,8 +124,9 @@ export class DurableRuntime {
     payload: unknown,
   ): Promise<SignalRecord> {
     this.registerWorkflows([workflow])
-    const parsedPayload = this.parseSignalPayload(workflow, type, payload)
     const normalizedRef = normalizeRef(ref)
+    const instance = await this.provider.loadInstance(normalizedRef)
+    const parsedPayload = this.parseSignalPayloadForInstance(workflow, instance, type, payload)
     return this.provider.appendSignal({
       ...normalizedRef,
       type,
@@ -132,31 +152,81 @@ export class DurableRuntime {
     return definition.schema.parse(output)
   }
 
-  async drain(options: { maxActivations?: number } = {}): Promise<{ activations: number }> {
+  async drain(options: { maxActivations?: number } = {}): Promise<DrainResult> {
     const maxActivations = options.maxActivations ?? 100
     let activations = 0
+    let nextWakeAt: string | undefined
     const shardIds = await this.claimDispatchShards()
 
     if (shardIds.length === 0) {
       return { activations }
     }
 
-    while (activations < maxActivations) {
-      await this.heartbeatDispatchShards(shardIds)
-      const activation = await this.provider.claimReadyActivation({
-        workerId: this.workerId,
-        shardIds,
-        workflows: this.workflowVersions(),
-        now: this.now(),
-        leaseMs: this.activationLeaseMs,
-      })
+    try {
+      while (activations < maxActivations) {
+        await this.heartbeatDispatchShards(shardIds)
+        const claim = await this.provider.claimReadyActivation({
+          workerId: this.workerId,
+          shardIds,
+          workflows: this.workflowVersions(),
+          now: this.now(),
+          leaseMs: this.activationLeaseMs,
+        })
 
-      if (!activation) {
+        if (!claim.activation) {
+          nextWakeAt = claim.nextWakeAt
+          break
+        }
+
+        try {
+          await this.withLeaseHeartbeats(shardIds, claim.activation, () =>
+            this.runActivation(claim.activation!),
+          )
+        } catch (error) {
+          await this.releaseActivationQuietly(claim.activation.activationId)
+          throw error
+        }
+        activations += 1
+      }
+    } finally {
+      await this.releaseDispatchShards(shardIds)
+    }
+
+    return nextWakeAt ? { activations, nextWakeAt } : { activations }
+  }
+
+  async runWorker(options: RunWorkerOptions = {}): Promise<{ activations: number }> {
+    const minPollIntervalMs = options.minPollIntervalMs ?? 10
+    const maxPollIntervalMs = options.maxPollIntervalMs ?? 1_000
+    const jitterRatio = options.jitterRatio ?? 0.1
+    const sleep = options.sleep ?? sleepMs
+    let activations = 0
+
+    while (!options.signal?.aborted) {
+      const result = await this.drain({ maxActivations: options.maxActivationsPerDrain })
+      activations += result.activations
+
+      if (options.signal?.aborted) {
         break
       }
 
-      await this.runActivation(activation)
-      activations += 1
+      const delayMs = pollDelayMs({
+        now: this.now(),
+        nextWakeAt: result.nextWakeAt,
+        activations: result.activations,
+        minPollIntervalMs,
+        maxPollIntervalMs,
+        jitterRatio,
+      })
+
+      try {
+        await sleep(delayMs, options.signal)
+      } catch (error) {
+        if (isAbortError(error) || options.signal?.aborted) {
+          break
+        }
+        throw error
+      }
     }
 
     return { activations }
@@ -186,6 +256,17 @@ export class DurableRuntime {
           ownerId: this.workerId,
           now: this.now(),
           leaseMs: this.dispatchLeaseMs,
+        }),
+      ),
+    )
+  }
+
+  private async releaseDispatchShards(shardIds: number[]): Promise<void> {
+    await Promise.allSettled(
+      shardIds.map((shardId) =>
+        this.provider.releaseDispatchShard({
+          shardId,
+          ownerId: this.workerId,
         }),
       ),
     )
@@ -234,8 +315,13 @@ export class DurableRuntime {
 
     if (activation.kind === "migration") {
       const next = await this.migrateSnapshot(workflow, latest)
-      const waits = this.materializeWaits(workflow, latest, next)
-      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits)
+      const commitTime = this.now()
+      const waits = this.materializeWaits(
+        workflow,
+        { workflowId: latest.workflowId, runId: latest.runId, updatedAt: commitTime },
+        next,
+      )
+      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime)
       return
     }
 
@@ -294,8 +380,16 @@ export class DurableRuntime {
     }
 
     const next = this.applyTransition(workflow, latest, transition)
-    const waits = next.status === "running" ? this.materializeWaits(workflow, latest, next) : []
-    await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, {
+    const commitTime = this.now()
+    const waits =
+      next.status === "running"
+        ? this.materializeWaits(
+            workflow,
+            { workflowId: latest.workflowId, runId: latest.runId, updatedAt: commitTime },
+            next,
+          )
+        : []
+    await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
       consumeSignalId,
       consumeChildRecordId,
     })
@@ -307,6 +401,7 @@ export class DurableRuntime {
     activationId: string,
     next: InstanceStatus<any>,
     waits: DurableWait[],
+    now: string,
     options: { consumeSignalId?: string; consumeChildRecordId?: string } = {},
   ): Promise<void> {
     const result = await this.provider.commitCheckpoint({
@@ -318,7 +413,7 @@ export class DurableRuntime {
       workflowVersion: workflow.version,
       next,
       waits,
-      now: this.now(),
+      now,
       consumeSignalId: options.consumeSignalId,
       consumeChildRecordId: options.consumeChildRecordId,
     })
@@ -344,7 +439,9 @@ export class DurableRuntime {
           workflowId: instance.workflowId,
           runId: instance.runId,
           activationId: currentActivationId,
+          workerId: this.workerId,
           key,
+          now: this.now(),
         })
 
         if (reservation.status === "completed") {
@@ -355,24 +452,32 @@ export class DurableRuntime {
           throw new Error(reservation.error.message)
         }
 
+        let result: T
         try {
-          const result = await fn()
-          await this.provider.completeEffect({
-            workflowId: instance.workflowId,
-            runId: instance.runId,
-            effectId: reservation.effectId,
-            result: toJson(result),
-          })
-          return result
+          result = await fn()
         } catch (error) {
           await this.provider.failEffect({
             workflowId: instance.workflowId,
             runId: instance.runId,
+            activationId: currentActivationId,
+            workerId: this.workerId,
             effectId: reservation.effectId,
             error: serializeError(error),
+            now: this.now(),
           })
           throw error
         }
+
+        await this.provider.completeEffect({
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId: currentActivationId,
+          workerId: this.workerId,
+          effectId: reservation.effectId,
+          result: toJson(result),
+          now: this.now(),
+        })
+        return result
       },
       child: {
         start: async <W extends AnyWorkflow>(
@@ -420,22 +525,42 @@ export class DurableRuntime {
         result: async <W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>> => {
           return this.provider.readOutput(handle)
         },
-        run: async <W extends AnyWorkflow>(
-          key: string,
-          childWorkflow: W,
-          input: InputOf<W>,
-          options: ChildOptions = {},
-        ): Promise<OutputOf<W>> => {
-          const handle = await this.contextFor(workflow, instance, currentActivationId, activationTime).child.start(
-            key,
-            childWorkflow,
-            input,
-            options,
-          )
-          return this.provider.readOutput(handle)
-        },
       },
     }
+  }
+
+  private async withLeaseHeartbeats<T>(
+    shardIds: number[],
+    activation: ClaimedActivation,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const timer = setInterval(() => {
+      void Promise.all([
+        this.heartbeatDispatchShards(shardIds),
+        this.provider.heartbeatActivation({
+          activationId: activation.activationId,
+          workerId: this.workerId,
+          now: this.now(),
+          leaseMs: this.activationLeaseMs,
+        }),
+      ]).catch(() => undefined)
+    }, this.leaseHeartbeatIntervalMs)
+    timer.unref?.()
+
+    try {
+      return await fn()
+    } finally {
+      clearInterval(timer)
+    }
+  }
+
+  private async releaseActivationQuietly(activationId: string): Promise<void> {
+    await this.provider
+      .releaseActivation({
+        activationId,
+        workerId: this.workerId,
+      })
+      .catch(() => undefined)
   }
 
   private applyTransition(
@@ -686,6 +811,29 @@ export class DurableRuntime {
     return candidates[0].schema.parse(payload)
   }
 
+  private parseSignalPayloadForInstance(
+    workflow: AnyWorkflow,
+    instance: PersistedInstance | null,
+    type: string,
+    payload: unknown,
+  ): unknown {
+    if (instance?.status === "running") {
+      const wait = instance.waits.find(
+        (candidate): candidate is Extract<DurableWait, { kind: "signal" }> =>
+          candidate.kind === "signal" && candidate.type === type,
+      )
+      if (wait) {
+        const definition = this.waitDefinition(workflow, instance, wait)
+        if (definition.kind !== "signal") {
+          throw new Error(`Signal wait ${wait.name} is not a signal definition`)
+        }
+        return definition.schema.parse(payload)
+      }
+    }
+
+    return this.parseSignalPayload(workflow, type, payload)
+  }
+
   private async requireInstance(ref: InstanceRef | string): Promise<PersistedInstance> {
     const normalizedRef = normalizeRef(ref)
     const instance = await this.provider.loadInstance(normalizedRef)
@@ -737,6 +885,66 @@ function normalizePhaseSnapshot(value: unknown): PhaseSnapshot {
     name: value.name,
     data: toJsonObject(value.data ?? {}),
   }
+}
+
+function pollDelayMs(input: {
+  now: string
+  nextWakeAt?: string
+  activations: number
+  minPollIntervalMs: number
+  maxPollIntervalMs: number
+  jitterRatio: number
+}): number {
+  const baseDelay =
+    input.nextWakeAt === undefined
+      ? input.activations > 0
+        ? input.minPollIntervalMs
+        : input.maxPollIntervalMs
+      : new Date(input.nextWakeAt).getTime() - new Date(input.now).getTime()
+  const clamped = Math.min(
+    input.maxPollIntervalMs,
+    Math.max(input.minPollIntervalMs, Number.isFinite(baseDelay) ? baseDelay : input.maxPollIntervalMs),
+  )
+  const jitter = clamped * input.jitterRatio * (Math.random() * 2 - 1)
+  return Math.max(0, Math.round(clamped + jitter))
+}
+
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(abortError())
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onAbort = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
+      settled = true
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+    timer.unref?.()
+  })
+}
+
+function abortError(): Error {
+  const error = new Error("Worker aborted")
+  error.name = "AbortError"
+  return error
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError"
 }
 
 function callWaitHandler(

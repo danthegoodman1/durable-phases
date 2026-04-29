@@ -3,7 +3,10 @@
 A small TypeScript prototype of the phase-based durable execution model in
 [`SPEC.md`](SPEC.md). The TypeScript runtime is backed by a SQLite durability
 provider with shard leases, activation leases, atomic checkpoint commits,
-durable waits, a signal inbox, child records, and activation-scoped effects.
+durable ready indexes, durable waits, a signal inbox, child records, and
+activation-scoped effects. `DurableRuntime.drain()` is useful for tests and
+manual pumping; `DurableRuntime.runWorker()` adds bounded polling, wake hints,
+and lease heartbeats for long-running workers.
 
 ```bash
 npm run demo

@@ -58,12 +58,6 @@ export type DurableContext = {
       options?: ChildOptions,
     ): Promise<ChildHandle<W>>
     result<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>>
-    run<W extends AnyWorkflow>(
-      key: string,
-      workflow: W,
-      input: InputOf<W>,
-      options?: ChildOptions,
-    ): Promise<OutputOf<W>>
   }
 }
 
@@ -290,4 +284,3 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
 export function safeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, "_")
 }
-

@@ -8,6 +8,7 @@ import type {
   ClaimDispatchShardInput,
   ClaimedActivation,
   ClaimReadyActivationInput,
+  ClaimReadyActivationResult,
   CommitCheckpointInput,
   CommitCheckpointResult,
   CompleteEffectInput,
@@ -71,6 +72,7 @@ type InstanceRow = {
   workflow_version: number
   workflow_id: string
   run_id: string
+  partition_shard: number
   sequence: number
   status: "running" | "completed" | "canceled" | "failed"
   common_json: string | null
@@ -116,6 +118,8 @@ type ChildRow = {
 
 type EffectRow = {
   effect_id: string
+  workflow_id: string
+  run_id: string
   activation_id: string
   key: string
   idempotency_key: string
@@ -128,8 +132,16 @@ type EffectRow = {
 
 type ActivationClaimRow = {
   activation_id: string
+  workflow_id: string
+  run_id: string
+  sequence: number
+  kind: "migration" | "run" | "event"
+  wait_name: string | null
+  event_json: string | null
+  wait_json: string | null
   owner_id: string | null
   lease_until: string | null
+  activation_time: string | null
   completed_by_sequence: number | null
 }
 
@@ -137,6 +149,23 @@ type DispatchShardRow = {
   shard_id: number
   owner_id: string | null
   lease_until: string | null
+}
+
+type ReadyEventRow = {
+  ready_event_id: string
+  workflow_id: string
+  run_id: string
+  workflow_name: string
+  workflow_version: number
+  partition_shard: number
+  sequence: number
+  kind: "migration" | "run" | "signal" | "timer" | "child"
+  wait_name: string | null
+  activation_id: string | null
+  ready_at: string
+  sort_key: string
+  wait_json: string | null
+  event_json: string | null
 }
 
 export class SqliteDurabilityProvider implements DurabilityProvider {
@@ -209,6 +238,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.now,
           input.now,
         )
+
+      this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
       return { workflowId: input.workflowId, runId: input.runId }
     })
@@ -288,6 +319,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.runId,
         )
 
+      this.replaceReadyEventsForInstance(input.workflowId, input.runId)
+
       return {
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
@@ -357,6 +390,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           signal.receivedAt,
         )
 
+      this.replaceReadyEventsForInstance(input.workflowId, input.runId)
+
       return signal
     })
 
@@ -394,15 +429,18 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void> {
-    this.db
+    const result = this.db
       .prepare(
         `
         UPDATE dispatch_shards
         SET lease_until = ?
-        WHERE shard_id = ? AND owner_id = ?
+        WHERE shard_id = ? AND owner_id = ? AND lease_until >= ?
       `,
       )
-      .run(addMs(input.now, input.leaseMs), input.shardId, input.ownerId)
+      .run(addMs(input.now, input.leaseMs), input.shardId, input.ownerId, input.now)
+    if (result.changes === 0) {
+      throw new Error(`Lost dispatch shard lease: ${input.shardId}`)
+    }
   }
 
   async releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void> {
@@ -417,7 +455,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       .run(input.shardId, input.ownerId)
   }
 
-  async claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimedActivation | null> {
+  async claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult> {
     const claim = this.db.transaction(() => {
       const ownedShards = input.shardIds.filter((shardId) => {
         const shard = oneRow<DispatchShardRow>(
@@ -427,36 +465,43 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       })
 
       if (ownedShards.length === 0) {
-        return null
+        return { activation: null }
       }
 
-      const candidates = this.readyCandidates({
+      const candidates = this.indexedReadyCandidates({
         ...input,
         shardIds: ownedShards,
-      }).sort(compareCandidates)
+      })
 
       for (const candidate of candidates) {
         if (this.tryWriteActivationClaim(candidate, input.workerId, input.now, input.leaseMs)) {
-          return stripSort(candidate)
+          return { activation: stripSort(candidate) }
         }
       }
 
-      return null
+      return {
+        activation: null,
+        nextWakeAt: this.nextWakeAt(ownedShards, input.now, input.workflows),
+      }
     })
 
-    return claim.immediate() as ClaimedActivation | null
+    return claim.immediate() as ClaimReadyActivationResult
   }
 
   async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
-    this.db
+    const result = this.db
       .prepare(
         `
         UPDATE activation_claims
         SET lease_until = ?
         WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+          AND lease_until >= ?
       `,
       )
-      .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId)
+      .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now)
+    if (result.changes === 0) {
+      throw new Error(`Lost activation lease: ${input.activationId}`)
+    }
   }
 
   async releaseActivation(input: ReleaseActivationInput): Promise<void> {
@@ -473,6 +518,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   async getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
     const reserve = this.db.transaction(() => {
+      this.assertLiveActivationLease(input)
+
       const existing = oneRow<EffectRow>(
         this.db
           .prepare(
@@ -531,47 +578,60 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatEffect(input: HeartbeatEffectInput): Promise<void> {
+    this.assertLiveActivationLease(input)
     const result = this.db
       .prepare(
         `
         UPDATE effects
         SET heartbeat_at = ?, heartbeat_details_json = ?
-        WHERE effect_id = ?
+        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+          AND status = 'pending'
       `,
       )
-      .run(input.now, encodeJson(input.details ?? null), input.effectId)
+      .run(
+        input.now,
+        encodeJson(input.details ?? null),
+        input.workflowId,
+        input.runId,
+        input.activationId,
+        input.effectId,
+      )
     if (result.changes === 0) {
-      throw new Error(`Unknown effect: ${input.effectId}`)
+      this.throwEffectMutationError(input)
     }
   }
 
   async completeEffect(input: CompleteEffectInput): Promise<void> {
+    this.assertLiveActivationLease(input)
     const result = this.db
       .prepare(
         `
         UPDATE effects
         SET status = 'completed', result_json = ?, error_json = NULL
-        WHERE workflow_id = ? AND run_id = ? AND effect_id = ?
+        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+          AND status = 'pending'
       `,
       )
-      .run(encodeJson(input.result), input.workflowId, input.runId, input.effectId)
+      .run(encodeJson(input.result), input.workflowId, input.runId, input.activationId, input.effectId)
     if (result.changes === 0) {
-      throw new Error(`Unknown effect: ${input.effectId}`)
+      this.throwEffectMutationError(input)
     }
   }
 
   async failEffect(input: FailEffectInput): Promise<void> {
+    this.assertLiveActivationLease(input)
     const result = this.db
       .prepare(
         `
         UPDATE effects
         SET status = 'failed', error_json = ?
-        WHERE workflow_id = ? AND run_id = ? AND effect_id = ?
+        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+          AND status = 'pending'
       `,
       )
-      .run(encodeJson(input.error), input.workflowId, input.runId, input.effectId)
+      .run(encodeJson(input.error), input.workflowId, input.runId, input.activationId, input.effectId)
     if (result.changes === 0) {
-      throw new Error(`Unknown effect: ${input.effectId}`)
+      this.throwEffectMutationError(input)
     }
   }
 
@@ -592,11 +652,18 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       if (
         !claim ||
+        claim.workflow_id !== input.workflowId ||
+        claim.run_id !== input.runId ||
+        claim.sequence !== input.expectedSequence ||
         claim.owner_id !== input.workerId ||
         !claim.lease_until ||
         claim.lease_until < input.now ||
         claim.completed_by_sequence !== null
       ) {
+        return { ok: false, sequence: instance.sequence }
+      }
+
+      if (!claimMatchesCommit(claim, input)) {
         return { ok: false, sequence: instance.sequence }
       }
 
@@ -653,6 +720,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       this.updateParentChildRecord(instance, input, nextSequence)
+      this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
       this.db
         .prepare(
@@ -782,6 +850,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         lease_until TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS ready_events (
+        ready_event_id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        workflow_name TEXT NOT NULL,
+        workflow_version INTEGER NOT NULL,
+        partition_shard INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('migration', 'run', 'signal', 'timer', 'child')),
+        wait_name TEXT,
+        activation_id TEXT,
+        ready_at TEXT NOT NULL,
+        sort_key TEXT NOT NULL,
+        wait_json TEXT,
+        event_json TEXT,
+        FOREIGN KEY (workflow_id, run_id) REFERENCES instances(workflow_id, run_id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS instances_by_status_shard
         ON instances(status, partition_shard, updated_at);
       CREATE INDEX IF NOT EXISTS signals_hot_lookup
@@ -794,8 +880,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         ON effects(workflow_id, run_id, activation_id, key);
       CREATE INDEX IF NOT EXISTS activation_claims_owner_lease
         ON activation_claims(owner_id, lease_until, completed_by_sequence);
+      CREATE INDEX IF NOT EXISTS ready_events_claim
+        ON ready_events(partition_shard, ready_at, sort_key);
+      CREATE INDEX IF NOT EXISTS ready_events_instance
+        ON ready_events(workflow_id, run_id, sequence);
     `)
     this.addColumnIfMissing("activation_claims", "activation_time", "TEXT")
+    this.rebuildAllReadyEvents()
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -853,28 +944,298 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
   }
 
-  private readyCandidates(input: ClaimReadyActivationInput): ReadyCandidate[] {
+  private rebuildAllReadyEvents(): void {
+    const rebuild = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM ready_events").run()
+      const rows = this.db
+        .prepare("SELECT workflow_id, run_id FROM instances WHERE status = 'running'")
+        .all()
+      for (const row of rows) {
+        const instance = requireRow<{ workflow_id: string; run_id: string }>(row)
+        this.replaceReadyEventsForInstance(instance.workflow_id, instance.run_id)
+      }
+    })
+    rebuild.immediate()
+  }
+
+  private replaceReadyEventsForInstance(workflowId: string, runId: string): void {
+    this.db.prepare("DELETE FROM ready_events WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
+
+    const instance = this.instanceRow({ workflowId, runId })
+    if (!instance || instance.status !== "running") {
+      return
+    }
+
+    this.insertReadyEvent({
+      readyEventId: `${instance.workflow_id}/${instance.run_id}/${instance.sequence}/migration`,
+      workflowId: instance.workflow_id,
+      runId: instance.run_id,
+      workflowName: instance.workflow_name,
+      workflowVersion: instance.workflow_version,
+      partitionShard: instance.partition_shard,
+      sequence: instance.sequence,
+      kind: "migration",
+      waitName: null,
+      activationId: null,
+      readyAt: instance.updated_at,
+      sortKey: sortKey(instance.updated_at, "migration", instance.workflow_id, instance.run_id),
+      wait: null,
+      event: null,
+    })
+
+    for (const wait of decodeJson<DurableWait[]>(instance.waits_json, [])) {
+      if (wait.kind === "run") {
+        const activationId = activationIdFromParts(
+          instance.workflow_id,
+          instance.run_id,
+          instance.sequence,
+          "run",
+          wait.name,
+        )
+        this.insertReadyEvent({
+          readyEventId: activationId,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          workflowName: instance.workflow_name,
+          workflowVersion: instance.workflow_version,
+          partitionShard: instance.partition_shard,
+          sequence: instance.sequence,
+          kind: "run",
+          waitName: wait.name,
+          activationId,
+          readyAt: wait.readyAt,
+          sortKey: sortKey(wait.readyAt, "run", wait.name, instance.workflow_id, instance.run_id),
+          wait,
+          event: null,
+        })
+      } else if (wait.kind === "signal") {
+        const signalRow = oneRow<SignalRow>(
+          this.db
+            .prepare(
+              `
+              SELECT * FROM signals
+              WHERE workflow_id = ? AND run_id = ? AND type = ? AND consumed_by_sequence IS NULL
+              ORDER BY received_at, type, signal_id
+              LIMIT 1
+            `,
+            )
+            .get(instance.workflow_id, instance.run_id, wait.type),
+        )
+        if (!signalRow) {
+          continue
+        }
+
+        const activationId = activationIdFromParts(
+          instance.workflow_id,
+          instance.run_id,
+          instance.sequence,
+          "signal",
+          signalRow.signal_id,
+        )
+        const event: ReadyEvent = {
+          kind: "signal",
+          signalId: signalRow.signal_id,
+          payload: decodeJson<JsonValue>(signalRow.payload_json, null),
+          occurredAt: signalRow.received_at,
+          consumeSignalId: signalRow.signal_id,
+        }
+        this.insertReadyEvent({
+          readyEventId: `${activationId}/${wait.name}`,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          workflowName: instance.workflow_name,
+          workflowVersion: instance.workflow_version,
+          partitionShard: instance.partition_shard,
+          sequence: instance.sequence,
+          kind: "signal",
+          waitName: wait.name,
+          activationId,
+          readyAt: signalRow.received_at,
+          sortKey: sortKey(signalRow.received_at, "signal", wait.name, signalRow.signal_id),
+          wait,
+          event,
+        })
+      } else if (wait.kind === "timer") {
+        const activationId = activationIdFromParts(
+          instance.workflow_id,
+          instance.run_id,
+          instance.sequence,
+          "timer",
+          `${wait.name}:${wait.fireAt}`,
+        )
+        const event: ReadyEvent = {
+          kind: "timer",
+          firedAt: wait.fireAt,
+          occurredAt: wait.fireAt,
+        }
+        this.insertReadyEvent({
+          readyEventId: activationId,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          workflowName: instance.workflow_name,
+          workflowVersion: instance.workflow_version,
+          partitionShard: instance.partition_shard,
+          sequence: instance.sequence,
+          kind: "timer",
+          waitName: wait.name,
+          activationId,
+          readyAt: wait.fireAt,
+          sortKey: sortKey(wait.fireAt, "timer", wait.name, `${wait.name}:${wait.fireAt}`),
+          wait,
+          event,
+        })
+      } else {
+        const childRow = oneRow<ChildRow>(
+          this.db
+            .prepare(
+              `
+              SELECT * FROM children
+              WHERE workflow_id = ? AND run_id = ? AND status <> 'started' AND delivered_by_sequence IS NULL
+              ORDER BY completed_at, child_record_id
+              LIMIT 1
+            `,
+            )
+            .get(wait.workflowId, wait.runId),
+        )
+        if (!childRow) {
+          continue
+        }
+
+        const occurredAt = childRow.completed_at ?? instance.updated_at
+        const activationId = activationIdFromParts(
+          instance.workflow_id,
+          instance.run_id,
+          instance.sequence,
+          "child",
+          childRow.child_record_id,
+        )
+        const event: ReadyEvent = {
+          kind: "child",
+          childRecordId: childRow.child_record_id,
+          occurredAt,
+          event:
+            childRow.status === "completed"
+              ? { ok: true, output: decodeJson<JsonValue>(childRow.output_json, null) }
+              : {
+                  ok: false,
+                  error: decodeJson<SerializedError>(childRow.error_json, {
+                    message: "Child failed",
+                  }),
+                },
+        }
+        this.insertReadyEvent({
+          readyEventId: activationId,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          workflowName: instance.workflow_name,
+          workflowVersion: instance.workflow_version,
+          partitionShard: instance.partition_shard,
+          sequence: instance.sequence,
+          kind: "child",
+          waitName: wait.name,
+          activationId,
+          readyAt: occurredAt,
+          sortKey: sortKey(occurredAt, "child", wait.name, childRow.child_record_id),
+          wait,
+          event,
+        })
+      }
+    }
+  }
+
+  private insertReadyEvent(input: {
+    readyEventId: string
+    workflowId: string
+    runId: string
+    workflowName: string
+    workflowVersion: number
+    partitionShard: number
+    sequence: number
+    kind: ReadyEventRow["kind"]
+    waitName: string | null
+    activationId: string | null
+    readyAt: string
+    sortKey: string
+    wait: DurableWait | null
+    event: ReadyEvent | null
+  }): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO ready_events (
+          ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
+          partition_shard, sequence, kind, wait_name, activation_id, ready_at,
+          sort_key, wait_json, event_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        input.readyEventId,
+        input.workflowId,
+        input.runId,
+        input.workflowName,
+        input.workflowVersion,
+        input.partitionShard,
+        input.sequence,
+        input.kind,
+        input.waitName,
+        input.activationId,
+        input.readyAt,
+        input.sortKey,
+        input.wait ? encodeJson(input.wait) : null,
+        input.event ? encodeJson(input.event) : null,
+      )
+  }
+
+  private indexedReadyCandidates(input: ClaimReadyActivationInput): ReadyCandidate[] {
+    const workflowEntries = Object.entries(input.workflows)
+    if (input.shardIds.length === 0 || workflowEntries.length === 0) {
+      return []
+    }
+
     const placeholders = input.shardIds.map(() => "?").join(", ")
+    const migrationClauses = workflowEntries
+      .map(() => "(kind = 'migration' AND workflow_name = ? AND workflow_version < ?)")
+      .join(" OR ")
+    const currentClauses = workflowEntries
+      .map(() => "(kind <> 'migration' AND workflow_name = ? AND workflow_version = ?)")
+      .join(" OR ")
+    const versionParams = [
+      ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
+      ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
+    ]
     const rows = this.db
       .prepare(
         `
-        SELECT * FROM instances
-        WHERE status = 'running' AND partition_shard IN (${placeholders})
-        ORDER BY updated_at, workflow_id, run_id
+        SELECT * FROM ready_events
+        WHERE partition_shard IN (${placeholders}) AND ready_at <= ?
+          AND (${migrationClauses} OR ${currentClauses})
+        ORDER BY sort_key
       `,
       )
-      .all(...input.shardIds)
-      .map((row) => requireRow<InstanceRow>(row))
+      .all(...input.shardIds, input.now, ...versionParams)
+      .map((row) => requireRow<ReadyEventRow>(row))
 
     const candidates: ReadyCandidate[] = []
+    for (const row of rows) {
+      const instance = this.instanceRow({ workflowId: row.workflow_id, runId: row.run_id })
+      if (!instance || instance.status !== "running" || instance.sequence !== row.sequence) {
+        this.db.prepare("DELETE FROM ready_events WHERE ready_event_id = ?").run(row.ready_event_id)
+        continue
+      }
 
-    for (const instance of rows) {
       const workflow = input.workflows[instance.workflow_name]
       if (!workflow) {
         continue
       }
 
-      if (instance.workflow_version < workflow.version) {
+      if (row.kind === "migration") {
+        if (instance.workflow_version >= workflow.version) {
+          continue
+        }
+        if (this.hasUncompletedNonMigrationActivation(instance)) {
+          continue
+        }
         candidates.push({
           kind: "migration",
           activationId: activationIdFromParts(
@@ -884,173 +1245,125 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
             "migration",
             `${instance.workflow_version}->${workflow.version}`,
           ),
-        workflowName: instance.workflow_name,
-        workflowId: instance.workflow_id,
-        runId: instance.run_id,
-        sequence: instance.sequence,
-        activationTime: instance.updated_at,
-        leaseUntil: "",
-        sort: [instance.updated_at, "migration", instance.workflow_id, instance.run_id],
-      })
+          workflowName: instance.workflow_name,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          sequence: instance.sequence,
+          activationTime: row.ready_at,
+          leaseUntil: "",
+          sort: [row.sort_key],
+        })
         continue
       }
 
-      if (instance.workflow_version > workflow.version) {
+      if (instance.workflow_version !== workflow.version) {
         continue
       }
 
-      for (const wait of decodeJson<DurableWait[]>(instance.waits_json, [])) {
-        if (wait.kind === "run") {
-          if (wait.readyAt > input.now) {
-            continue
-          }
-          candidates.push({
-            kind: "run",
-            activationId: activationIdFromParts(
-              instance.workflow_id,
-              instance.run_id,
-              instance.sequence,
-              "run",
-              wait.name,
-            ),
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            sequence: instance.sequence,
-            activationTime: wait.readyAt,
-            leaseUntil: "",
-            sort: [wait.readyAt, "run", wait.name, instance.workflow_id, instance.run_id],
-          })
-        } else if (wait.kind === "signal") {
-          const signalRow = oneRow<SignalRow>(
-            this.db
-              .prepare(
-                `
-                SELECT * FROM signals
-                WHERE workflow_id = ? AND run_id = ? AND type = ? AND consumed_by_sequence IS NULL
-                ORDER BY received_at, type, signal_id
-                LIMIT 1
-              `,
-              )
-              .get(instance.workflow_id, instance.run_id, wait.type),
-          )
-
-          if (!signalRow) {
-            continue
-          }
-
-          candidates.push({
-            kind: "event",
-            activationId: activationIdFromParts(
-              instance.workflow_id,
-              instance.run_id,
-              instance.sequence,
-              "signal",
-              signalRow.signal_id,
-            ),
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            sequence: instance.sequence,
-            activationTime: signalRow.received_at,
-            waitName: wait.name,
-            wait,
-            event: {
-              kind: "signal",
-              signalId: signalRow.signal_id,
-              payload: decodeJson<JsonValue>(signalRow.payload_json, null),
-              occurredAt: signalRow.received_at,
-              consumeSignalId: signalRow.signal_id,
-            },
-            leaseUntil: "",
-            sort: [signalRow.received_at, "signal", wait.name, signalRow.signal_id],
-          })
-        } else if (wait.kind === "timer") {
-          if (wait.fireAt > input.now) {
-            continue
-          }
-
-          candidates.push({
-            kind: "event",
-            activationId: activationIdFromParts(
-              instance.workflow_id,
-              instance.run_id,
-              instance.sequence,
-              "timer",
-              `${wait.name}:${wait.fireAt}`,
-            ),
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            sequence: instance.sequence,
-            activationTime: wait.fireAt,
-            waitName: wait.name,
-            wait,
-            event: {
-              kind: "timer",
-              firedAt: wait.fireAt,
-              occurredAt: wait.fireAt,
-            },
-            leaseUntil: "",
-            sort: [wait.fireAt, "timer", wait.name, `${wait.name}:${wait.fireAt}`],
-          })
-        } else {
-          const childRow = oneRow<ChildRow>(
-            this.db
-              .prepare(
-                `
-                SELECT * FROM children
-                WHERE workflow_id = ? AND run_id = ? AND status <> 'started' AND delivered_by_sequence IS NULL
-                ORDER BY completed_at, child_record_id
-                LIMIT 1
-              `,
-              )
-              .get(wait.workflowId, wait.runId),
-          )
-
-          if (!childRow) {
-            continue
-          }
-
-          const occurredAt = childRow.completed_at ?? input.now
-          candidates.push({
-            kind: "event",
-            activationId: activationIdFromParts(
-              instance.workflow_id,
-              instance.run_id,
-              instance.sequence,
-              "child",
-              childRow.child_record_id,
-            ),
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            sequence: instance.sequence,
-            activationTime: occurredAt,
-            waitName: wait.name,
-            wait,
-            event: {
-              kind: "child",
-              childRecordId: childRow.child_record_id,
-              occurredAt,
-              event:
-                childRow.status === "completed"
-                  ? { ok: true, output: decodeJson<JsonValue>(childRow.output_json, null) }
-                  : {
-                      ok: false,
-                      error: decodeJson<SerializedError>(childRow.error_json, {
-                        message: "Child failed",
-                      }),
-                    },
-            },
-            leaseUntil: "",
-            sort: [occurredAt, "child", wait.name, childRow.child_record_id],
-          })
-        }
+      const candidate = this.readyCandidateFromRow(row, instance)
+      if (candidate) {
+        candidates.push(candidate)
       }
     }
 
     return candidates
+  }
+
+  private readyCandidateFromRow(row: ReadyEventRow, instance: InstanceRow): ReadyCandidate | null {
+    if (row.kind === "run") {
+      if (!row.activation_id) {
+        return null
+      }
+      return {
+        kind: "run",
+        activationId: row.activation_id,
+        workflowName: instance.workflow_name,
+        workflowId: instance.workflow_id,
+        runId: instance.run_id,
+        sequence: instance.sequence,
+        activationTime: row.ready_at,
+        leaseUntil: "",
+        sort: [row.sort_key],
+      }
+    }
+
+    if (row.kind === "signal" || row.kind === "timer" || row.kind === "child") {
+      if (!row.activation_id || !row.wait_name) {
+        return null
+      }
+      return {
+        kind: "event",
+        activationId: row.activation_id,
+        workflowName: instance.workflow_name,
+        workflowId: instance.workflow_id,
+        runId: instance.run_id,
+        sequence: instance.sequence,
+        activationTime: row.ready_at,
+        waitName: row.wait_name,
+        wait: decodeJson<Exclude<DurableWait, { kind: "run" }>>(row.wait_json, {
+          kind: "timer",
+          name: row.wait_name,
+          fireAt: row.ready_at,
+        }),
+        event: decodeJson<ReadyEvent>(row.event_json, {
+          kind: "timer",
+          firedAt: row.ready_at,
+          occurredAt: row.ready_at,
+        }),
+        leaseUntil: "",
+        sort: [row.sort_key],
+      }
+    }
+
+    return null
+  }
+
+  private hasUncompletedNonMigrationActivation(instance: InstanceRow): boolean {
+    return Boolean(
+      oneRow(
+        this.db
+          .prepare(
+            `
+            SELECT activation_id FROM activation_claims
+            WHERE workflow_id = ? AND run_id = ? AND sequence = ?
+              AND kind <> 'migration' AND completed_by_sequence IS NULL
+            LIMIT 1
+          `,
+          )
+          .get(instance.workflow_id, instance.run_id, instance.sequence),
+      ),
+    )
+  }
+
+  private nextWakeAt(
+    shardIds: number[],
+    now: string,
+    workflows: Record<string, { version: number }>,
+  ): string | undefined {
+    const workflowEntries = Object.entries(workflows)
+    if (shardIds.length === 0 || workflowEntries.length === 0) {
+      return undefined
+    }
+
+    const placeholders = shardIds.map(() => "?").join(", ")
+    const versionClauses = workflowEntries.map(() => "(workflow_name = ? AND workflow_version = ?)").join(" OR ")
+    const versionParams = workflowEntries.flatMap(([name, workflow]) => [name, workflow.version])
+    const row = oneRow<{ ready_at: string }>(
+      this.db
+        .prepare(
+          `
+          SELECT ready_at FROM ready_events
+          WHERE partition_shard IN (${placeholders})
+            AND kind IN ('run', 'timer')
+            AND ready_at > ?
+            AND (${versionClauses})
+          ORDER BY ready_at
+          LIMIT 1
+        `,
+        )
+        .get(...shardIds, now, ...versionParams),
+    )
+    return row?.ready_at
   }
 
   private tryWriteActivationClaim(
@@ -1101,6 +1414,53 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
     candidate.leaseUntil = leaseUntil
     return true
+  }
+
+  private assertLiveActivationLease(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    workerId: string
+    now: string
+  }): ActivationClaimRow {
+    const claim = oneRow<ActivationClaimRow>(
+      this.db.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+    )
+    if (
+      !claim ||
+      claim.workflow_id !== input.workflowId ||
+      claim.run_id !== input.runId ||
+      claim.owner_id !== input.workerId ||
+      !claim.lease_until ||
+      claim.lease_until < input.now ||
+      claim.completed_by_sequence !== null
+    ) {
+      throw new Error(`Lost activation lease: ${input.activationId}`)
+    }
+    return claim
+  }
+
+  private throwEffectMutationError(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    effectId: string
+  }): never {
+    const effect = oneRow<EffectRow>(
+      this.db
+        .prepare(
+          `
+          SELECT * FROM effects
+          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+          LIMIT 1
+        `,
+        )
+        .get(input.workflowId, input.runId, input.activationId, input.effectId),
+    )
+    if (!effect) {
+      throw new Error(`Unknown effect: ${input.effectId}`)
+    }
+    throw new Error(`Effect is already terminal: ${input.effectId}`)
   }
 
   private writeNextInstance(input: CommitCheckpointInput, nextSequence: number): void {
@@ -1240,10 +1600,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         .run(input.now, encodeJson(error), existing.child_record_id)
     }
 
+    this.replaceReadyEventsForInstance(existing.parent_workflow_id, existing.parent_run_id)
     void nextSequence
   }
 
   private deleteInstanceRecords(workflowId: string, runId: string): void {
+    this.db
+      .prepare(
+        `
+        DELETE FROM children
+        WHERE (parent_workflow_id = ? AND parent_run_id = ?)
+          OR (workflow_id = ? AND run_id = ?)
+      `,
+      )
+      .run(workflowId, runId, workflowId, runId)
     this.db.prepare("DELETE FROM instances WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
   }
 }
@@ -1267,25 +1637,29 @@ function activationIdFromParts(
   return `${workflowId}/${runId}/${sequence}/${kind}/${eventId}`
 }
 
-function compareCandidates(left: ReadyCandidate, right: ReadyCandidate): number {
-  return compareStringArrays(left.sort, right.sort)
+function claimMatchesCommit(claim: ActivationClaimRow, input: CommitCheckpointInput): boolean {
+  if (claim.kind !== "event") {
+    return !input.consumeSignalId && !input.consumeChildRecordId
+  }
+
+  const event = decodeJson<ReadyEvent | null>(claim.event_json, null)
+  if (!event) {
+    return false
+  }
+
+  if (event.kind === "signal") {
+    return input.consumeSignalId === event.consumeSignalId && !input.consumeChildRecordId
+  }
+
+  if (event.kind === "child") {
+    return input.consumeChildRecordId === event.childRecordId && !input.consumeSignalId
+  }
+
+  return !input.consumeSignalId && !input.consumeChildRecordId
 }
 
-function compareStringArrays(left: string[], right: string[]): number {
-  const length = Math.max(left.length, right.length)
-  for (let index = 0; index < length; index += 1) {
-    if (left[index] === undefined) {
-      return -1
-    }
-    if (right[index] === undefined) {
-      return 1
-    }
-    const compared = left[index].localeCompare(right[index])
-    if (compared !== 0) {
-      return compared
-    }
-  }
-  return 0
+function sortKey(...parts: string[]): string {
+  return parts.join("\u0000")
 }
 
 function stripSort(candidate: ReadyCandidate): ClaimedActivation {

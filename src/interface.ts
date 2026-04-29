@@ -200,6 +200,11 @@ export type ClaimReadyActivationInput = {
   leaseMs: number
 }
 
+export type ClaimReadyActivationResult = {
+  activation: ClaimedActivation | null
+  nextWakeAt?: string
+}
+
 export type HeartbeatActivationInput = {
   activationId: string
   workerId: string
@@ -232,10 +237,16 @@ export type ReserveEffectInput = {
   workflowId: string
   runId: string
   activationId: string
+  workerId: string
   key: string
+  now: string
 }
 
 export type HeartbeatEffectInput = {
+  workflowId: string
+  runId: string
+  activationId: string
+  workerId: string
   effectId: string
   now: string
   details?: JsonValue
@@ -244,15 +255,21 @@ export type HeartbeatEffectInput = {
 export type CompleteEffectInput = {
   workflowId: string
   runId: string
+  activationId: string
+  workerId: string
   effectId: string
   result: JsonValue
+  now: string
 }
 
 export type FailEffectInput = {
   workflowId: string
   runId: string
+  activationId: string
+  workerId: string
   effectId: string
   error: SerializedError
+  now: string
 }
 
 export type CommitCheckpointInput = {
@@ -282,7 +299,7 @@ export type DurabilityProvider = {
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>
   releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void>
-  claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimedActivation | null>
+  claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
   heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
   releaseActivation(input: ReleaseActivationInput): Promise<void>
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
