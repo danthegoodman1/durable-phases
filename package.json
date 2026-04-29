@@ -20,6 +20,8 @@
     "demo": "tsx src/demos/index.ts",
     "test": "vitest run",
     "test:soak": "DURABLE_SOAK=1 vitest run",
+    "benchmark": "tsx src/benchmarks/sqlite.ts",
+    "benchmark:sqlite": "tsx src/benchmarks/sqlite.ts",
     "watch": "tsx watch src/index.ts",
     "build": "tsc"
   },
