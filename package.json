@@ -19,6 +19,7 @@
     "dev": "tsx src/index.ts",
     "demo": "tsx src/demos/index.ts",
     "test": "vitest run",
+    "test:soak": "DURABLE_SOAK=1 vitest run",
     "watch": "tsx watch src/index.ts",
     "build": "tsc"
   },

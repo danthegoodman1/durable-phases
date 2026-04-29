@@ -39,6 +39,12 @@ import type {
   JsonValue,
   SerializedError,
 } from "./workflow.js"
+import type { DurableMetricTags, DurableObservability } from "./observability.js"
+import {
+  countDurable,
+  gaugeDurable,
+  logDurable,
+} from "./observability.js"
 import { clone, isPlainObject, toJson } from "./workflow.js"
 
 const require = createRequire(import.meta.url)
@@ -62,6 +68,10 @@ type SqliteConstructor = {
 }
 
 const Database = require("better-sqlite3") as SqliteConstructor
+
+export type SqliteDurabilityProviderOptions = DurableObservability & {
+  busyTimeoutMs?: number
+}
 
 type ReadyCandidate = ClaimedActivation & {
   sort: string[]
@@ -191,13 +201,15 @@ type ReadyEventRow = {
 export class SqliteDurabilityProvider implements DurabilityProvider {
   private readonly db: SqliteDatabase
   private readonly busyTimeoutMs: number
+  private readonly observability: DurableObservability
   private closed = false
 
   constructor(
     private readonly filePath: string,
-    options: { busyTimeoutMs?: number } = {},
+    options: SqliteDurabilityProviderOptions = {},
   ) {
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000
+    this.observability = { logger: options.logger, metrics: options.metrics }
     if (filePath !== ":memory:") {
       mkdirSync(dirname(filePath), { recursive: true })
     }
@@ -261,7 +273,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
-      return { workflowId: input.workflowId, runId: input.runId }
+      const ref = { workflowId: input.workflowId, runId: input.runId }
+      this.log("info", "provider.instance.create", {
+        workflowName: input.workflowName,
+        workflowId: input.workflowId,
+        runId: input.runId,
+        partitionShard: input.partitionShard,
+      })
+      this.count("durable.provider.instance", {
+        workflowName: input.workflowName,
+        shardId: input.partitionShard,
+        status: "created",
+      })
+      return ref
     })
 
     return create.immediate() as InstanceRef
@@ -292,13 +316,50 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       if (existing) {
         if (conflictPolicy === "fail") {
+          this.log("warn", "provider.child.create_conflict", {
+            workflowName: input.workflowName,
+            workflowId: input.workflowId,
+            runId: input.runId,
+            parentWorkflowId: input.parentWorkflowId,
+            parentRunId: input.parentRunId,
+            activationId: input.activationId,
+            key: input.key,
+            reason: "existing_parent_activation_key",
+          })
+          this.count("durable.provider.child", {
+            workflowName: input.workflowName,
+            status: "conflict",
+            reason: "existing_parent_activation_key",
+          })
           throw new Error(
             `Child workflow already exists for activation key: ${input.parentWorkflowId}/${input.parentRunId}/${input.activationId}/${input.key}`,
           )
         }
         if (conflictPolicy === "terminate_existing") {
           this.deleteInstanceRecords(existing.workflow_id, existing.run_id)
+          this.log("info", "provider.child.terminate_existing", {
+            workflowName: input.workflowName,
+            workflowId: existing.workflow_id,
+            runId: existing.run_id,
+            parentWorkflowId: input.parentWorkflowId,
+            parentRunId: input.parentRunId,
+            activationId: input.activationId,
+            key: input.key,
+          })
         } else {
+          this.log("debug", "provider.child.use_existing", {
+            workflowName: existing.workflow_name,
+            workflowId: existing.workflow_id,
+            runId: existing.run_id,
+            parentWorkflowId: input.parentWorkflowId,
+            parentRunId: input.parentRunId,
+            activationId: input.activationId,
+            key: input.key,
+          })
+          this.count("durable.provider.child", {
+            workflowName: existing.workflow_name,
+            status: "use_existing",
+          })
           return childHandle(rowToChildRecord(existing))
         }
       }
@@ -306,7 +367,21 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       if (this.instanceRow(input)) {
         if (conflictPolicy === "terminate_existing") {
           this.deleteInstanceRecords(input.workflowId, input.runId)
+          this.log("info", "provider.child.terminate_existing", {
+            workflowName: input.workflowName,
+            workflowId: input.workflowId,
+            runId: input.runId,
+            parentWorkflowId: input.parentWorkflowId,
+            parentRunId: input.parentRunId,
+            activationId: input.activationId,
+            key: input.key,
+          })
         } else {
+          this.count("durable.provider.child", {
+            workflowName: input.workflowName,
+            status: "conflict",
+            reason: "existing_child_instance",
+          })
           throw new Error(`Child workflow instance already exists: ${input.workflowId}/${input.runId}`)
         }
       }
@@ -364,6 +439,21 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
+      this.log("info", "provider.child.create", {
+        workflowName: input.workflowName,
+        workflowId: input.workflowId,
+        runId: input.runId,
+        childRecordId,
+        parentWorkflowId: input.parentWorkflowId,
+        parentRunId: input.parentRunId,
+        activationId: input.activationId,
+        key: input.key,
+        parentClosePolicy,
+      })
+      this.count("durable.provider.child", {
+        workflowName: input.workflowName,
+        status: "created",
+      })
       return {
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
@@ -410,6 +500,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         deliverToParent: true,
         reason: childCanceledError(),
       })
+      this.log("info", "provider.child.cancel", {
+        workflowName: childRecord.workflow_name,
+        workflowId: childRecord.workflow_id,
+        runId: childRecord.run_id,
+        childRecordId: childRecord.child_record_id,
+        parentWorkflowId: childRecord.parent_workflow_id,
+        parentRunId: childRecord.parent_run_id,
+        activationId: input.activationId,
+      })
+      this.count("durable.provider.child", {
+        workflowName: childRecord.workflow_name,
+        status: "canceled",
+      })
     })
 
     cancel.immediate()
@@ -439,6 +542,32 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       .prepare("SELECT * FROM children ORDER BY child_record_id")
       .all()
       .map((row) => rowToChildRecord(requireRow<ChildRow>(row)))
+  }
+
+  async listActivationClaims(): Promise<
+    Array<{
+      activationId: string
+      workflowId: string
+      runId: string
+      sequence: number
+      kind: ActivationClaimRow["kind"]
+      completedBySequence?: number
+    }>
+  > {
+    return this.db
+      .prepare("SELECT * FROM activation_claims ORDER BY workflow_id, run_id, sequence, activation_id")
+      .all()
+      .map((row) => {
+        const claim = requireRow<ActivationClaimRow>(row)
+        return {
+          activationId: claim.activation_id,
+          workflowId: claim.workflow_id,
+          runId: claim.run_id,
+          sequence: claim.sequence,
+          kind: claim.kind,
+          completedBySequence: claim.completed_by_sequence ?? undefined,
+        }
+      })
   }
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
@@ -475,6 +604,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
+      this.log("info", "provider.signal.append", {
+        workflowId: input.workflowId,
+        runId: input.runId,
+        signalId: signal.signalId,
+        type: input.type,
+      })
+      this.count("durable.provider.signal", { status: "appended" })
       return signal
     })
 
@@ -502,9 +638,28 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         .run(input.shardId, input.ownerId, leaseUntil, input.now)
 
       if (result.changes === 0) {
+        this.log("debug", "provider.shard.claim_miss", {
+          workerId: input.ownerId,
+          shardId: input.shardId,
+        })
+        this.count("durable.provider.shard.claim", {
+          workerId: input.ownerId,
+          shardId: input.shardId,
+          status: "miss",
+        })
         return null
       }
 
+      this.log("debug", "provider.shard.claim", {
+        workerId: input.ownerId,
+        shardId: input.shardId,
+        leaseUntil,
+      })
+      this.count("durable.provider.shard.claim", {
+        workerId: input.ownerId,
+        shardId: input.shardId,
+        status: "success",
+      })
       return { shardId: input.shardId, ownerId: input.ownerId, leaseUntil }
     })
 
@@ -522,8 +677,26 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
       .run(addMs(input.now, input.leaseMs), input.shardId, input.ownerId, input.now)
     if (result.changes === 0) {
+      this.log("warn", "provider.shard.heartbeat_failed", {
+        workerId: input.ownerId,
+        shardId: input.shardId,
+      })
+      this.count("durable.provider.shard.heartbeat", {
+        workerId: input.ownerId,
+        shardId: input.shardId,
+        status: "failed",
+      })
       throw new Error(`Lost dispatch shard lease: ${input.shardId}`)
     }
+    this.log("debug", "provider.shard.heartbeat", {
+      workerId: input.ownerId,
+      shardId: input.shardId,
+    })
+    this.count("durable.provider.shard.heartbeat", {
+      workerId: input.ownerId,
+      shardId: input.shardId,
+      status: "success",
+    })
   }
 
   async releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void> {
@@ -536,6 +709,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       `,
       )
       .run(input.shardId, input.ownerId)
+    this.log("debug", "provider.shard.release", {
+      workerId: input.ownerId,
+      shardId: input.shardId,
+    })
+    this.count("durable.provider.shard.release", {
+      workerId: input.ownerId,
+      shardId: input.shardId,
+      status: "released",
+    })
   }
 
   async claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult> {
@@ -548,6 +730,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       })
 
       if (ownedShards.length === 0) {
+        this.log("debug", "provider.activation.claim_miss", {
+          workerId: input.workerId,
+          reason: "no_owned_shards",
+        })
+        this.count("durable.provider.activation.claim", {
+          workerId: input.workerId,
+          status: "miss",
+          reason: "no_owned_shards",
+        })
         return { activation: null }
       }
 
@@ -564,9 +755,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         }
       }
 
+      const nextWakeAt = this.nextWakeAt(ownedShards, input.now, input.workflows)
+      this.log("debug", "provider.activation.claim_miss", {
+        workerId: input.workerId,
+        nextWakeAt,
+      })
+      this.count("durable.provider.activation.claim", {
+        workerId: input.workerId,
+        status: "miss",
+      })
+      if (nextWakeAt) {
+        this.gauge("durable.provider.next_wake", new Date(nextWakeAt).getTime(), {
+          workerId: input.workerId,
+          status: "scheduled",
+        })
+      }
       return {
         activation: null,
-        nextWakeAt: this.nextWakeAt(ownedShards, input.now, input.workflows),
+        nextWakeAt,
       }
     })
 
@@ -589,8 +795,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
     const result = heartbeat.immediate() as SqliteRunResult
     if (result.changes === 0) {
+      this.log("warn", "provider.activation.heartbeat_failed", {
+        workerId: input.workerId,
+        activationId: input.activationId,
+      })
+      this.count("durable.provider.activation.heartbeat", {
+        workerId: input.workerId,
+        status: "failed",
+      })
       throw new Error(`Lost activation lease: ${input.activationId}`)
     }
+    this.log("debug", "provider.activation.heartbeat", {
+      workerId: input.workerId,
+      activationId: input.activationId,
+    })
+    this.count("durable.provider.activation.heartbeat", {
+      workerId: input.workerId,
+      status: "success",
+    })
   }
 
   async releaseActivation(input: ReleaseActivationInput): Promise<void> {
@@ -603,6 +825,14 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       `,
       )
       .run(input.activationId, input.workerId)
+    this.log("debug", "provider.activation.release", {
+      workerId: input.workerId,
+      activationId: input.activationId,
+    })
+    this.count("durable.provider.activation.release", {
+      workerId: input.workerId,
+      status: "released",
+    })
   }
 
   async getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
@@ -624,6 +854,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
 
       if (existing?.status === "completed") {
+        this.log("debug", "provider.effect.memoized", {
+          workerId: input.workerId,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          effectId: existing.effect_id,
+          key: input.key,
+        })
+        this.count("durable.provider.effect", { workerId: input.workerId, status: "memoized" })
         return {
           status: "completed",
           result: decodeJson<JsonValue>(existing.result_json, null),
@@ -631,6 +870,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       if (existing?.status === "failed") {
+        this.log("debug", "provider.effect.failed_memoized", {
+          workerId: input.workerId,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          effectId: existing.effect_id,
+          key: input.key,
+        })
+        this.count("durable.provider.effect", { workerId: input.workerId, status: "failed" })
         return {
           status: "failed",
           error: decodeJson<SerializedError>(existing.error_json, { message: "Effect failed" }),
@@ -639,6 +887,17 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       if (existing) {
         const started = this.ensureEffectAttemptStarted(existing, input)
+        this.log("debug", "provider.effect.reserve", {
+          workerId: input.workerId,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          effectId: started.effect_id,
+          attemptId: started.attempt_id,
+          key: input.key,
+          attempt: started.attempt ?? 1,
+        })
+        this.count("durable.provider.effect", { workerId: input.workerId, status: "reserved" })
         return {
           status: "reserved",
           effectId: started.effect_id,
@@ -691,6 +950,17 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           encodeJson(options.nonRetryableErrorNames),
         )
 
+      this.log("debug", "provider.effect.reserve", {
+        workerId: input.workerId,
+        workflowId: input.workflowId,
+        runId: input.runId,
+        activationId: input.activationId,
+        effectId,
+        attemptId,
+        key: input.key,
+        attempt: 1,
+      })
+      this.count("durable.provider.effect", { workerId: input.workerId, status: "reserved" })
       return {
         status: "reserved",
         effectId,
@@ -735,6 +1005,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
+    this.log("debug", "provider.effect.heartbeat", {
+      workerId: input.workerId,
+      workflowId: input.workflowId,
+      runId: input.runId,
+      activationId: input.activationId,
+      effectId: input.effectId,
+      attemptId: input.attemptId,
+    })
+    this.count("durable.provider.effect", { workerId: input.workerId, status: "heartbeat" })
   }
 
   async completeEffect(input: CompleteEffectInput): Promise<void> {
@@ -764,6 +1043,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
+    this.log("debug", "provider.effect.complete", {
+      workerId: input.workerId,
+      workflowId: input.workflowId,
+      runId: input.runId,
+      activationId: input.activationId,
+      effectId: input.effectId,
+      attemptId: input.attemptId,
+    })
+    this.count("durable.provider.effect", { workerId: input.workerId, status: "completed" })
   }
 
   async failEffect(input: FailEffectInput): Promise<FailEffectResult> {
@@ -795,6 +1083,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
             input.effectId,
             input.attemptId,
         )
+        this.log("info", "provider.effect.retry", {
+          workerId: input.workerId,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          effectId: input.effectId,
+          attemptId: input.attemptId,
+          nextAttemptAt: retry.nextAttemptAt,
+          nextAttempt: retry.nextAttempt,
+        })
+        this.count("durable.provider.effect", {
+          workerId: input.workerId,
+          status: "retry_scheduled",
+        })
         return { result: retry, changes: result.changes }
       }
 
@@ -817,6 +1119,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.effectId,
           input.attemptId,
         )
+      this.log("warn", "provider.effect.fail", {
+        workerId: input.workerId,
+        workflowId: input.workflowId,
+        runId: input.runId,
+        activationId: input.activationId,
+        effectId: input.effectId,
+        attemptId: input.attemptId,
+        error: input.error,
+      })
+      this.count("durable.provider.effect", { workerId: input.workerId, status: "failed" })
       return { result: { status: "failed" } satisfies FailEffectResult, changes: result.changes }
     })
 
@@ -830,14 +1142,31 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
     const commit = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      const conflict = (reason: string, sequence: number): CommitCheckpointResult => {
+        this.log("warn", "provider.checkpoint.conflict", {
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          workerId: input.workerId,
+          reason,
+          sequence,
+          expectedSequence: input.expectedSequence,
+        })
+        this.count("durable.provider.checkpoint", {
+          workerId: input.workerId,
+          status: "conflict",
+          reason,
+        })
+        return { ok: false, sequence }
+      }
 
       const instance = this.instanceRow(input)
       if (!instance || instance.status !== "running") {
-        return { ok: false, sequence: instance?.sequence ?? -1 }
+        return conflict("not_running", instance?.sequence ?? -1)
       }
 
       if (instance.sequence !== input.expectedSequence) {
-        return { ok: false, sequence: instance.sequence }
+        return conflict("stale_sequence", instance.sequence)
       }
 
       const claim = oneRow<ActivationClaimRow>(
@@ -854,11 +1183,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         claim.lease_until < input.now ||
         claim.completed_by_sequence !== null
       ) {
-        return { ok: false, sequence: instance.sequence }
+        return conflict("lost_activation_lease", instance.sequence)
       }
 
       if (!claimMatchesCommit(claim, input)) {
-        return { ok: false, sequence: instance.sequence }
+        return conflict("activation_event_mismatch", instance.sequence)
       }
 
       const signalToConsume = input.consumeSignalId
@@ -876,7 +1205,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         : undefined
 
       if (input.consumeSignalId && !signalToConsume) {
-        return { ok: false, sequence: instance.sequence }
+        return conflict("signal_not_consumable", instance.sequence)
       }
 
       const childToConsume = input.consumeChildRecordId
@@ -895,7 +1224,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         : undefined
 
       if (input.consumeChildRecordId && !childToConsume) {
-        return { ok: false, sequence: instance.sequence }
+        return conflict("child_not_consumable", instance.sequence)
       }
 
       const nextSequence = instance.sequence + 1
@@ -927,6 +1256,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         )
         .run(nextSequence, input.now, input.now, input.workerId, input.activationId)
 
+      this.log("info", "provider.checkpoint.commit", {
+        workflowName: instance.workflow_name,
+        workflowId: input.workflowId,
+        runId: input.runId,
+        activationId: input.activationId,
+        workerId: input.workerId,
+        sequence: nextSequence,
+        status: input.next.status,
+      })
+      this.count("durable.provider.checkpoint", {
+        workerId: input.workerId,
+        workflowName: instance.workflow_name,
+        status: "success",
+      })
       return { ok: true, sequence: nextSequence }
     })
 
@@ -1454,6 +1797,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           continue
         }
         if (this.hasUncompletedNonMigrationActivation(instance)) {
+          this.log("debug", "provider.activation.blocked_by_competing_activation", {
+            workflowName: instance.workflow_name,
+            workflowId: instance.workflow_id,
+            runId: instance.run_id,
+            sequence: instance.sequence,
+            activationKind: "migration",
+          })
+          this.count("durable.provider.activation.claim", {
+            workflowName: instance.workflow_name,
+            activationKind: "migration",
+            status: "blocked",
+            reason: "competing_activation",
+          })
           continue
         }
         candidates.push({
@@ -1483,10 +1839,40 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const candidate = this.readyCandidateFromRow(row, instance)
       if (candidate) {
         if (this.hasCompetingUncompletedActivation(instance, candidate.activationId)) {
+          this.log("debug", "provider.activation.blocked_by_competing_activation", {
+            workflowName: instance.workflow_name,
+            workflowId: instance.workflow_id,
+            runId: instance.run_id,
+            activationId: candidate.activationId,
+            activationKind: candidate.kind,
+            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
+            sequence: instance.sequence,
+          })
+          this.count("durable.provider.activation.claim", {
+            workflowName: instance.workflow_name,
+            activationKind: candidate.kind,
+            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
+            status: "blocked",
+            reason: "competing_activation",
+          })
           continue
         }
         const blockedUntil = this.activationRetryBlockedUntil(candidate.activationId, input.now)
         if (blockedUntil) {
+          this.log("debug", "provider.activation.blocked_by_effect_retry", {
+            workflowName: instance.workflow_name,
+            workflowId: instance.workflow_id,
+            runId: instance.run_id,
+            activationId: candidate.activationId,
+            blockedUntil,
+          })
+          this.count("durable.provider.activation.claim", {
+            workflowName: instance.workflow_name,
+            activationKind: candidate.kind,
+            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
+            status: "blocked",
+            reason: "effect_retry",
+          })
           continue
         }
         candidates.push(candidate)
@@ -1743,6 +2129,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
             timeoutKind,
             effect.effect_id,
           )
+        this.log("warn", "provider.effect.timeout", {
+          workflowId: effect.workflow_id,
+          runId: effect.run_id,
+          activationId,
+          effectId: effect.effect_id,
+          attemptId: effect.attempt_id,
+          timeoutKind,
+          status: "failed",
+        })
+        this.count("durable.provider.effect", {
+          status: "timeout_failed",
+          reason: timeoutKind,
+        })
         continue
       }
 
@@ -1765,6 +2164,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           encodeJson(timeoutError),
           effect.effect_id,
         )
+      this.log("info", "provider.effect.timeout_retry", {
+        workflowId: effect.workflow_id,
+        runId: effect.run_id,
+        activationId,
+        effectId: effect.effect_id,
+        attemptId: effect.attempt_id,
+        timeoutKind,
+        nextAttempt: retry.nextAttempt,
+        nextAttemptAt: retry.nextAttemptAt,
+      })
+      this.count("durable.provider.effect", {
+        status: "timeout_retry",
+        reason: timeoutKind,
+      })
     }
 
     this.db
@@ -1933,10 +2346,28 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (result.changes === 0) {
       return false
     }
-    if (shouldResetPendingEffectAttemptsOnClaim(existing, workerId, now)) {
+    const reclaimed = shouldResetPendingEffectAttemptsOnClaim(existing, workerId, now)
+    if (reclaimed) {
       this.resetPendingEffectsForActivationReclaim(candidate.activationId)
     }
     candidate.leaseUntil = leaseUntil
+    this.log("debug", reclaimed ? "provider.activation.reclaim" : "provider.activation.claim", {
+      workerId,
+      workflowName: candidate.workflowName,
+      workflowId: candidate.workflowId,
+      runId: candidate.runId,
+      activationId: candidate.activationId,
+      activationKind: candidate.kind,
+      eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
+      leaseUntil,
+    })
+    this.count("durable.provider.activation.claim", {
+      workerId,
+      workflowName: candidate.workflowName,
+      activationKind: candidate.kind,
+      eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
+      status: reclaimed ? "reclaimed" : "success",
+    })
     return true
   }
 
@@ -2207,6 +2638,23 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (child.status !== "started") {
       return
     }
+    const event = options.deliverToParent
+      ? "provider.child.cancel_started"
+      : "provider.child.parent_close_cancel"
+    const status = options.deliverToParent ? "cancel_started" : "parent_close_cancel"
+    this.log("info", event, {
+      workflowName: child.workflow_name,
+      workflowId: child.workflow_id,
+      runId: child.run_id,
+      childRecordId: child.child_record_id,
+      parentWorkflowId: child.parent_workflow_id,
+      parentRunId: child.parent_run_id,
+      deliverToParent: options.deliverToParent,
+    })
+    this.count("durable.provider.child", {
+      workflowName: child.workflow_name,
+      status,
+    })
 
     const instance = this.instanceRow({ workflowId: child.workflow_id, runId: child.run_id })
     if (instance?.status === "running") {
@@ -2280,6 +2728,18 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       `,
       )
       .run(now, deliveredBySequence, child.child_record_id)
+    this.log("info", "provider.child.parent_close_abandon", {
+      workflowName: child.workflow_name,
+      workflowId: child.workflow_id,
+      runId: child.run_id,
+      childRecordId: child.child_record_id,
+      parentWorkflowId: child.parent_workflow_id,
+      parentRunId: child.parent_run_id,
+    })
+    this.count("durable.provider.child", {
+      workflowName: child.workflow_name,
+      status: "parent_close_abandon",
+    })
   }
 
   private deleteInstanceRecords(workflowId: string, runId: string): void {
@@ -2293,6 +2753,22 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
       .run(workflowId, runId, workflowId, runId)
     this.db.prepare("DELETE FROM instances WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
+  }
+
+  private log(
+    level: "debug" | "info" | "warn" | "error",
+    event: string,
+    fields?: Record<string, unknown>,
+  ): void {
+    logDurable(this.observability, level, event, fields)
+  }
+
+  private count(name: string, tags?: DurableMetricTags): void {
+    countDurable(this.observability, name, 1, tags)
+  }
+
+  private gauge(name: string, value: number, tags?: DurableMetricTags): void {
+    gaugeDurable(this.observability, name, value, tags)
   }
 }
 

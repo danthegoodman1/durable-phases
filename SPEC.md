@@ -810,6 +810,44 @@ type DurabilityProvider = {
 }
 ```
 
+### Operational observability
+
+The TypeScript runtime and SQLite provider accept optional best-effort observability sinks:
+
+```ts
+type DurableLogger = {
+  debug(event: string, fields?: Record<string, unknown>): void
+  info(event: string, fields?: Record<string, unknown>): void
+  warn(event: string, fields?: Record<string, unknown>): void
+  error(event: string, fields?: Record<string, unknown>): void
+}
+
+type DurableMetrics = {
+  counter(name: string, value?: number, tags?: MetricTags): void
+  histogram(name: string, value: number, tags?: MetricTags): void
+  gauge(name: string, value: number, tags?: MetricTags): void
+}
+
+type MetricTags = Record<string, string | number | boolean>
+```
+
+Logger and metrics failures must be swallowed by the runtime/provider and must not affect workflow execution.
+
+Metrics use stable low-cardinality names and tags. Tags may include values such as `workerId`, `workflowName`, `activationKind`, `eventKind`, `status`, `reason`, and `shardId`. High-cardinality IDs such as `workflowId`, `runId`, `activationId`, `signalId`, child IDs, effect IDs, attempt IDs, and idempotency keys may appear in logs but must not be emitted as metric tags.
+
+The core lifecycle should be observable:
+
+```text
+workflow start/signal/query
+worker loop start/stop/sleep/error
+drain start/end and next wake
+shard claim/heartbeat/release
+activation claim/reclaim/start/complete/conflict/failure/release
+activity reserve/memoize/heartbeat/complete/fail/retry/timeout
+checkpoint commit success/conflict
+child start/cancel/parent-close cancel/abandon
+```
+
 ### Instance creation
 
 `createInstance(...)` must atomically:

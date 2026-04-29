@@ -1,4 +1,5 @@
 export * from "./workflow.js"
 export * from "./interface.js"
+export * from "./observability.js"
 export * from "./runtime.js"
 export * from "./sqlite.js"

@@ -3,11 +3,20 @@ import { z } from "zod"
 import type {
   ClaimedActivation,
   ConflictPolicy,
+  CommitCheckpointResult,
   DurabilityProvider,
   DurableWait,
   PersistedInstance,
   SignalRecord,
 } from "./interface.js"
+import type { DurableMetricTags, DurableObservability } from "./observability.js"
+import {
+  countDurable,
+  errorFields,
+  gaugeDurable,
+  histogramDurable,
+  logDurable,
+} from "./observability.js"
 import { workflowPartitionShard } from "./interface.js"
 import type {
   AnyWorkflow,
@@ -39,7 +48,7 @@ import {
   toJsonObject,
 } from "./workflow.js"
 
-export type DurableRuntimeOptions = {
+export type DurableRuntimeOptions = DurableObservability & {
   workerId?: string
   shardCount?: number
   dispatchLeaseMs?: number
@@ -76,6 +85,7 @@ export class DurableRuntime {
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
+  private readonly observability: DurableObservability
 
   constructor(
     private readonly provider: DurabilityProvider,
@@ -89,6 +99,7 @@ export class DurableRuntime {
     this.leaseHeartbeatIntervalMs =
       options.leaseHeartbeatIntervalMs ??
       Math.max(1, Math.floor(Math.min(this.dispatchLeaseMs, this.activationLeaseMs) / 3))
+    this.observability = { logger: options.logger, metrics: options.metrics }
     this.registerWorkflows(options.workflows ?? [])
   }
 
@@ -111,7 +122,7 @@ export class DurableRuntime {
     const runId = options.runId ?? "run-1"
     const instance = this.initialInstance(workflow, workflowId, runId, startCommand, now)
 
-    return this.provider.createInstance({
+    const ref = await this.provider.createInstance({
       workflowName: workflow.name,
       workflowVersion: workflow.version,
       workflowId: instance.workflowId,
@@ -123,6 +134,14 @@ export class DurableRuntime {
       now,
       conflictPolicy: options.conflictPolicy,
     })
+    this.log("info", "workflow.start", {
+      workflowName: workflow.name,
+      workflowId: ref.workflowId,
+      runId: ref.runId,
+      workerId: this.workerId,
+    })
+    this.count("durable.workflow.start", { workflowName: workflow.name, workerId: this.workerId })
+    return ref
   }
 
   async signal<W extends AnyWorkflow>(
@@ -135,12 +154,22 @@ export class DurableRuntime {
     const normalizedRef = normalizeRef(ref)
     const instance = await this.provider.loadInstance(normalizedRef)
     const parsedPayload = this.parseSignalPayloadForInstance(workflow, instance, type, payload)
-    return this.provider.appendSignal({
+    const signalRecord = await this.provider.appendSignal({
       ...normalizedRef,
       type,
       payload: toJson(parsedPayload),
       receivedAt: this.now(),
     })
+    this.log("info", "workflow.signal", {
+      workflowName: workflow.name,
+      workflowId: normalizedRef.workflowId,
+      runId: normalizedRef.runId,
+      signalId: signalRecord.signalId,
+      type,
+      workerId: this.workerId,
+    })
+    this.count("durable.workflow.signal", { workflowName: workflow.name, workerId: this.workerId })
+    return signalRecord
   }
 
   async query<W extends AnyWorkflow, QueryName extends keyof NonNullable<W["queries"]> & string>(
@@ -157,16 +186,32 @@ export class DurableRuntime {
     const instance = await this.requireInstance(ref)
     const snapshot = snapshotFromInstance(instance)
     const output = definition.handler({ sequence: instance.sequence, snapshot })
+    this.log("debug", "workflow.query", {
+      workflowName: workflow.name,
+      workflowId: instance.workflowId,
+      runId: instance.runId,
+      name,
+      workerId: this.workerId,
+    })
+    this.count("durable.workflow.query", { workflowName: workflow.name, workerId: this.workerId })
     return definition.schema.parse(output)
   }
 
   async drain(options: DrainOptions = {}): Promise<DrainResult> {
+    const startedAt = Date.now()
     const maxActivations = options.maxActivations ?? 100
     let activations = 0
     let nextWakeAt: string | undefined
+    this.log("debug", "runtime.drain.start", { workerId: this.workerId, maxActivations })
     const shardIds = await this.claimDispatchShards()
 
     if (shardIds.length === 0) {
+      this.log("debug", "runtime.drain.no_shards", { workerId: this.workerId })
+      this.count("durable.runtime.drain", { workerId: this.workerId, status: "no_shards" })
+      this.histogram("durable.runtime.drain.duration_ms", Date.now() - startedAt, {
+        workerId: this.workerId,
+        status: "no_shards",
+      })
       return { activations }
     }
 
@@ -183,16 +228,57 @@ export class DurableRuntime {
 
         if (!claim.activation) {
           nextWakeAt = claim.nextWakeAt
+          this.log("debug", "runtime.activation.claim_miss", {
+            workerId: this.workerId,
+            nextWakeAt,
+          })
+          this.count("durable.runtime.activation.claim", {
+            workerId: this.workerId,
+            status: "miss",
+          })
           break
         }
 
+        this.log("debug", "runtime.activation.claimed", {
+          workerId: this.workerId,
+          workflowName: claim.activation.workflowName,
+          workflowId: claim.activation.workflowId,
+          runId: claim.activation.runId,
+          activationId: claim.activation.activationId,
+          activationKind: claim.activation.kind,
+          eventKind: activationEventKind(claim.activation),
+          sequence: claim.activation.sequence,
+        })
+        this.count("durable.runtime.activation.claim", this.activationTags(claim.activation, "claimed"))
         try {
           await this.withLeaseHeartbeats(shardIds, claim.activation, options.signal, (signal) =>
             this.runActivation(claim.activation!, signal),
           )
         } catch (error) {
           await this.releaseActivationQuietly(claim.activation.activationId)
-          if (!isActivityRetryScheduledError(error)) {
+          if (isActivityRetryScheduledError(error)) {
+            this.log("info", "runtime.activation.retry_scheduled", {
+              workerId: this.workerId,
+              workflowName: claim.activation.workflowName,
+              workflowId: claim.activation.workflowId,
+              runId: claim.activation.runId,
+              activationId: claim.activation.activationId,
+              nextAttemptAt: error.nextAttemptAt,
+            })
+            this.count(
+              "durable.runtime.activation",
+              this.activationTags(claim.activation, "retry_scheduled"),
+            )
+          } else {
+            this.log("error", "runtime.activation.failed", {
+              workerId: this.workerId,
+              workflowName: claim.activation.workflowName,
+              workflowId: claim.activation.workflowId,
+              runId: claim.activation.runId,
+              activationId: claim.activation.activationId,
+              ...errorFields(error),
+            })
+            this.count("durable.runtime.activation", this.activationTags(claim.activation, "failed"))
             throw error
           }
         }
@@ -200,6 +286,16 @@ export class DurableRuntime {
       }
     } finally {
       await this.releaseDispatchShards(shardIds)
+      const resultTags = { workerId: this.workerId, status: "complete" }
+      this.log("debug", "runtime.drain.end", {
+        workerId: this.workerId,
+        activations,
+        nextWakeAt,
+        durationMs: Date.now() - startedAt,
+      })
+      this.count("durable.runtime.drain", resultTags)
+      this.histogram("durable.runtime.drain.activations", activations, resultTags)
+      this.histogram("durable.runtime.drain.duration_ms", Date.now() - startedAt, resultTags)
     }
 
     return nextWakeAt ? { activations, nextWakeAt } : { activations }
@@ -211,43 +307,67 @@ export class DurableRuntime {
     const jitterRatio = options.jitterRatio ?? 0.1
     const sleep = options.sleep ?? sleepMs
     let activations = 0
+    this.log("info", "runtime.worker.start", { workerId: this.workerId })
+    this.count("durable.runtime.worker", { workerId: this.workerId, status: "start" })
 
-    while (!options.signal?.aborted) {
-      let result: DrainResult
-      try {
-        result = await this.drain({
-          maxActivations: options.maxActivationsPerDrain,
-          signal: options.signal,
+    try {
+      while (!options.signal?.aborted) {
+        let result: DrainResult
+        try {
+          result = await this.drain({
+            maxActivations: options.maxActivationsPerDrain,
+            signal: options.signal,
+          })
+        } catch (error) {
+          if (isAbortError(error) || options.signal?.aborted) {
+            break
+          }
+          this.log("error", "runtime.worker.error", {
+            workerId: this.workerId,
+            ...errorFields(error),
+          })
+          this.count("durable.runtime.worker", { workerId: this.workerId, status: "error" })
+          throw error
+        }
+        activations += result.activations
+
+        if (options.signal?.aborted) {
+          break
+        }
+
+        const delayMs = pollDelayMs({
+          now: this.now(),
+          nextWakeAt: result.nextWakeAt,
+          activations: result.activations,
+          minPollIntervalMs,
+          maxPollIntervalMs,
+          jitterRatio,
         })
-      } catch (error) {
-        if (isAbortError(error) || options.signal?.aborted) {
-          break
+        this.log("debug", "runtime.worker.sleep", {
+          workerId: this.workerId,
+          delayMs,
+          nextWakeAt: result.nextWakeAt,
+          activations: result.activations,
+        })
+        this.histogram("durable.runtime.worker.sleep_ms", delayMs, { workerId: this.workerId })
+
+        try {
+          await sleep(delayMs, options.signal)
+        } catch (error) {
+          if (isAbortError(error) || options.signal?.aborted) {
+            break
+          }
+          this.log("error", "runtime.worker.error", {
+            workerId: this.workerId,
+            ...errorFields(error),
+          })
+          this.count("durable.runtime.worker", { workerId: this.workerId, status: "error" })
+          throw error
         }
-        throw error
       }
-      activations += result.activations
-
-      if (options.signal?.aborted) {
-        break
-      }
-
-      const delayMs = pollDelayMs({
-        now: this.now(),
-        nextWakeAt: result.nextWakeAt,
-        activations: result.activations,
-        minPollIntervalMs,
-        maxPollIntervalMs,
-        jitterRatio,
-      })
-
-      try {
-        await sleep(delayMs, options.signal)
-      } catch (error) {
-        if (isAbortError(error) || options.signal?.aborted) {
-          break
-        }
-        throw error
-      }
+    } finally {
+      this.log("info", "runtime.worker.stop", { workerId: this.workerId, activations })
+      this.count("durable.runtime.worker", { workerId: this.workerId, status: "stop" })
     }
 
     return { activations }
@@ -266,6 +386,14 @@ export class DurableRuntime {
         shardIds.push(shardId)
       }
     }
+    this.log("debug", "runtime.dispatch_shards.claimed", {
+      workerId: this.workerId,
+      shardIds,
+      shardCount: this.shardCount,
+    })
+    this.gauge("durable.runtime.dispatch_shards.owned", shardIds.length, {
+      workerId: this.workerId,
+    })
     return shardIds
   }
 
@@ -303,6 +431,16 @@ export class DurableRuntime {
   }
 
   private async runActivation(activation: ClaimedActivation, signal: AbortSignal): Promise<void> {
+    this.log("debug", "runtime.activation.started", {
+      workerId: this.workerId,
+      workflowName: activation.workflowName,
+      workflowId: activation.workflowId,
+      runId: activation.runId,
+      activationId: activation.activationId,
+      activationKind: activation.kind,
+      eventKind: activationEventKind(activation),
+      sequence: activation.sequence,
+    })
     const latest = await this.requireInstance({
       workflowId: activation.workflowId,
       runId: activation.runId,
@@ -312,6 +450,14 @@ export class DurableRuntime {
         activationId: activation.activationId,
         workerId: this.workerId,
       })
+      this.log("debug", "runtime.activation.released", {
+        workerId: this.workerId,
+        workflowName: activation.workflowName,
+        workflowId: activation.workflowId,
+        runId: activation.runId,
+        activationId: activation.activationId,
+        reason: "stale_instance",
+      })
       return
     }
 
@@ -320,6 +466,14 @@ export class DurableRuntime {
       await this.provider.releaseActivation({
         activationId: activation.activationId,
         workerId: this.workerId,
+      })
+      this.log("warn", "runtime.activation.released", {
+        workerId: this.workerId,
+        workflowName: latest.workflowName,
+        workflowId: latest.workflowId,
+        runId: latest.runId,
+        activationId: activation.activationId,
+        reason: "unknown_workflow",
       })
       return
     }
@@ -430,7 +584,7 @@ export class DurableRuntime {
     waits: DurableWait[],
     now: string,
     options: { consumeSignalId?: string; consumeChildRecordId?: string } = {},
-  ): Promise<void> {
+  ): Promise<CommitCheckpointResult> {
     const result = await this.provider.commitCheckpoint({
       workflowId: latest.workflowId,
       runId: latest.runId,
@@ -446,11 +600,42 @@ export class DurableRuntime {
     })
 
     if (!result.ok) {
+      this.log("warn", "runtime.activation.commit_conflict", {
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        workflowId: latest.workflowId,
+        runId: latest.runId,
+        activationId,
+        expectedSequence: latest.sequence,
+        actualSequence: result.sequence,
+      })
+      this.count("durable.runtime.activation", {
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        status: "commit_conflict",
+      })
       await this.provider.releaseActivation({
         activationId,
         workerId: this.workerId,
       })
+      return result
     }
+
+    this.log("info", "runtime.activation.completed", {
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      workflowId: latest.workflowId,
+      runId: latest.runId,
+      activationId,
+      sequence: result.sequence,
+      nextStatus: next.status,
+    })
+    this.count("durable.runtime.activation", {
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      status: "completed",
+    })
+    return result
   }
 
   private contextFor(
@@ -478,12 +663,56 @@ export class DurableRuntime {
         })
 
         if (reservation.status === "completed") {
+          this.log("debug", "runtime.activity.memoized", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            workflowId: instance.workflowId,
+            runId: instance.runId,
+            activationId: currentActivationId,
+            key,
+          })
+          this.count("durable.runtime.activity", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            status: "memoized",
+          })
           return clone(reservation.result) as T
         }
 
         if (reservation.status === "failed") {
+          this.log("warn", "runtime.activity.failed", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            workflowId: instance.workflowId,
+            runId: instance.runId,
+            activationId: currentActivationId,
+            key,
+            error: reservation.error,
+          })
+          this.count("durable.runtime.activity", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            status: "failed",
+          })
           throw new Error(reservation.error.message)
         }
+
+        this.log("debug", "runtime.activity.reserved", {
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId: currentActivationId,
+          effectId: reservation.effectId,
+          attemptId: reservation.attemptId,
+          key,
+          attempt: reservation.attempt,
+        })
+        this.count("durable.runtime.activity", {
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          status: "reserved",
+        })
 
         const activityContext = {
           heartbeat: async (details?: JsonValue): Promise<void> => {
@@ -499,6 +728,21 @@ export class DurableRuntime {
               attemptId: reservation.attemptId,
               now: this.now(),
               details: details === undefined ? undefined : toJson(details),
+            })
+            this.log("debug", "runtime.activity.heartbeat", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              workflowId: instance.workflowId,
+              runId: instance.runId,
+              activationId: currentActivationId,
+              effectId: reservation.effectId,
+              attemptId: reservation.attemptId,
+              key,
+            })
+            this.count("durable.runtime.activity", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              status: "heartbeat",
             })
           },
           heartbeatDetails: clone(reservation.heartbeatDetails),
@@ -529,8 +773,40 @@ export class DurableRuntime {
             retryable: !isNonRetryableActivityError(error),
           })
           if (failure.status === "retry_scheduled") {
+            this.log("info", "runtime.activity.retry_scheduled", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              workflowId: instance.workflowId,
+              runId: instance.runId,
+              activationId: currentActivationId,
+              effectId: reservation.effectId,
+              attemptId: reservation.attemptId,
+              key,
+              nextAttemptAt: failure.nextAttemptAt,
+            })
+            this.count("durable.runtime.activity", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              status: "retry_scheduled",
+            })
             throw new ActivityRetryScheduledError(failure.nextAttemptAt)
           }
+          this.log("error", "runtime.activity.failed", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            workflowId: instance.workflowId,
+            runId: instance.runId,
+            activationId: currentActivationId,
+            effectId: reservation.effectId,
+            attemptId: reservation.attemptId,
+            key,
+            ...errorFields(error),
+          })
+          this.count("durable.runtime.activity", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            status: "failed",
+          })
           throw error
         }
 
@@ -543,6 +819,21 @@ export class DurableRuntime {
           attemptId: reservation.attemptId,
           result: toJson(result),
           now: this.now(),
+        })
+        this.log("debug", "runtime.activity.completed", {
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId: currentActivationId,
+          effectId: reservation.effectId,
+          attemptId: reservation.attemptId,
+          key,
+        })
+        this.count("durable.runtime.activity", {
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          status: "completed",
         })
         return result
       },
@@ -591,6 +882,23 @@ export class DurableRuntime {
             conflictPolicy: options.conflictPolicy ?? "use_existing",
           })
 
+          this.log("info", "runtime.child.start", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            childWorkflowName: childWorkflow.name,
+            workflowId: instance.workflowId,
+            runId: instance.runId,
+            activationId: currentActivationId,
+            childWorkflowId: handle.workflowId,
+            childRunId: handle.runId,
+            key,
+          })
+          this.count("durable.runtime.child", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            status: "started",
+          })
+
           return handle as ChildHandle<W>
         },
         cancel: async (handle: ChildHandle<any>): Promise<void> => {
@@ -602,6 +910,20 @@ export class DurableRuntime {
             workflowId: handle.workflowId,
             runId: handle.runId,
             now: this.now(),
+          })
+          this.log("info", "runtime.child.cancel", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            workflowId: instance.workflowId,
+            runId: instance.runId,
+            activationId: currentActivationId,
+            childWorkflowId: handle.workflowId,
+            childRunId: handle.runId,
+          })
+          this.count("durable.runtime.child", {
+            workerId: this.workerId,
+            workflowName: workflow.name,
+            status: "canceled",
           })
         },
       },
@@ -637,7 +959,22 @@ export class DurableRuntime {
           now: this.now(),
           leaseMs: this.activationLeaseMs,
         }),
-      ]).catch(failActivation)
+      ]).catch((error) => {
+        this.log("warn", "runtime.lease_heartbeat.failure", {
+          workerId: this.workerId,
+          workflowName: activation.workflowName,
+          workflowId: activation.workflowId,
+          runId: activation.runId,
+          activationId: activation.activationId,
+          ...errorFields(error),
+        })
+        this.count("durable.runtime.lease_heartbeat", {
+          workerId: this.workerId,
+          workflowName: activation.workflowName,
+          status: "failed",
+        })
+        failActivation(error)
+      })
     }, this.leaseHeartbeatIntervalMs)
     timer.unref?.()
 
@@ -663,6 +1000,39 @@ export class DurableRuntime {
         workerId: this.workerId,
       })
       .catch(() => undefined)
+  }
+
+  private log(
+    level: "debug" | "info" | "warn" | "error",
+    event: string,
+    fields?: Record<string, unknown>,
+  ): void {
+    logDurable(this.observability, level, event, fields)
+  }
+
+  private count(name: string, tags?: DurableMetricTags): void {
+    countDurable(this.observability, name, 1, tags)
+  }
+
+  private histogram(name: string, value: number, tags?: DurableMetricTags): void {
+    histogramDurable(this.observability, name, value, tags)
+  }
+
+  private gauge(name: string, value: number, tags?: DurableMetricTags): void {
+    gaugeDurable(this.observability, name, value, tags)
+  }
+
+  private activationTags(
+    activation: ClaimedActivation,
+    status: string,
+  ): DurableMetricTags {
+    return {
+      workerId: this.workerId,
+      workflowName: activation.workflowName,
+      activationKind: activation.kind,
+      eventKind: activationEventKind(activation),
+      status,
+    }
   }
 
   private applyTransition(
@@ -959,6 +1329,10 @@ export class DurableRuntime {
 
 function normalizeRef(ref: InstanceRef | string): InstanceRef {
   return typeof ref === "string" ? { workflowId: ref, runId: "run-1" } : ref
+}
+
+function activationEventKind(activation: ClaimedActivation): string | undefined {
+  return activation.kind === "event" ? activation.event.kind : undefined
 }
 
 function commonSchema(workflow: AnyWorkflow): Schema<any> {

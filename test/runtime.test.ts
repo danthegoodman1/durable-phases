@@ -9,6 +9,9 @@ import {
   child,
   complete,
   defineWorkflow,
+  type DurableLogger,
+  type DurableMetricTags,
+  type DurableMetrics,
   DurableRuntime,
   fail,
   go,
@@ -34,8 +37,11 @@ async function storePath(): Promise<string> {
   return join(dir, "store.sqlite")
 }
 
-function testProvider(path: string): SqliteDurabilityProvider {
-  const provider = new SqliteDurabilityProvider(path)
+function testProvider(
+  path: string,
+  options: ConstructorParameters<typeof SqliteDurabilityProvider>[1] = {},
+): SqliteDurabilityProvider {
+  const provider = new SqliteDurabilityProvider(path, options)
   testProviders.add(provider)
   return provider
 }
@@ -70,6 +76,97 @@ async function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void>
       throw new Error("Timed out waiting for condition")
     }
     await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+}
+
+type LogEntry = {
+  level: keyof DurableLogger
+  event: string
+  fields?: Record<string, unknown>
+}
+
+type MetricEntry = {
+  kind: keyof DurableMetrics
+  name: string
+  value?: number
+  tags?: DurableMetricTags
+}
+
+function observabilityCollector(options: { throwLogger?: boolean; throwMetrics?: boolean } = {}) {
+  const logs: LogEntry[] = []
+  const metrics: MetricEntry[] = []
+  const logger = {
+    debug: (event: string, fields?: Record<string, unknown>) => {
+      if (options.throwLogger) {
+        throw new Error("logger failed")
+      }
+      logs.push({ level: "debug", event, fields })
+    },
+    info: (event: string, fields?: Record<string, unknown>) => {
+      if (options.throwLogger) {
+        throw new Error("logger failed")
+      }
+      logs.push({ level: "info", event, fields })
+    },
+    warn: (event: string, fields?: Record<string, unknown>) => {
+      if (options.throwLogger) {
+        throw new Error("logger failed")
+      }
+      logs.push({ level: "warn", event, fields })
+    },
+    error: (event: string, fields?: Record<string, unknown>) => {
+      if (options.throwLogger) {
+        throw new Error("logger failed")
+      }
+      logs.push({ level: "error", event, fields })
+    },
+  } satisfies DurableLogger
+  const metricSink = {
+    counter: (name: string, value?: number, tags?: DurableMetricTags) => {
+      if (options.throwMetrics) {
+        throw new Error("metrics failed")
+      }
+      metrics.push({ kind: "counter", name, value, tags })
+    },
+    histogram: (name: string, value: number, tags?: DurableMetricTags) => {
+      if (options.throwMetrics) {
+        throw new Error("metrics failed")
+      }
+      metrics.push({ kind: "histogram", name, value, tags })
+    },
+    gauge: (name: string, value: number, tags?: DurableMetricTags) => {
+      if (options.throwMetrics) {
+        throw new Error("metrics failed")
+      }
+      metrics.push({ kind: "gauge", name, value, tags })
+    },
+  } satisfies DurableMetrics
+
+  return { logger, metrics: metricSink, logs, metricEntries: metrics }
+}
+
+function expectEvents(logs: LogEntry[], events: string[]): void {
+  for (const event of events) {
+    expect(logs.some((entry) => entry.event === event), `missing event ${event}`).toBe(true)
+  }
+}
+
+function expectNoHighCardinalityMetricTags(metrics: MetricEntry[]): void {
+  const forbidden = [
+    "workflowId",
+    "runId",
+    "activationId",
+    "signalId",
+    "childId",
+    "childRecordId",
+    "effectId",
+    "attemptId",
+    "idempotencyKey",
+  ]
+  for (const metric of metrics) {
+    for (const tag of forbidden) {
+      expect(metric.tags ?? {}, `${metric.name} must not tag ${tag}`).not.toHaveProperty(tag)
+    }
   }
 }
 
@@ -288,7 +385,560 @@ function makeWorkflowSuite(counters = { reminders: 0, processed: 0 }) {
   }
 }
 
+async function runConcurrencyScenario(options: {
+  workflowCount: number
+  workerCount: number
+  shardCount: number
+  drainBatch: number
+  maxRounds: number
+  restartRound?: number
+}): Promise<void> {
+  const path = await storePath()
+  const clock = manualClock()
+  const sideEffects = {
+    boot: [] as number[],
+    child: [] as number[],
+    finish: [] as number[],
+  }
+  const ChildWorkflow = defineWorkflow({
+    name: "concurrency_child",
+    version: 1,
+    input: z.object({ index: z.number() }),
+    output: z.object({ childValue: z.number() }),
+    common: z.object({ index: z.number() }),
+    initial(input) {
+      return start({ common: { index: input.index }, phase: "run", data: {} })
+    },
+    phases: {
+      run: phase({
+        run: async ({ ctx, common }) => {
+          const childValue = await ctx.activity("child_once", () => {
+            sideEffects.child.push(common.index)
+            return common.index * 10
+          })
+          return complete({ childValue })
+        },
+      }),
+    },
+  })
+  const ParentWorkflow = defineWorkflow({
+    name: "concurrency_parent",
+    version: 1,
+    input: z.object({ index: z.number() }),
+    output: z.object({
+      index: z.number(),
+      childValue: z.number(),
+      signalValue: z.number(),
+      finished: z.boolean(),
+    }),
+    common: z.object({ index: z.number() }),
+    initial(input) {
+      return start({ common: { index: input.index }, phase: "boot", data: {} })
+    },
+    phases: {
+      boot: phase({
+        run: async ({ ctx, common }) => {
+          await ctx.activity("boot_once", () => {
+            sideEffects.boot.push(common.index)
+            return true
+          })
+          const handle = await ctx.child.start("child", ChildWorkflow, { index: common.index })
+          return go("waiting_child", { handle })
+        },
+      }),
+      waiting_child: phase({
+        state: z.object({ handle: z.any() }),
+        on: {
+          child_done: child(
+            ({ data }) => data.handle,
+            async ({ event }) =>
+              go("waiting_signal", {
+                childValue: event.ok ? event.output.childValue : -1,
+              }),
+          ),
+        },
+      }),
+      waiting_signal: phase({
+        state: z.object({ childValue: z.number() }),
+        on: {
+          finish: signal(z.object({ signalValue: z.number() }), async ({ ctx, data, event }) =>
+            go("waiting_timer", {
+              childValue: data.childValue,
+              signalValue: event.signalValue,
+              wakeAt: ctx.now(),
+            }),
+          ),
+        },
+      }),
+      waiting_timer: phase({
+        state: z.object({
+          childValue: z.number(),
+          signalValue: z.number(),
+          wakeAt: z.string(),
+        }),
+        on: {
+          finish_due: timer(
+            ({ data }) => data.wakeAt,
+            async ({ ctx, common, data }) => {
+              await ctx.activity("finish_once", () => {
+                sideEffects.finish.push(common.index)
+                return true
+              })
+              return complete({
+                index: common.index,
+                childValue: data.childValue,
+                signalValue: data.signalValue,
+                finished: true,
+              })
+            },
+          ),
+        },
+      }),
+    },
+  })
+
+  const workflows = [ParentWorkflow, ChildWorkflow]
+  const providers = Array.from({ length: options.workerCount }, () => testProvider(path))
+  let runtimes = providers.map(
+    (provider, index) =>
+      new DurableRuntime(provider, {
+        clock: clock.clock,
+        workflows,
+        workerId: `concurrency-worker-${index}`,
+        shardCount: options.shardCount,
+        dispatchLeaseMs: 1_000,
+        activationLeaseMs: 1_000,
+      }),
+  )
+  for (let index = 0; index < options.workflowCount; index += 1) {
+    await runtimes[0].start(
+      ParentWorkflow,
+      { index },
+      { workflowId: `concurrency-parent-${index}` },
+    )
+  }
+
+  const signaled = new Set<string>()
+  let completed = 0
+  for (let round = 0; round < options.maxRounds; round += 1) {
+    if (options.restartRound === round) {
+      providers[0].close()
+      providers[0] = testProvider(path)
+      runtimes = providers.map(
+        (provider, index) =>
+          new DurableRuntime(provider, {
+            clock: clock.clock,
+            workflows,
+            workerId: `concurrency-worker-${index}`,
+            shardCount: options.shardCount,
+            dispatchLeaseMs: 1_000,
+            activationLeaseMs: 1_000,
+          }),
+      )
+    }
+
+    await Promise.all(
+      runtimes.map((runtime) => runtime.drain({ maxActivations: options.drainBatch })),
+    )
+
+    const instances = await providers[0].listInstances()
+    const waitingForSignal = instances.filter(
+      (instance) =>
+        instance.workflowName === ParentWorkflow.name &&
+        instance.status === "running" &&
+        instance.phase?.name === "waiting_signal" &&
+        !signaled.has(instance.workflowId),
+    )
+    for (const instance of waitingForSignal) {
+      signaled.add(instance.workflowId)
+      const index = Number(instance.workflowId.split("-").at(-1))
+      await runtimes[0].signal(
+        ParentWorkflow,
+        { workflowId: instance.workflowId, runId: instance.runId },
+        "finish",
+        { signalValue: index + 1_000 },
+      )
+    }
+
+    completed = instances.filter(
+      (instance) => instance.workflowName === ParentWorkflow.name && instance.status === "completed",
+    ).length
+    if (completed === options.workflowCount) {
+      break
+    }
+  }
+
+  const instances = await providers[0].listInstances()
+  const parents = instances.filter((instance) => instance.workflowName === ParentWorkflow.name)
+  expect(parents).toHaveLength(options.workflowCount)
+  for (const instance of parents) {
+    const index = Number(instance.workflowId.split("-").at(-1))
+    expect(instance).toMatchObject({
+      status: "completed",
+      sequence: 4,
+      output: {
+        index,
+        childValue: index * 10,
+        signalValue: index + 1_000,
+        finished: true,
+      },
+    })
+  }
+
+  expectExactlyOnce(sideEffects.boot, options.workflowCount, "boot")
+  expectExactlyOnce(sideEffects.child, options.workflowCount, "child")
+  expectExactlyOnce(sideEffects.finish, options.workflowCount, "finish")
+
+  const signals = await providers[0].listSignals()
+  expect(signals).toHaveLength(options.workflowCount)
+  expect(signals.every((record) => record.consumedBySequence === 3)).toBe(true)
+
+  const children = await providers[0].listChildren()
+  expect(children).toHaveLength(options.workflowCount)
+  expect(children.every((record) => record.status === "completed")).toBe(true)
+  expect(children.every((record) => record.deliveredBySequence === 2)).toBe(true)
+
+  const completedClaims = (await providers[0].listActivationClaims()).filter(
+    (claim) => claim.completedBySequence !== undefined,
+  )
+  const completedBySequence = new Map<string, number>()
+  for (const claim of completedClaims) {
+    const key = `${claim.workflowId}/${claim.runId}/${claim.sequence}`
+    completedBySequence.set(key, (completedBySequence.get(key) ?? 0) + 1)
+  }
+  expect([...completedBySequence.values()].every((count) => count === 1)).toBe(true)
+}
+
+function expectExactlyOnce(values: number[], count: number, label: string): void {
+  expect(values, `${label} side effects`).toHaveLength(count)
+  expect([...values].sort((left, right) => left - right), `${label} side effects`).toEqual(
+    Array.from({ length: count }, (_value, index) => index),
+  )
+}
+
 describe("durable workflow PoC", () => {
+  it("emits runtime and provider observability without high-cardinality metric tags", async () => {
+    const path = await storePath()
+    const observed = observabilityCollector()
+    const calls: string[] = []
+    const ObservedWorkflow = defineWorkflow({
+      name: "observed_workflow",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({ value: z.string() }), async ({ ctx, event }) => {
+              const value = await ctx.activity("record", () => {
+                calls.push(event.value)
+                return event.value
+              })
+              return complete({ value })
+            }),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path, {
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ObservedWorkflow],
+      workerId: "observability-worker",
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    const ref = await runtime.start(ObservedWorkflow, {}, { workflowId: "observability-workflow" })
+    await runtime.signal(ObservedWorkflow, ref, "finish", { value: "done" })
+    await runtime.drain()
+
+    expect(calls).toEqual(["done"])
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { value: "done" },
+    })
+    expectEvents(observed.logs, [
+      "workflow.start",
+      "workflow.signal",
+      "runtime.drain.start",
+      "runtime.activation.claimed",
+      "runtime.activity.completed",
+      "runtime.activation.completed",
+      "provider.shard.claim",
+      "provider.activation.claim",
+      "provider.effect.reserve",
+      "provider.effect.complete",
+      "provider.checkpoint.commit",
+    ])
+    expect(observed.metricEntries.some((entry) => entry.name === "durable.runtime.activity")).toBe(true)
+    expect(observed.metricEntries.some((entry) => entry.name === "durable.provider.checkpoint")).toBe(true)
+    expectNoHighCardinalityMetricTags(observed.metricEntries)
+  })
+
+  it("swallows logger and metrics failures without affecting workflow execution", async () => {
+    const path = await storePath()
+    const throwing = observabilityCollector({ throwLogger: true, throwMetrics: true })
+    const QuietWorkflow = defineWorkflow({
+      name: "throwing_observability",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.activity("once", () => true)
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path, {
+      logger: throwing.logger,
+      metrics: throwing.metrics,
+    })
+    const runtime = new DurableRuntime(provider, {
+      workflows: [QuietWorkflow],
+      workerId: "throwing-observability-worker",
+      logger: throwing.logger,
+      metrics: throwing.metrics,
+    })
+    const ref = await runtime.start(QuietWorkflow, {}, { workflowId: "throwing-observability" })
+
+    await expect(runtime.drain()).resolves.toEqual({ activations: 1 })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { ok: true },
+    })
+  })
+
+  it("emits provider conflict, timeout retry, child cancel, and abandon observability", async () => {
+    const observed = observabilityCollector()
+    const provider = testProvider(await storePath(), {
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    const ref = await provider.createInstance({
+      workflowName: "provider_observability",
+      workflowVersion: 1,
+      workflowId: "provider-observability",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "provider-observability-worker",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "provider-observability-worker",
+        shardIds: [0],
+        workflows: { provider_observability: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "run" })
+
+    await expect(
+      provider.commitCheckpoint({
+        ...ref,
+        expectedSequence: 1,
+        activationId: activation!.activationId,
+        workerId: "provider-observability-worker",
+        workflowVersion: 1,
+        next: { status: "completed", output: { ok: true } },
+        waits: [],
+        now: "2026-01-01T00:00:00.000Z",
+      }),
+    ).resolves.toEqual({ ok: false, sequence: 0 })
+
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "provider-observability-worker",
+      key: "timeout",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 2, initialIntervalMs: 0 } },
+    })
+    expect(reservation.status).toBe("reserved")
+    await expect(
+      provider.heartbeatActivation({
+        activationId: activation!.activationId,
+        workerId: "provider-observability-worker",
+        now: "2026-01-01T00:00:01.000Z",
+        leaseMs: 60_000,
+      }),
+    ).rejects.toThrow("Lost activation lease")
+    await provider.releaseDispatchShard({
+      shardId: 0,
+      ownerId: "provider-observability-worker",
+    })
+
+    const WaitingChildWorkflow = defineWorkflow({
+      name: "observed_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            done: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const CancelParent = defineWorkflow({
+      name: "observed_cancel_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            const handle = await ctx.child.start("child", WaitingChildWorkflow, {})
+            await ctx.child.cancel(handle)
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+    const AbandonParent = defineWorkflow({
+      name: "observed_abandon_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", WaitingChildWorkflow, {}, { parentClosePolicy: "abandon" })
+            return cancel("done")
+          },
+        }),
+      },
+    })
+
+    const runtime = new DurableRuntime(provider, {
+      workflows: [WaitingChildWorkflow, CancelParent, AbandonParent],
+      workerId: "provider-child-observability-worker",
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    await runtime.start(CancelParent, {}, { workflowId: "observed-cancel-parent" })
+    await runtime.start(AbandonParent, {}, { workflowId: "observed-abandon-parent" })
+    await runtime.drain({ maxActivations: 2 })
+
+    expectEvents(observed.logs, [
+      "provider.checkpoint.conflict",
+      "provider.effect.timeout_retry",
+      "provider.child.cancel",
+      "provider.child.parent_close_abandon",
+    ])
+    expectNoHighCardinalityMetricTags(observed.metricEntries)
+  })
+
+  it("emits worker sleep observability from runWorker", async () => {
+    const observed = observabilityCollector()
+    const WorkerSleepWorkflow = defineWorkflow({
+      name: "observed_worker_sleep",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: { wakeAt: "2026-01-01T00:00:05.000Z" } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ wakeAt: z.string() }),
+          on: {
+            wake: timer(({ data }) => data.wakeAt, async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const clock = manualClock()
+    const provider = testProvider(await storePath(), {
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [WorkerSleepWorkflow],
+      workerId: "observed-worker-loop",
+      logger: observed.logger,
+      metrics: observed.metrics,
+    })
+    const abort = new AbortController()
+    await runtime.start(WorkerSleepWorkflow, {}, { workflowId: "observed-worker-sleep" })
+    await runtime.runWorker({
+      signal: abort.signal,
+      minPollIntervalMs: 1,
+      maxPollIntervalMs: 10_000,
+      jitterRatio: 0,
+      sleep: async () => {
+        abort.abort()
+      },
+    })
+
+    expectEvents(observed.logs, [
+      "runtime.worker.start",
+      "runtime.worker.sleep",
+      "runtime.worker.stop",
+    ])
+    expect(observed.metricEntries.some((entry) => entry.name === "durable.runtime.worker.sleep_ms")).toBe(true)
+    expectNoHighCardinalityMetricTags(observed.metricEntries)
+  })
+
+  it("processes a deterministic multi-worker SQLite concurrency mix exactly once", async () => {
+    await runConcurrencyScenario({
+      workflowCount: 24,
+      workerCount: 4,
+      shardCount: 4,
+      drainBatch: 4,
+      maxRounds: 120,
+    })
+  })
+
+  const soakIt = process.env.DURABLE_SOAK === "1" ? it : it.skip
+  soakIt(
+    "soaks multi-worker SQLite concurrency with provider restart",
+    async () => {
+      await runConcurrencyScenario({
+        workflowCount: 96,
+        workerCount: 6,
+        shardCount: 4,
+        drainBatch: 8,
+        maxRounds: 240,
+        restartRound: 3,
+      })
+    },
+    30_000,
+  )
+
   it("persists the initial snapshot and reloads it from the SQLite provider", async () => {
     const path = await storePath()
     const clock = manualClock()
