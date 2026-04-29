@@ -1994,6 +1994,123 @@ describe("durable workflow PoC", () => {
     })
   })
 
+  it("does not claim competing ready events for the same workflow sequence", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "activation_race",
+      workflowVersion: 1,
+      workflowId: "activation-race",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [
+        { kind: "signal", name: "finish", type: "finish", scope: "phase" },
+        { kind: "timer", name: "timeout", fireAt: "2026-01-01T00:00:00.000Z" },
+      ],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: {},
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+
+    const first = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activation_race: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(first).toMatchObject({ kind: "event", event: { kind: "signal" } })
+
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activation_race: { version: 1 } },
+        now: "2026-01-01T00:00:00.001Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toMatchObject({ activation: null })
+
+    await provider.releaseActivation({ activationId: first!.activationId, workerId: "worker-a" })
+    const retried = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activation_race: { version: 1 } },
+        now: "2026-01-01T00:00:00.002Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(retried).toMatchObject({
+      activationId: first!.activationId,
+      event: { kind: "signal" },
+    })
+  })
+
+  it("requires a live activation lease to start a child workflow", async () => {
+    const provider = testProvider(await storePath())
+    const parentRef = await provider.createInstance({
+      workflowName: "child_start_fence_parent",
+      workflowVersion: 1,
+      workflowId: "child-start-fence-parent",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { child_start_fence_parent: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 1,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "run" })
+
+    await expect(
+      provider.createChildInstance({
+        workflowName: "child_start_fence_child",
+        workflowVersion: 1,
+        workflowId: "child-start-fence-child",
+        runId: "run-1",
+        partitionShard: 0,
+        common: {},
+        phase: { name: "run", data: {} },
+        waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+        now: "2026-01-01T00:00:00.000Z",
+        parentWorkflowId: parentRef.workflowId,
+        parentRunId: parentRef.runId,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        leaseNow: "2026-01-01T00:00:00.002Z",
+        key: "child",
+      }),
+    ).rejects.toThrow("Lost activation lease")
+  })
+
   it("reclaims an expired activation lease and reuses completed effects", async () => {
     const path = await storePath()
     const clock = manualClock()
@@ -2282,7 +2399,55 @@ describe("durable workflow PoC", () => {
       runId: "run-1",
       partitionShard: 0,
       common: {},
-      phase: { name: "waiting", data: {} },
+      phase: { name: "setup", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const setupActivation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { ordering_parent: { version: 1 }, ordering_child: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(setupActivation).toMatchObject({ kind: "run", workflowId: "ordering-parent" })
+
+    await provider.createChildInstance({
+      workflowName: "ordering_child",
+      workflowVersion: 1,
+      workflowId: "ordering-child",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+      parentWorkflowId: parentRef.workflowId,
+      parentRunId: parentRef.runId,
+      activationId: setupActivation!.activationId,
+      workerId: "worker-a",
+      leaseNow: "2026-01-01T00:00:00.000Z",
+      key: "child",
+    })
+    await provider.commitCheckpoint({
+      ...parentRef,
+      expectedSequence: 0,
+      activationId: setupActivation!.activationId,
+      workerId: "worker-a",
+      workflowVersion: 1,
+      next: {
+        status: "running",
+        common: {},
+        phase: { name: "waiting", data: {} },
+      },
       waits: [
         {
           kind: "child",
@@ -2296,27 +2461,6 @@ describe("durable workflow PoC", () => {
         { kind: "timer", name: "timer_done", fireAt: eventAt },
       ],
       now: "2026-01-01T00:00:00.000Z",
-    })
-    await provider.createChildInstance({
-      workflowName: "ordering_child",
-      workflowVersion: 1,
-      workflowId: "ordering-child",
-      runId: "run-1",
-      partitionShard: 0,
-      common: {},
-      phase: { name: "run", data: {} },
-      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
-      now: "2026-01-01T00:00:00.000Z",
-      parentWorkflowId: parentRef.workflowId,
-      parentRunId: parentRef.runId,
-      activationId: "setup",
-      key: "child",
-    })
-    await provider.claimDispatchShard({
-      shardId: 0,
-      ownerId: "worker-a",
-      now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 60_000,
     })
     const childRun = (
       await provider.claimReadyActivation({
@@ -2745,19 +2889,27 @@ describe("durable workflow PoC", () => {
       runId: "run-1",
       partitionShard: 0,
       common: {},
-      phase: { name: "waiting", data: {} },
-      waits: [
-        {
-          kind: "child",
-          name: "child_done",
-          workflowName: "child_consume_child",
-          workflowVersion: 1,
-          workflowId: "child-consume-1",
-          runId: "run-1",
-        },
-      ],
+      phase: { name: "setup", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
       now: "2026-01-01T00:00:00.000Z",
     })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const setupActivation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { child_consume_parent: { version: 1 }, child_consume_child: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(setupActivation).toMatchObject({ kind: "run", workflowId: "child-consume-parent" })
+
     await provider.createChildInstance({
       workflowName: "child_consume_child",
       workflowVersion: 1,
@@ -2770,7 +2922,9 @@ describe("durable workflow PoC", () => {
       now: "2026-01-01T00:00:00.000Z",
       parentWorkflowId: parentRef.workflowId,
       parentRunId: parentRef.runId,
-      activationId: "setup",
+      activationId: setupActivation!.activationId,
+      workerId: "worker-a",
+      leaseNow: "2026-01-01T00:00:00.000Z",
       key: "child-1",
     })
     await provider.createChildInstance({
@@ -2785,14 +2939,33 @@ describe("durable workflow PoC", () => {
       now: "2026-01-01T00:00:00.000Z",
       parentWorkflowId: parentRef.workflowId,
       parentRunId: parentRef.runId,
-      activationId: "setup",
+      activationId: setupActivation!.activationId,
+      workerId: "worker-a",
+      leaseNow: "2026-01-01T00:00:00.000Z",
       key: "child-2",
     })
-    await provider.claimDispatchShard({
-      shardId: 0,
-      ownerId: "worker-a",
+    await provider.commitCheckpoint({
+      ...parentRef,
+      expectedSequence: 0,
+      activationId: setupActivation!.activationId,
+      workerId: "worker-a",
+      workflowVersion: 1,
+      next: {
+        status: "running",
+        common: {},
+        phase: { name: "waiting", data: {} },
+      },
+      waits: [
+        {
+          kind: "child",
+          name: "child_done",
+          workflowName: "child_consume_child",
+          workflowVersion: 1,
+          workflowId: "child-consume-1",
+          runId: "run-1",
+        },
+      ],
       now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 60_000,
     })
     const childRun = (
       await provider.claimReadyActivation({
@@ -2834,7 +3007,7 @@ describe("durable workflow PoC", () => {
     await expect(
       provider.commitCheckpoint({
         ...parentRef,
-        expectedSequence: 0,
+        expectedSequence: 1,
         activationId: parentActivation!.activationId,
         workerId: "worker-a",
         workflowVersion: 1,
@@ -2843,8 +3016,11 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.000Z",
         consumeChildRecordId: wrongChild!.childRecordId,
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
-    expect(wrongChild?.deliveredBySequence).toBeUndefined()
+    ).resolves.toEqual({ ok: false, sequence: 1 })
+    expect(
+      (await provider.listChildren()).find((record) => record.childRecordId === wrongChild!.childRecordId)
+        ?.deliveredBySequence,
+    ).toBeUndefined()
   })
 
   it("blocks migration while an old-version activation is uncompleted", async () => {
@@ -3250,6 +3426,105 @@ describe("durable workflow PoC", () => {
       parentClosePolicy: "cancel",
       deliveredBySequence: 1,
       error: { name: "ParentClosed" },
+    })
+  })
+
+  it("parent cancellation cascades through cancel-policy child trees", async () => {
+    const GrandchildWorkflow = defineWorkflow({
+      name: "cascade_grandchild",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const ChildWorkflow = defineWorkflow({
+      name: "cascade_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            const grandchild = await ctx.child.start("grandchild", GrandchildWorkflow, {})
+            return go("waiting", { grandchild })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ grandchild: z.any() }),
+          on: {
+            grandchild_done: child(
+              ({ data }) => data.grandchild,
+              async ({ event }) => complete({ ok: event.ok }),
+            ),
+          },
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "cascade_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            const childHandle = await ctx.child.start("child", ChildWorkflow, {})
+            return go("waiting", { childHandle })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ childHandle: z.any() }),
+          on: {
+            stop: signal(z.object({}), async () => cancel("stop")),
+            child_done: child(
+              ({ data }) => data.childHandle,
+              async () => complete({}),
+            ),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, ChildWorkflow, GrandchildWorkflow],
+      workerId: "cascade-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "cascade-parent" })
+    await runtime.drain({ maxActivations: 2 })
+
+    const beforeCancel = await provider.listChildren()
+    expect(beforeCancel).toHaveLength(2)
+    expect(beforeCancel.map((record) => record.status).sort()).toEqual(["started", "started"])
+
+    await runtime.signal(ParentWorkflow, ref, "stop", {})
+    await runtime.drain({ maxActivations: 1 })
+
+    const childRecords = await provider.listChildren()
+    const childRecord = childRecords.find((record) => record.workflowName === "cascade_child")
+    const grandchildRecord = childRecords.find((record) => record.workflowName === "cascade_grandchild")
+    expect(childRecord).toMatchObject({ status: "failed", error: { name: "ParentClosed" } })
+    expect(grandchildRecord).toMatchObject({ status: "failed", error: { name: "ParentClosed" } })
+    expect(await provider.loadInstance({ workflowId: childRecord!.workflowId, runId: childRecord!.runId })).toMatchObject({
+      status: "canceled",
+    })
+    expect(await provider.loadInstance({ workflowId: grandchildRecord!.workflowId, runId: grandchildRecord!.runId })).toMatchObject({
+      status: "canceled",
     })
   })
 

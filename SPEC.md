@@ -415,7 +415,7 @@ type DurableContext = {
   ): Promise<T>
 
   child: {
-    start<W extends WorkflowContract<any, any>>(
+    start<W extends WorkflowDefinition<any, any>>(
       key: string,
       workflow: W,
       input: InputOf<W>,
@@ -551,7 +551,7 @@ The next activation starts from the new checkpoint and gets a fresh effect names
 
 ## 9. Child workflows
 
-A child workflow must be a typed workflow definition or typed workflow contract.
+A child workflow must be a typed local workflow definition.
 
 Do this:
 
@@ -571,7 +571,7 @@ ctx.child.start("KycWorkflow", input)
 The workflow object carries both compile-time and runtime information:
 
 ```ts
-type WorkflowContract<Input, Output> = {
+type WorkflowDefinition<Input, Output> = {
   name: string
   version: number
   input: Schema<Input>

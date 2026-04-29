@@ -269,6 +269,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   async createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
     const create = this.db.transaction(() => {
+      this.assertLiveActivationLease({
+        workflowId: input.parentWorkflowId,
+        runId: input.parentRunId,
+        activationId: input.activationId,
+        workerId: input.workerId,
+        now: input.leaseNow,
+      })
       const conflictPolicy = input.conflictPolicy ?? "use_existing"
       const parentClosePolicy = input.parentClosePolicy ?? "cancel"
       const existing = oneRow<ChildRow>(
@@ -1088,134 +1095,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       CREATE INDEX IF NOT EXISTS ready_events_instance
         ON ready_events(workflow_id, run_id, sequence);
     `)
-    this.migrateChildrenTableShape()
-    this.addColumnIfMissing(
-      "children",
-      "parent_close_policy",
-      "TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon'))",
-    )
-    this.addColumnIfMissing("activation_claims", "activation_time", "TEXT")
-    this.addColumnIfMissing("effects", "attempt", "INTEGER DEFAULT 1")
-    this.addColumnIfMissing("effects", "attempt_id", "TEXT")
-    this.addColumnIfMissing("effects", "attempt_owner_id", "TEXT")
-    this.addColumnIfMissing("effects", "attempt_started_at", "TEXT")
-    this.addColumnIfMissing("effects", "start_to_close_timeout_ms", "INTEGER")
-    this.addColumnIfMissing("effects", "start_to_close_deadline", "TEXT")
-    this.addColumnIfMissing("effects", "heartbeat_timeout_ms", "INTEGER")
-    this.addColumnIfMissing("effects", "heartbeat_deadline", "TEXT")
-    this.addColumnIfMissing("effects", "max_attempts", "INTEGER DEFAULT 3")
-    this.addColumnIfMissing("effects", "max_elapsed_ms", "INTEGER")
-    this.addColumnIfMissing("effects", "initial_interval_ms", "INTEGER DEFAULT 1000")
-    this.addColumnIfMissing("effects", "max_interval_ms", "INTEGER DEFAULT 30000")
-    this.addColumnIfMissing("effects", "backoff_coefficient", "REAL DEFAULT 2")
-    this.addColumnIfMissing("effects", "first_attempt_started_at", "TEXT")
-    this.addColumnIfMissing("effects", "next_attempt_at", "TEXT")
-    this.addColumnIfMissing("effects", "last_failure_json", "TEXT")
-    this.addColumnIfMissing("effects", "non_retryable_error_names_json", "TEXT")
-    this.addColumnIfMissing("effects", "timed_out_at", "TEXT")
-    this.addColumnIfMissing("effects", "timeout_kind", "TEXT")
-    this.backfillEffectAttemptColumns()
     this.rebuildAllReadyEvents()
-  }
-
-  private migrateChildrenTableShape(): void {
-    const table = oneRow<{ sql: string }>(
-      this.db
-        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'children'")
-        .get(),
-    )
-    const columns = this.db.prepare("PRAGMA table_info(children)").all()
-    const hasParentClosePolicy = columns.some(
-      (row) => isPlainObject(row) && row.name === "parent_close_policy",
-    )
-    if (!table || (table.sql.includes("'abandoned'") && hasParentClosePolicy)) {
-      return
-    }
-
-    const parentClosePolicyExpression = hasParentClosePolicy ? "parent_close_policy" : "'cancel'"
-    this.db.exec(`
-      ALTER TABLE children RENAME TO children_old;
-
-      CREATE TABLE children (
-        child_record_id TEXT PRIMARY KEY,
-        parent_workflow_id TEXT NOT NULL,
-        parent_run_id TEXT NOT NULL,
-        activation_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        workflow_name TEXT NOT NULL,
-        workflow_version INTEGER NOT NULL,
-        workflow_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed', 'abandoned')),
-        parent_close_policy TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon')),
-        completed_at TEXT,
-        output_json TEXT,
-        error_json TEXT,
-        delivered_by_sequence INTEGER,
-        UNIQUE(parent_workflow_id, parent_run_id, activation_id, key)
-      );
-
-      INSERT INTO children (
-        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-        workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy,
-        completed_at, output_json, error_json, delivered_by_sequence
-      )
-      SELECT
-        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-        workflow_name, workflow_version, workflow_id, run_id, status, ${parentClosePolicyExpression},
-        completed_at, output_json, error_json, delivered_by_sequence
-      FROM children_old;
-
-      DROP TABLE children_old;
-
-      CREATE INDEX IF NOT EXISTS children_parent_delivery
-        ON children(parent_workflow_id, parent_run_id, delivered_by_sequence, completed_at, child_record_id);
-      CREATE INDEX IF NOT EXISTS children_child_instance
-        ON children(workflow_id, run_id, status, delivered_by_sequence);
-    `)
-  }
-
-  private addColumnIfMissing(table: string, column: string, definition: string): void {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all()
-    const exists = columns.some((row) => isPlainObject(row) && row.name === column)
-    if (!exists) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
-    }
-  }
-
-  private backfillEffectAttemptColumns(): void {
-    const rows = this.db
-      .prepare(
-        `
-        SELECT * FROM effects
-        WHERE attempt IS NULL OR attempt_id IS NULL OR max_attempts IS NULL
-          OR initial_interval_ms IS NULL OR max_interval_ms IS NULL OR backoff_coefficient IS NULL
-      `,
-      )
-      .all()
-      .map((row) => requireRow<EffectRow>(row))
-
-    for (const row of rows) {
-      this.db
-        .prepare(
-          `
-          UPDATE effects
-          SET attempt = ?, attempt_id = ?, max_attempts = ?,
-            initial_interval_ms = ?, max_interval_ms = ?, backoff_coefficient = ?,
-            first_attempt_started_at = COALESCE(first_attempt_started_at, attempt_started_at)
-          WHERE effect_id = ?
-        `,
-      )
-        .run(
-          row.attempt ?? 1,
-          row.attempt_id ?? `attempt-${randomUUID()}`,
-          row.max_attempts ?? 3,
-          row.initial_interval_ms ?? 1_000,
-          row.max_interval_ms ?? 30_000,
-          row.backoff_coefficient ?? 2,
-          row.effect_id,
-        )
-    }
   }
 
   private effectRow(input: {
@@ -1602,6 +1482,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const candidate = this.readyCandidateFromRow(row, instance)
       if (candidate) {
+        if (this.hasCompetingUncompletedActivation(instance, candidate.activationId)) {
+          continue
+        }
         const blockedUntil = this.activationRetryBlockedUntil(candidate.activationId, input.now)
         if (blockedUntil) {
           continue
@@ -1675,6 +1558,26 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           `,
           )
           .get(instance.workflow_id, instance.run_id, instance.sequence),
+      ),
+    )
+  }
+
+  private hasCompetingUncompletedActivation(
+    instance: InstanceRow,
+    activationId: string,
+  ): boolean {
+    return Boolean(
+      oneRow(
+        this.db
+          .prepare(
+            `
+            SELECT activation_id FROM activation_claims
+            WHERE workflow_id = ? AND run_id = ? AND sequence = ?
+              AND activation_id <> ? AND completed_by_sequence IS NULL
+            LIMIT 1
+          `,
+          )
+          .get(instance.workflow_id, instance.run_id, instance.sequence, activationId),
       ),
     )
   }
@@ -2008,7 +1911,6 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         WHERE activation_claims.completed_by_sequence IS NULL
           AND (
             activation_claims.owner_id IS NULL
-            OR activation_claims.owner_id = excluded.owner_id
             OR activation_claims.lease_until IS NULL
             OR activation_claims.lease_until <= ?
           )

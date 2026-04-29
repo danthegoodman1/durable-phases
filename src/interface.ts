@@ -125,6 +125,8 @@ export type CreateChildInstanceInput = CreateInstanceInput & {
   parentWorkflowId: string
   parentRunId: string
   activationId: string
+  workerId: string
+  leaseNow: string
   key: string
   parentClosePolicy?: "cancel" | "abandon"
   conflictPolicy?: ConflictPolicy

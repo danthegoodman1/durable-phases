@@ -584,6 +584,8 @@ export class DurableRuntime {
             parentWorkflowId: instance.workflowId,
             parentRunId: instance.runId,
             activationId: currentActivationId,
+            workerId: this.workerId,
+            leaseNow: this.now(),
             key,
             parentClosePolicy: options.parentClosePolicy ?? "cancel",
             conflictPolicy: options.conflictPolicy ?? "use_existing",
