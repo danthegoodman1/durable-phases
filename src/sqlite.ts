@@ -20,6 +20,7 @@ import type {
   EffectRecord,
   EffectReservation,
   FailEffectInput,
+  FailEffectResult,
   HeartbeatActivationInput,
   HeartbeatDispatchShardInput,
   HeartbeatEffectInput,
@@ -124,6 +125,25 @@ type EffectRow = {
   key: string
   idempotency_key: string
   status: "pending" | "completed" | "failed"
+  attempt: number | null
+  attempt_id: string | null
+  attempt_owner_id: string | null
+  attempt_started_at: string | null
+  start_to_close_timeout_ms: number | null
+  start_to_close_deadline: string | null
+  heartbeat_timeout_ms: number | null
+  heartbeat_deadline: string | null
+  max_attempts: number | null
+  max_elapsed_ms: number | null
+  initial_interval_ms: number | null
+  max_interval_ms: number | null
+  backoff_coefficient: number | null
+  first_attempt_started_at: string | null
+  next_attempt_at: string | null
+  last_failure_json: string | null
+  non_retryable_error_names_json: string | null
+  timed_out_at: string | null
+  timeout_kind: "heartbeat" | "start_to_close" | null
   result_json: string | null
   error_json: string | null
   heartbeat_at: string | null
@@ -468,6 +488,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         return { activation: null }
       }
 
+      this.expireActivityTimeouts(input.now, { shardIds: ownedShards })
+
       const candidates = this.indexedReadyCandidates({
         ...input,
         shardIds: ownedShards,
@@ -489,16 +511,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
-    const result = this.db
-      .prepare(
-        `
-        UPDATE activation_claims
-        SET lease_until = ?
-        WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
-          AND lease_until >= ?
-      `,
-      )
-      .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now)
+    const heartbeat = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      return this.db
+        .prepare(
+          `
+          UPDATE activation_claims
+          SET lease_until = ?
+          WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+            AND lease_until >= ?
+        `,
+        )
+        .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now)
+    })
+    const result = heartbeat.immediate() as SqliteRunResult
     if (result.changes === 0) {
       throw new Error(`Lost activation lease: ${input.activationId}`)
     }
@@ -518,7 +544,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   async getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
     const reserve = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
       this.assertLiveActivationLease(input)
+      const options = normalizeEffectOptions(input)
 
       const existing = oneRow<EffectRow>(
         this.db
@@ -547,30 +575,65 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       if (existing) {
+        const started = this.ensureEffectAttemptStarted(existing, input)
         return {
           status: "reserved",
-          effectId: existing.effect_id,
-          idempotencyKey: existing.idempotency_key,
-          heartbeatDetails: decodeJson<JsonValue | undefined>(existing.heartbeat_details_json, undefined),
+          effectId: started.effect_id,
+          idempotencyKey: started.idempotency_key,
+          attempt: started.attempt ?? 1,
+          attemptId: requireAttemptId(started),
+          heartbeatDetails: decodeJson<JsonValue | undefined>(
+            started.heartbeat_details_json,
+            undefined,
+          ),
         } satisfies EffectReservation
       }
 
       const effectId = `effect-${randomUUID()}`
+      const attemptId = `attempt-${randomUUID()}`
       const idempotencyKey = `${input.workflowId}/${input.runId}/${input.activationId}/${input.key}`
       this.db
         .prepare(
           `
           INSERT INTO effects (
-            effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status
-          ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
+            attempt, attempt_id, attempt_owner_id, attempt_started_at,
+            start_to_close_timeout_ms, start_to_close_deadline,
+            heartbeat_timeout_ms, heartbeat_deadline, max_attempts,
+            max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
+            first_attempt_started_at, next_attempt_at, non_retryable_error_names_json
+          ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         `,
         )
-        .run(effectId, input.workflowId, input.runId, input.activationId, input.key, idempotencyKey)
+        .run(
+          effectId,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          input.key,
+          idempotencyKey,
+          attemptId,
+          input.workerId,
+          input.now,
+          options.startToCloseTimeoutMs,
+          deadlineFrom(input.now, options.startToCloseTimeoutMs),
+          options.heartbeatTimeoutMs,
+          deadlineFrom(input.now, options.heartbeatTimeoutMs),
+          options.maxAttempts,
+          options.maxElapsedMs,
+          options.initialIntervalMs,
+          options.maxIntervalMs,
+          options.backoffCoefficient,
+          input.now,
+          encodeJson(options.nonRetryableErrorNames),
+        )
 
       return {
         status: "reserved",
         effectId,
         idempotencyKey,
+        attempt: 1,
+        attemptId,
       } satisfies EffectReservation
     })
 
@@ -578,65 +641,133 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatEffect(input: HeartbeatEffectInput): Promise<void> {
-    this.assertLiveActivationLease(input)
-    const result = this.db
-      .prepare(
-        `
-        UPDATE effects
-        SET heartbeat_at = ?, heartbeat_details_json = ?
-        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
-          AND status = 'pending'
-      `,
-      )
-      .run(
-        input.now,
-        encodeJson(input.details ?? null),
-        input.workflowId,
-        input.runId,
-        input.activationId,
-        input.effectId,
-      )
+    const heartbeat = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      this.assertLiveActivationLease(input)
+      const effect = this.effectRow(input)
+      const heartbeatDeadline = effect?.heartbeat_timeout_ms
+        ? addMs(input.now, effect.heartbeat_timeout_ms)
+        : null
+      return this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET heartbeat_at = ?, heartbeat_details_json = ?, heartbeat_deadline = ?
+          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+            AND attempt_id = ? AND status = 'pending'
+        `,
+        )
+        .run(
+          input.now,
+          encodeJson(input.details ?? null),
+          heartbeatDeadline,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          input.effectId,
+          input.attemptId,
+        )
+    })
+    const result = heartbeat.immediate() as SqliteRunResult
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
   }
 
   async completeEffect(input: CompleteEffectInput): Promise<void> {
-    this.assertLiveActivationLease(input)
-    const result = this.db
-      .prepare(
-        `
-        UPDATE effects
-        SET status = 'completed', result_json = ?, error_json = NULL
-        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
-          AND status = 'pending'
-      `,
-      )
-      .run(encodeJson(input.result), input.workflowId, input.runId, input.activationId, input.effectId)
+    const complete = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      this.assertLiveActivationLease(input)
+      return this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET status = 'completed', result_json = ?, error_json = NULL,
+            start_to_close_deadline = NULL, heartbeat_deadline = NULL
+          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+            AND attempt_id = ? AND status = 'pending'
+        `,
+        )
+        .run(
+          encodeJson(input.result),
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          input.effectId,
+          input.attemptId,
+        )
+    })
+    const result = complete.immediate() as SqliteRunResult
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
   }
 
-  async failEffect(input: FailEffectInput): Promise<void> {
-    this.assertLiveActivationLease(input)
-    const result = this.db
-      .prepare(
-        `
-        UPDATE effects
-        SET status = 'failed', error_json = ?
-        WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
-          AND status = 'pending'
-      `,
-      )
-      .run(encodeJson(input.error), input.workflowId, input.runId, input.activationId, input.effectId)
-    if (result.changes === 0) {
+  async failEffect(input: FailEffectInput): Promise<FailEffectResult> {
+    const fail = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      this.assertLiveActivationLease(input)
+      const effect = this.effectRow(input)
+      if (!effect || effect.status !== "pending" || effect.attempt_id !== input.attemptId) {
+        return { result: null, changes: 0 }
+      }
+
+      const retry = retryDecision(effect, input.error, input.now, input.retryable !== false)
+      if (retry.status === "retry_scheduled") {
+        const result = this.db
+          .prepare(
+            `
+            UPDATE effects
+            SET attempt = ?, attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
+              start_to_close_deadline = NULL, heartbeat_deadline = NULL,
+              next_attempt_at = ?, last_failure_json = ?
+            WHERE effect_id = ? AND attempt_id = ? AND status = 'pending'
+          `,
+          )
+          .run(
+            retry.nextAttempt,
+            `attempt-${randomUUID()}`,
+            retry.nextAttemptAt,
+            encodeJson(input.error),
+            input.effectId,
+            input.attemptId,
+        )
+        return { result: retry, changes: result.changes }
+      }
+
+      const result = this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET status = 'failed', error_json = ?, last_failure_json = ?,
+            start_to_close_deadline = NULL, heartbeat_deadline = NULL, next_attempt_at = NULL
+          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+            AND attempt_id = ? AND status = 'pending'
+        `,
+        )
+        .run(
+          encodeJson(input.error),
+          encodeJson(input.error),
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          input.effectId,
+          input.attemptId,
+        )
+      return { result: { status: "failed" } satisfies FailEffectResult, changes: result.changes }
+    })
+
+    const output = fail.immediate() as { result: FailEffectResult | null; changes: number }
+    if (output.changes === 0 || !output.result) {
       this.throwEffectMutationError(input)
     }
+    return output.result
   }
 
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
     const commit = this.db.transaction(() => {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+
       const instance = this.instanceRow(input)
       if (!instance || instance.status !== "running") {
         return { ok: false, sequence: instance?.sequence ?? -1 }
@@ -836,6 +967,25 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         key TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+        attempt INTEGER NOT NULL DEFAULT 1,
+        attempt_id TEXT,
+        attempt_owner_id TEXT,
+        attempt_started_at TEXT,
+        start_to_close_timeout_ms INTEGER,
+        start_to_close_deadline TEXT,
+        heartbeat_timeout_ms INTEGER,
+        heartbeat_deadline TEXT,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        max_elapsed_ms INTEGER,
+        initial_interval_ms INTEGER NOT NULL DEFAULT 1000,
+        max_interval_ms INTEGER NOT NULL DEFAULT 30000,
+        backoff_coefficient REAL NOT NULL DEFAULT 2,
+        first_attempt_started_at TEXT,
+        next_attempt_at TEXT,
+        last_failure_json TEXT,
+        non_retryable_error_names_json TEXT,
+        timed_out_at TEXT,
+        timeout_kind TEXT CHECK (timeout_kind IS NULL OR timeout_kind IN ('heartbeat', 'start_to_close')),
         result_json TEXT,
         error_json TEXT,
         heartbeat_at TEXT,
@@ -878,6 +1028,14 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         ON children(workflow_id, run_id, status, delivered_by_sequence);
       CREATE INDEX IF NOT EXISTS effects_activation_key
         ON effects(workflow_id, run_id, activation_id, key);
+      CREATE INDEX IF NOT EXISTS effects_activation_pending
+        ON effects(activation_id, status);
+      CREATE INDEX IF NOT EXISTS effects_start_deadline
+        ON effects(status, start_to_close_deadline);
+      CREATE INDEX IF NOT EXISTS effects_heartbeat_deadline
+        ON effects(status, heartbeat_deadline);
+      CREATE INDEX IF NOT EXISTS effects_next_attempt
+        ON effects(status, next_attempt_at);
       CREATE INDEX IF NOT EXISTS activation_claims_owner_lease
         ON activation_claims(owner_id, lease_until, completed_by_sequence);
       CREATE INDEX IF NOT EXISTS ready_events_claim
@@ -886,6 +1044,26 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         ON ready_events(workflow_id, run_id, sequence);
     `)
     this.addColumnIfMissing("activation_claims", "activation_time", "TEXT")
+    this.addColumnIfMissing("effects", "attempt", "INTEGER DEFAULT 1")
+    this.addColumnIfMissing("effects", "attempt_id", "TEXT")
+    this.addColumnIfMissing("effects", "attempt_owner_id", "TEXT")
+    this.addColumnIfMissing("effects", "attempt_started_at", "TEXT")
+    this.addColumnIfMissing("effects", "start_to_close_timeout_ms", "INTEGER")
+    this.addColumnIfMissing("effects", "start_to_close_deadline", "TEXT")
+    this.addColumnIfMissing("effects", "heartbeat_timeout_ms", "INTEGER")
+    this.addColumnIfMissing("effects", "heartbeat_deadline", "TEXT")
+    this.addColumnIfMissing("effects", "max_attempts", "INTEGER DEFAULT 3")
+    this.addColumnIfMissing("effects", "max_elapsed_ms", "INTEGER")
+    this.addColumnIfMissing("effects", "initial_interval_ms", "INTEGER DEFAULT 1000")
+    this.addColumnIfMissing("effects", "max_interval_ms", "INTEGER DEFAULT 30000")
+    this.addColumnIfMissing("effects", "backoff_coefficient", "REAL DEFAULT 2")
+    this.addColumnIfMissing("effects", "first_attempt_started_at", "TEXT")
+    this.addColumnIfMissing("effects", "next_attempt_at", "TEXT")
+    this.addColumnIfMissing("effects", "last_failure_json", "TEXT")
+    this.addColumnIfMissing("effects", "non_retryable_error_names_json", "TEXT")
+    this.addColumnIfMissing("effects", "timed_out_at", "TEXT")
+    this.addColumnIfMissing("effects", "timeout_kind", "TEXT")
+    this.backfillEffectAttemptColumns()
     this.rebuildAllReadyEvents()
   }
 
@@ -895,6 +1073,60 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (!exists) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
+  }
+
+  private backfillEffectAttemptColumns(): void {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT * FROM effects
+        WHERE attempt IS NULL OR attempt_id IS NULL OR max_attempts IS NULL
+          OR initial_interval_ms IS NULL OR max_interval_ms IS NULL OR backoff_coefficient IS NULL
+      `,
+      )
+      .all()
+      .map((row) => requireRow<EffectRow>(row))
+
+    for (const row of rows) {
+      this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET attempt = ?, attempt_id = ?, max_attempts = ?,
+            initial_interval_ms = ?, max_interval_ms = ?, backoff_coefficient = ?,
+            first_attempt_started_at = COALESCE(first_attempt_started_at, attempt_started_at)
+          WHERE effect_id = ?
+        `,
+      )
+        .run(
+          row.attempt ?? 1,
+          row.attempt_id ?? `attempt-${randomUUID()}`,
+          row.max_attempts ?? 3,
+          row.initial_interval_ms ?? 1_000,
+          row.max_interval_ms ?? 30_000,
+          row.backoff_coefficient ?? 2,
+          row.effect_id,
+        )
+    }
+  }
+
+  private effectRow(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    effectId: string
+  }): EffectRow | null {
+    return oneRow<EffectRow>(
+      this.db
+        .prepare(
+          `
+          SELECT * FROM effects
+          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
+          LIMIT 1
+        `,
+        )
+        .get(input.workflowId, input.runId, input.activationId, input.effectId),
+    )
   }
 
   private instanceRow(ref: InstanceRef): InstanceRow | null {
@@ -1262,6 +1494,10 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const candidate = this.readyCandidateFromRow(row, instance)
       if (candidate) {
+        const blockedUntil = this.activationRetryBlockedUntil(candidate.activationId, input.now)
+        if (blockedUntil) {
+          continue
+        }
         candidates.push(candidate)
       }
     }
@@ -1335,6 +1571,215 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     )
   }
 
+  private activationRetryBlockedUntil(activationId: string, now: string): string | undefined {
+    const row = oneRow<{ blocked_until: string | null }>(
+      this.db
+        .prepare(
+          `
+          SELECT MAX(next_attempt_at) AS blocked_until
+          FROM effects
+          WHERE activation_id = ? AND status = 'pending'
+            AND next_attempt_at IS NOT NULL AND next_attempt_at > ?
+        `,
+        )
+        .get(activationId, now),
+    )
+    return row?.blocked_until ?? undefined
+  }
+
+  private ensureEffectAttemptStarted(effect: EffectRow, input: ReserveEffectInput): EffectRow {
+    if (effect.next_attempt_at && effect.next_attempt_at > input.now) {
+      throw new Error(`Effect retry is not ready until ${effect.next_attempt_at}: ${effect.effect_id}`)
+    }
+
+    if (
+      effect.attempt_started_at &&
+      effect.attempt_owner_id === input.workerId &&
+      effect.attempt_id
+    ) {
+      return effect
+    }
+
+    const attemptId = effect.attempt_started_at
+      ? `attempt-${randomUUID()}`
+      : effect.attempt_id ?? `attempt-${randomUUID()}`
+    const attempt = effect.attempt ?? 1
+    const startToCloseTimeoutMs = effect.start_to_close_timeout_ms
+    const heartbeatTimeoutMs = effect.heartbeat_timeout_ms
+    const maxAttempts = effect.max_attempts ?? 3
+    const firstAttemptStartedAt = effect.first_attempt_started_at ?? input.now
+
+    this.db
+      .prepare(
+        `
+        UPDATE effects
+        SET attempt = ?, attempt_id = ?, attempt_owner_id = ?, attempt_started_at = ?,
+          start_to_close_timeout_ms = ?, start_to_close_deadline = ?,
+          heartbeat_timeout_ms = ?, heartbeat_deadline = ?, max_attempts = ?,
+          first_attempt_started_at = ?, next_attempt_at = NULL
+        WHERE effect_id = ? AND status = 'pending'
+      `,
+      )
+      .run(
+        attempt,
+        attemptId,
+        input.workerId,
+        input.now,
+        startToCloseTimeoutMs,
+        deadlineFrom(input.now, startToCloseTimeoutMs),
+        heartbeatTimeoutMs,
+        deadlineFrom(input.now, heartbeatTimeoutMs),
+        maxAttempts,
+        firstAttemptStartedAt,
+        effect.effect_id,
+      )
+
+    return {
+      ...effect,
+      attempt,
+      attempt_id: attemptId,
+      attempt_owner_id: input.workerId,
+      attempt_started_at: input.now,
+      start_to_close_timeout_ms: startToCloseTimeoutMs,
+      start_to_close_deadline: deadlineFrom(input.now, startToCloseTimeoutMs),
+      heartbeat_timeout_ms: heartbeatTimeoutMs,
+      heartbeat_deadline: deadlineFrom(input.now, heartbeatTimeoutMs),
+      max_attempts: maxAttempts,
+      first_attempt_started_at: firstAttemptStartedAt,
+      next_attempt_at: null,
+    }
+  }
+
+  private expireActivityTimeouts(
+    now: string,
+    scope: { activationId?: string; shardIds?: number[] },
+  ): void {
+    if (!scope.activationId && (!scope.shardIds || scope.shardIds.length === 0)) {
+      return
+    }
+
+    const filters: string[] = []
+    const params: SqliteValue[] = []
+    if (scope.activationId) {
+      filters.push("e.activation_id = ?")
+      params.push(scope.activationId)
+    }
+    if (scope.shardIds && scope.shardIds.length > 0) {
+      filters.push(`i.partition_shard IN (${scope.shardIds.map(() => "?").join(", ")})`)
+      params.push(...scope.shardIds)
+    }
+
+    const expired = this.db
+      .prepare(
+        `
+        SELECT DISTINCT e.activation_id
+        FROM effects e
+        JOIN activation_claims a ON a.activation_id = e.activation_id
+        JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+        WHERE e.status = 'pending'
+          AND e.attempt_started_at IS NOT NULL
+          AND a.completed_by_sequence IS NULL
+          AND (${filters.join(" OR ")})
+          AND (
+            (e.start_to_close_deadline IS NOT NULL AND e.start_to_close_deadline <= ?)
+            OR (e.heartbeat_deadline IS NOT NULL AND e.heartbeat_deadline <= ?)
+          )
+      `,
+      )
+      .all(...params, now, now)
+      .map((row) => requireRow<{ activation_id: string }>(row).activation_id)
+
+    for (const activationId of expired) {
+      this.expirePendingEffectsForActivation(activationId, now)
+    }
+  }
+
+  private expirePendingEffectsForActivation(activationId: string, now: string): void {
+    const effects = this.db
+      .prepare(
+        `
+        SELECT * FROM effects
+        WHERE activation_id = ? AND status = 'pending' AND attempt_started_at IS NOT NULL
+      `,
+      )
+      .all(activationId)
+      .map((row) => requireRow<EffectRow>(row))
+
+    for (const effect of effects) {
+      const timeoutKind = effectTimeoutKind(effect, now)
+      if (!timeoutKind) {
+        this.fencePendingEffectAttempt(effect)
+        continue
+      }
+
+      const timeoutError = activityTimeoutError(effect, timeoutKind)
+      const retry = retryDecision(effect, timeoutError, now, true)
+      if (retry.status === "failed") {
+        this.db
+          .prepare(
+            `
+            UPDATE effects
+            SET status = 'failed', error_json = ?, last_failure_json = ?,
+              timed_out_at = ?, timeout_kind = ?,
+              start_to_close_deadline = NULL, heartbeat_deadline = NULL, next_attempt_at = NULL
+            WHERE effect_id = ? AND status = 'pending'
+          `,
+          )
+          .run(
+            encodeJson(timeoutError),
+            encodeJson(timeoutError),
+            now,
+            timeoutKind,
+            effect.effect_id,
+          )
+        continue
+      }
+
+      this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET attempt = ?, attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
+            start_to_close_deadline = NULL, heartbeat_deadline = NULL,
+            timed_out_at = ?, timeout_kind = ?, next_attempt_at = ?, last_failure_json = ?
+          WHERE effect_id = ? AND status = 'pending'
+        `,
+        )
+        .run(
+          retry.nextAttempt,
+          `attempt-${randomUUID()}`,
+          now,
+          timeoutKind,
+          retry.nextAttemptAt,
+          encodeJson(timeoutError),
+          effect.effect_id,
+        )
+    }
+
+    this.db
+      .prepare(
+        `
+        UPDATE activation_claims
+        SET owner_id = NULL, lease_until = NULL
+        WHERE activation_id = ? AND completed_by_sequence IS NULL
+      `,
+      )
+      .run(activationId)
+  }
+
+  private fencePendingEffectAttempt(effect: EffectRow): void {
+    this.db
+      .prepare(
+        `
+        UPDATE effects
+        SET attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
+          start_to_close_deadline = NULL, heartbeat_deadline = NULL, next_attempt_at = NULL
+        WHERE effect_id = ? AND status = 'pending'
+      `,
+      )
+      .run(`attempt-${randomUUID()}`, effect.effect_id)
+  }
+
   private nextWakeAt(
     shardIds: number[],
     now: string,
@@ -1363,7 +1808,70 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         )
         .get(...shardIds, now, ...versionParams),
     )
-    return row?.ready_at
+    const effectDeadline = oneRow<{ deadline: string }>(
+      this.db
+        .prepare(
+          `
+          SELECT MIN(deadline) AS deadline FROM (
+            SELECT e.start_to_close_deadline AS deadline
+            FROM effects e
+            JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+            JOIN activation_claims a ON a.activation_id = e.activation_id
+            WHERE i.partition_shard IN (${placeholders})
+              AND i.status = 'running'
+              AND e.status = 'pending'
+              AND e.start_to_close_deadline IS NOT NULL
+              AND e.start_to_close_deadline > ?
+              AND a.completed_by_sequence IS NULL
+              AND (${versionClauses})
+            UNION ALL
+            SELECT e.heartbeat_deadline AS deadline
+            FROM effects e
+            JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+            JOIN activation_claims a ON a.activation_id = e.activation_id
+            WHERE i.partition_shard IN (${placeholders})
+              AND i.status = 'running'
+              AND e.status = 'pending'
+              AND e.heartbeat_deadline IS NOT NULL
+              AND e.heartbeat_deadline > ?
+              AND a.completed_by_sequence IS NULL
+              AND (${versionClauses})
+          )
+        `,
+        )
+        .get(
+          ...shardIds,
+          now,
+          ...versionParams,
+          ...shardIds,
+          now,
+          ...versionParams,
+        ),
+    )
+
+    const retryWake = oneRow<{ ready_at: string | null }>(
+      this.db
+        .prepare(
+          `
+          SELECT MIN(blocked_until) AS ready_at
+          FROM (
+            SELECT e.activation_id, MAX(e.next_attempt_at) AS blocked_until
+            FROM effects e
+            JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+            WHERE i.partition_shard IN (${placeholders})
+              AND i.status = 'running'
+              AND e.status = 'pending'
+              AND e.next_attempt_at IS NOT NULL
+              AND e.next_attempt_at > ?
+              AND (${versionClauses})
+            GROUP BY e.activation_id
+          )
+        `,
+        )
+        .get(...shardIds, now, ...versionParams),
+    )
+
+    return earliestIso(row?.ready_at, effectDeadline?.deadline, retryWake?.ready_at ?? undefined)
   }
 
   private tryWriteActivationClaim(
@@ -1373,6 +1881,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     leaseMs: number,
   ): boolean {
     const leaseUntil = addMs(now, leaseMs)
+    const existing = oneRow<ActivationClaimRow>(
+      this.db.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
+    )
     const result = this.db
       .prepare(
         `
@@ -1412,8 +1923,36 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (result.changes === 0) {
       return false
     }
+    if (shouldResetPendingEffectAttemptsOnClaim(existing, workerId, now)) {
+      this.resetPendingEffectsForActivationReclaim(candidate.activationId)
+    }
     candidate.leaseUntil = leaseUntil
     return true
+  }
+
+  private resetPendingEffectsForActivationReclaim(activationId: string): void {
+    const effects = this.db
+      .prepare(
+        `
+        SELECT * FROM effects
+        WHERE activation_id = ? AND status = 'pending' AND attempt_started_at IS NOT NULL
+      `,
+      )
+      .all(activationId)
+      .map((row) => requireRow<EffectRow>(row))
+
+    for (const effect of effects) {
+      this.db
+        .prepare(
+          `
+          UPDATE effects
+          SET attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
+            start_to_close_deadline = NULL, heartbeat_deadline = NULL, next_attempt_at = NULL
+          WHERE effect_id = ? AND status = 'pending'
+        `,
+        )
+        .run(`attempt-${randomUUID()}`, effect.effect_id)
+    }
   }
 
   private assertLiveActivationLease(input: {
@@ -1446,19 +1985,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     activationId: string
     effectId: string
   }): never {
-    const effect = oneRow<EffectRow>(
-      this.db
-        .prepare(
-          `
-          SELECT * FROM effects
-          WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
-          LIMIT 1
-        `,
-        )
-        .get(input.workflowId, input.runId, input.activationId, input.effectId),
-    )
+    const effect = this.effectRow(input)
     if (!effect) {
       throw new Error(`Unknown effect: ${input.effectId}`)
+    }
+    if (effect.status === "pending") {
+      throw new Error(`Lost effect attempt: ${input.effectId}`)
     }
     throw new Error(`Effect is already terminal: ${input.effectId}`)
   }
@@ -1658,6 +2190,20 @@ function claimMatchesCommit(claim: ActivationClaimRow, input: CommitCheckpointIn
   return !input.consumeSignalId && !input.consumeChildRecordId
 }
 
+function shouldResetPendingEffectAttemptsOnClaim(
+  existing: ActivationClaimRow | null,
+  workerId: string,
+  now: string,
+): boolean {
+  if (!existing || existing.completed_by_sequence !== null) {
+    return false
+  }
+  if (existing.owner_id === workerId && existing.lease_until && existing.lease_until > now) {
+    return false
+  }
+  return true
+}
+
 function sortKey(...parts: string[]): string {
   return parts.join("\u0000")
 }
@@ -1669,6 +2215,171 @@ function stripSort(candidate: ReadyCandidate): ClaimedActivation {
 
 function addMs(iso: string, ms: number): string {
   return new Date(new Date(iso).getTime() + ms).toISOString()
+}
+
+function deadlineFrom(now: string, timeoutMs: number | null): string | null {
+  return timeoutMs === null ? null : addMs(now, timeoutMs)
+}
+
+type NormalizedEffectOptions = {
+  startToCloseTimeoutMs: number | null
+  heartbeatTimeoutMs: number | null
+  maxAttempts: number
+  maxElapsedMs: number | null
+  initialIntervalMs: number
+  maxIntervalMs: number
+  backoffCoefficient: number
+  nonRetryableErrorNames: string[]
+}
+
+function normalizeEffectOptions(input: ReserveEffectInput): NormalizedEffectOptions {
+  const startToCloseTimeoutMs = normalizeOptionalTimeout(
+    input.options?.startToCloseTimeoutMs,
+    "startToCloseTimeoutMs",
+  )
+  const heartbeatTimeoutMs = normalizeOptionalTimeout(
+    input.options?.heartbeatTimeoutMs,
+    "heartbeatTimeoutMs",
+  )
+  const requestedMaxAttempts = input.maxAttempts ?? input.options?.retry?.maxAttempts
+  const maxAttempts = requestedMaxAttempts ?? 3
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error("activity retry.maxAttempts must be a positive integer")
+  }
+  const maxElapsedMs = normalizeOptionalTimeout(input.options?.retry?.maxElapsedMs, "retry.maxElapsedMs")
+  const initialIntervalMs = normalizeRetryInterval(
+    input.options?.retry?.initialIntervalMs ?? 1_000,
+    "retry.initialIntervalMs",
+  )
+  const maxIntervalMs = normalizeRetryInterval(
+    input.options?.retry?.maxIntervalMs ?? 30_000,
+    "retry.maxIntervalMs",
+  )
+  const backoffCoefficient = input.options?.retry?.backoffCoefficient ?? 2
+  if (!Number.isFinite(backoffCoefficient) || backoffCoefficient < 1) {
+    throw new Error("activity retry.backoffCoefficient must be greater than or equal to 1")
+  }
+  const nonRetryableErrorNames = input.options?.retry?.nonRetryableErrorNames ?? []
+  if (
+    !Array.isArray(nonRetryableErrorNames) ||
+    nonRetryableErrorNames.some((name) => typeof name !== "string" || name.length === 0)
+  ) {
+    throw new Error("activity retry.nonRetryableErrorNames must be non-empty strings")
+  }
+  return {
+    startToCloseTimeoutMs,
+    heartbeatTimeoutMs,
+    maxAttempts,
+    maxElapsedMs,
+    initialIntervalMs,
+    maxIntervalMs,
+    backoffCoefficient,
+    nonRetryableErrorNames,
+  }
+}
+
+function normalizeOptionalTimeout(value: number | null | undefined, name: string): number | null {
+  if (value == null) {
+    return null
+  }
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`activity ${name} must be a positive integer when provided`)
+  }
+  return value
+}
+
+function normalizeRetryInterval(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`activity ${name} must be a non-negative integer`)
+  }
+  return value
+}
+
+function requireAttemptId(effect: EffectRow): string {
+  if (!effect.attempt_id) {
+    throw new Error(`Effect has no active attempt: ${effect.effect_id}`)
+  }
+  return effect.attempt_id
+}
+
+function effectTimeoutKind(
+  effect: EffectRow,
+  now: string,
+): "heartbeat" | "start_to_close" | null {
+  const startExpired =
+    effect.start_to_close_deadline !== null && effect.start_to_close_deadline <= now
+  const heartbeatExpired = effect.heartbeat_deadline !== null && effect.heartbeat_deadline <= now
+
+  if (startExpired && heartbeatExpired) {
+    return effect.start_to_close_deadline! <= effect.heartbeat_deadline!
+      ? "start_to_close"
+      : "heartbeat"
+  }
+  if (startExpired) {
+    return "start_to_close"
+  }
+  return heartbeatExpired ? "heartbeat" : null
+}
+
+function activityTimeoutError(
+  effect: EffectRow,
+  timeoutKind: "heartbeat" | "start_to_close",
+): SerializedError {
+  const label =
+    timeoutKind === "start_to_close" ? "start-to-close timeout" : "heartbeat timeout"
+  return {
+    name: "ActivityTimeoutError",
+    message: `Activity ${effect.key} failed due to ${label}`,
+  }
+}
+
+function retryDecision(
+  effect: EffectRow,
+  error: SerializedError,
+  now: string,
+  retryable: boolean,
+): FailEffectResult {
+  if (!retryable || isStoredNonRetryable(effect, error)) {
+    return { status: "failed" }
+  }
+
+  const attempt = effect.attempt ?? 1
+  const maxAttempts = effect.max_attempts ?? 3
+  if (attempt >= maxAttempts) {
+    return { status: "failed" }
+  }
+
+  const firstAttemptStartedAt = effect.first_attempt_started_at ?? effect.attempt_started_at ?? now
+  const nextAttempt = attempt + 1
+  const delayMs = retryDelayMs(effect, attempt)
+  const nextAttemptAt = addMs(now, delayMs)
+  if (effect.max_elapsed_ms !== null) {
+    const maxElapsedAt = addMs(firstAttemptStartedAt, effect.max_elapsed_ms)
+    if (nextAttemptAt > maxElapsedAt) {
+      return { status: "failed" }
+    }
+  }
+
+  return { status: "retry_scheduled", nextAttemptAt, nextAttempt }
+}
+
+function retryDelayMs(effect: EffectRow, failedAttempt: number): number {
+  const initial = effect.initial_interval_ms ?? 1_000
+  const max = effect.max_interval_ms ?? 30_000
+  const coefficient = effect.backoff_coefficient ?? 2
+  const exponential = initial * coefficient ** Math.max(0, failedAttempt - 1)
+  return Math.min(max, Math.round(exponential))
+}
+
+function isStoredNonRetryable(effect: EffectRow, error: SerializedError): boolean {
+  if (!error.name) {
+    return false
+  }
+  return decodeJson<string[]>(effect.non_retryable_error_names_json, []).includes(error.name)
+}
+
+function earliestIso(...values: Array<string | undefined>): string | undefined {
+  return values.filter((value): value is string => typeof value === "string").sort()[0]
 }
 
 function encodeJson(value: unknown): string {
@@ -1735,6 +2446,28 @@ function rowToEffectRecord(row: EffectRow): EffectRecord {
     key: row.key,
     idempotencyKey: row.idempotency_key,
     status: row.status,
+    attempt: row.attempt ?? undefined,
+    attemptId: row.attempt_id ?? undefined,
+    attemptOwnerId: row.attempt_owner_id ?? undefined,
+    attemptStartedAt: row.attempt_started_at ?? undefined,
+    startToCloseTimeoutMs: row.start_to_close_timeout_ms ?? undefined,
+    startToCloseDeadline: row.start_to_close_deadline ?? undefined,
+    heartbeatTimeoutMs: row.heartbeat_timeout_ms ?? undefined,
+    heartbeatDeadline: row.heartbeat_deadline ?? undefined,
+    maxAttempts: row.max_attempts ?? undefined,
+    maxElapsedMs: row.max_elapsed_ms ?? undefined,
+    initialIntervalMs: row.initial_interval_ms ?? undefined,
+    maxIntervalMs: row.max_interval_ms ?? undefined,
+    backoffCoefficient: row.backoff_coefficient ?? undefined,
+    firstAttemptStartedAt: row.first_attempt_started_at ?? undefined,
+    nextAttemptAt: row.next_attempt_at ?? undefined,
+    lastFailure: decodeJson<SerializedError | undefined>(row.last_failure_json, undefined),
+    nonRetryableErrorNames: decodeJson<string[] | undefined>(
+      row.non_retryable_error_names_json,
+      undefined,
+    ),
+    timedOutAt: row.timed_out_at ?? undefined,
+    timeoutKind: row.timeout_kind ?? undefined,
     result: decodeJson<JsonValue | undefined>(row.result_json, undefined),
     error: decodeJson<SerializedError | undefined>(row.error_json, undefined),
     heartbeatAt: row.heartbeat_at ?? undefined,

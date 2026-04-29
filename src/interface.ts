@@ -1,5 +1,6 @@
 import type {
   AnyWorkflow,
+  ActivityOptions,
   ChildEvent,
   ChildHandle,
   InstanceRef,
@@ -40,6 +41,25 @@ export type EffectRecord = {
   key: string
   idempotencyKey: string
   status: "pending" | "completed" | "failed"
+  attempt?: number
+  attemptId?: string
+  attemptOwnerId?: string
+  attemptStartedAt?: string
+  startToCloseTimeoutMs?: number
+  startToCloseDeadline?: string
+  heartbeatTimeoutMs?: number
+  heartbeatDeadline?: string
+  maxAttempts?: number
+  maxElapsedMs?: number
+  initialIntervalMs?: number
+  maxIntervalMs?: number
+  backoffCoefficient?: number
+  firstAttemptStartedAt?: string
+  nextAttemptAt?: string
+  lastFailure?: SerializedError
+  nonRetryableErrorNames?: string[]
+  timedOutAt?: string
+  timeoutKind?: "heartbeat" | "start_to_close"
   result?: JsonValue
   error?: SerializedError
   heartbeatAt?: string
@@ -222,6 +242,8 @@ export type EffectReservation<T = JsonValue> =
       status: "reserved"
       effectId: string
       idempotencyKey: string
+      attempt: number
+      attemptId: string
       heartbeatDetails?: JsonValue
     }
   | {
@@ -240,6 +262,8 @@ export type ReserveEffectInput = {
   workerId: string
   key: string
   now: string
+  options?: ActivityOptions
+  maxAttempts?: number
 }
 
 export type HeartbeatEffectInput = {
@@ -248,6 +272,7 @@ export type HeartbeatEffectInput = {
   activationId: string
   workerId: string
   effectId: string
+  attemptId: string
   now: string
   details?: JsonValue
 }
@@ -258,6 +283,7 @@ export type CompleteEffectInput = {
   activationId: string
   workerId: string
   effectId: string
+  attemptId: string
   result: JsonValue
   now: string
 }
@@ -268,9 +294,15 @@ export type FailEffectInput = {
   activationId: string
   workerId: string
   effectId: string
+  attemptId: string
   error: SerializedError
   now: string
+  retryable?: boolean
 }
+
+export type FailEffectResult =
+  | { status: "failed" }
+  | { status: "retry_scheduled"; nextAttemptAt: string; nextAttempt: number }
 
 export type CommitCheckpointInput = {
   workflowId: string
@@ -305,7 +337,7 @@ export type DurabilityProvider = {
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
   heartbeatEffect(input: HeartbeatEffectInput): Promise<void>
   completeEffect(input: CompleteEffectInput): Promise<void>
-  failEffect(input: FailEffectInput): Promise<void>
+  failEffect(input: FailEffectInput): Promise<FailEffectResult>
   commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
   readOutput<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>>
 }

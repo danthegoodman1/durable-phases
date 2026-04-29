@@ -11,6 +11,20 @@ export type SerializedError = {
   stack?: string
 }
 
+export class NonRetryableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = new.target.name
+  }
+}
+
+export class NonRetraybleError extends NonRetryableError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "NonRetraybleError"
+  }
+}
+
 export type PhaseSnapshot = {
   name: string
   data: JsonObject
@@ -49,7 +63,11 @@ export type TransitionCommand<Output = unknown> =
 
 export type DurableContext = {
   now(): string
-  activity<T>(key: string, fn: () => Promise<T> | T): Promise<T>
+  activity<T>(
+    key: string,
+    fn: (ctx: ActivityContext) => Promise<T> | T,
+    options?: ActivityOptions,
+  ): Promise<T>
   child: {
     start<W extends AnyWorkflow>(
       key: string,
@@ -59,6 +77,29 @@ export type DurableContext = {
     ): Promise<ChildHandle<W>>
     result<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>>
   }
+}
+
+export type ActivityContext = {
+  heartbeat(details?: JsonValue): Promise<void>
+  heartbeatDetails?: JsonValue
+  idempotencyKey: string
+  attempt: number
+  signal: AbortSignal
+}
+
+export type ActivityOptions = {
+  startToCloseTimeoutMs?: number | null
+  heartbeatTimeoutMs?: number | null
+  retry?: ActivityRetryOptions
+}
+
+export type ActivityRetryOptions = {
+  maxAttempts?: number
+  maxElapsedMs?: number | null
+  initialIntervalMs?: number
+  maxIntervalMs?: number | null
+  backoffCoefficient?: number
+  nonRetryableErrorNames?: string[]
 }
 
 export type ChildOptions = {
@@ -252,6 +293,14 @@ export function serializeError(error: unknown): SerializedError {
   }
 
   return { message: String(error) }
+}
+
+export function isNonRetryableError(error: unknown): boolean {
+  return (
+    error instanceof NonRetryableError ||
+    (error instanceof Error &&
+      (error.name === "NonRetryableError" || error.name === "NonRetraybleError"))
+  )
 }
 
 export function toJson(value: unknown): JsonValue {

@@ -11,6 +11,8 @@ import type {
 import { workflowPartitionShard } from "./interface.js"
 import type {
   AnyWorkflow,
+  ActivityContext,
+  ActivityOptions,
   ChildHandle,
   ChildOptions,
   DurableContext,
@@ -19,6 +21,7 @@ import type {
   InstanceRef,
   InstanceStatus,
   JsonObject,
+  JsonValue,
   OutputOf,
   PhaseSnapshot,
   Schema,
@@ -29,6 +32,7 @@ import type {
 } from "./workflow.js"
 import {
   clone,
+  isNonRetryableError,
   isPlainObject,
   safeId,
   serializeError,
@@ -58,6 +62,11 @@ export type RunWorkerOptions = {
   jitterRatio?: number
   signal?: AbortSignal
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+}
+
+export type DrainOptions = {
+  maxActivations?: number
+  signal?: AbortSignal
 }
 
 export class DurableRuntime {
@@ -152,7 +161,7 @@ export class DurableRuntime {
     return definition.schema.parse(output)
   }
 
-  async drain(options: { maxActivations?: number } = {}): Promise<DrainResult> {
+  async drain(options: DrainOptions = {}): Promise<DrainResult> {
     const maxActivations = options.maxActivations ?? 100
     let activations = 0
     let nextWakeAt: string | undefined
@@ -179,12 +188,14 @@ export class DurableRuntime {
         }
 
         try {
-          await this.withLeaseHeartbeats(shardIds, claim.activation, () =>
-            this.runActivation(claim.activation!),
+          await this.withLeaseHeartbeats(shardIds, claim.activation, options.signal, (signal) =>
+            this.runActivation(claim.activation!, signal),
           )
         } catch (error) {
           await this.releaseActivationQuietly(claim.activation.activationId)
-          throw error
+          if (!isActivityRetryScheduledError(error)) {
+            throw error
+          }
         }
         activations += 1
       }
@@ -203,7 +214,18 @@ export class DurableRuntime {
     let activations = 0
 
     while (!options.signal?.aborted) {
-      const result = await this.drain({ maxActivations: options.maxActivationsPerDrain })
+      let result: DrainResult
+      try {
+        result = await this.drain({
+          maxActivations: options.maxActivationsPerDrain,
+          signal: options.signal,
+        })
+      } catch (error) {
+        if (isAbortError(error) || options.signal?.aborted) {
+          break
+        }
+        throw error
+      }
       activations += result.activations
 
       if (options.signal?.aborted) {
@@ -281,7 +303,7 @@ export class DurableRuntime {
     )
   }
 
-  private async runActivation(activation: ClaimedActivation): Promise<void> {
+  private async runActivation(activation: ClaimedActivation, signal: AbortSignal): Promise<void> {
     const latest = await this.requireInstance({
       workflowId: activation.workflowId,
       runId: activation.runId,
@@ -337,7 +359,13 @@ export class DurableRuntime {
     }
 
     const data = phaseDefinition.state.parse(phaseSnapshot.data)
-    const ctx = this.contextFor(workflow, latest, activation.activationId, activation.activationTime)
+    const ctx = this.contextFor(
+      workflow,
+      latest,
+      activation.activationId,
+      activation.activationTime,
+      signal,
+    )
     let transition: TransitionCommand
     let consumeSignalId: string | undefined
     let consumeChildRecordId: string | undefined
@@ -431,10 +459,15 @@ export class DurableRuntime {
     instance: PersistedInstance,
     currentActivationId: string,
     activationTime: string,
+    activationSignal: AbortSignal,
   ): DurableContext {
     return {
       now: () => activationTime,
-      activity: async <T>(key: string, fn: () => Promise<T> | T): Promise<T> => {
+      activity: async <T>(
+        key: string,
+        fn: (ctx: ActivityContext) => Promise<T> | T,
+        options?: ActivityOptions,
+      ): Promise<T> => {
         const reservation = await this.provider.getOrReserveEffect({
           workflowId: instance.workflowId,
           runId: instance.runId,
@@ -442,6 +475,7 @@ export class DurableRuntime {
           workerId: this.workerId,
           key,
           now: this.now(),
+          options,
         })
 
         if (reservation.status === "completed") {
@@ -452,19 +486,52 @@ export class DurableRuntime {
           throw new Error(reservation.error.message)
         }
 
+        const activityContext = {
+          heartbeat: async (details?: JsonValue): Promise<void> => {
+            if (activationSignal.aborted) {
+              throw abortError()
+            }
+            await this.provider.heartbeatEffect({
+              workflowId: instance.workflowId,
+              runId: instance.runId,
+              activationId: currentActivationId,
+              workerId: this.workerId,
+              effectId: reservation.effectId,
+              attemptId: reservation.attemptId,
+              now: this.now(),
+              details: details === undefined ? undefined : toJson(details),
+            })
+          },
+          heartbeatDetails: clone(reservation.heartbeatDetails),
+          idempotencyKey: reservation.idempotencyKey,
+          attempt: reservation.attempt,
+          signal: activationSignal,
+        }
+
         let result: T
         try {
-          result = await fn()
+          if (activationSignal.aborted) {
+            throw abortError()
+          }
+          result = await fn(activityContext)
         } catch (error) {
-          await this.provider.failEffect({
+          if (activationSignal.aborted) {
+            throw error
+          }
+          const failure = await this.provider.failEffect({
             workflowId: instance.workflowId,
             runId: instance.runId,
             activationId: currentActivationId,
             workerId: this.workerId,
             effectId: reservation.effectId,
+            attemptId: reservation.attemptId,
             error: serializeError(error),
             now: this.now(),
+            retryable: !isNonRetryableActivityError(error),
           })
+          if (failure.status === "retry_scheduled") {
+            throw new ActivityRetryScheduledError(failure.nextAttemptAt)
+          }
           throw error
         }
 
@@ -474,6 +541,7 @@ export class DurableRuntime {
           activationId: currentActivationId,
           workerId: this.workerId,
           effectId: reservation.effectId,
+          attemptId: reservation.attemptId,
           result: toJson(result),
           now: this.now(),
         })
@@ -532,8 +600,23 @@ export class DurableRuntime {
   private async withLeaseHeartbeats<T>(
     shardIds: number[],
     activation: ClaimedActivation,
-    fn: () => Promise<T>,
+    externalSignal: AbortSignal | undefined,
+    fn: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
+    const controller = new AbortController()
+    let rejectHeartbeat: (error: unknown) => void = () => undefined
+    const heartbeatFailure = new Promise<never>((_resolve, reject) => {
+      rejectHeartbeat = reject
+    })
+    const failActivation = (error: unknown) => {
+      if (!controller.signal.aborted) {
+        controller.abort(error)
+      }
+      rejectHeartbeat(error)
+    }
+    const onExternalAbort = () => failActivation(abortError())
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true })
+
     const timer = setInterval(() => {
       void Promise.all([
         this.heartbeatDispatchShards(shardIds),
@@ -543,14 +626,22 @@ export class DurableRuntime {
           now: this.now(),
           leaseMs: this.activationLeaseMs,
         }),
-      ]).catch(() => undefined)
+      ]).catch(failActivation)
     }, this.leaseHeartbeatIntervalMs)
     timer.unref?.()
 
+    if (externalSignal?.aborted) {
+      failActivation(abortError())
+    }
+
+    const work = fn(controller.signal)
+    void work.catch(() => undefined)
+
     try {
-      return await fn()
+      return await Promise.race([work, heartbeatFailure])
     } finally {
       clearInterval(timer)
+      externalSignal?.removeEventListener("abort", onExternalAbort)
     }
   }
 
@@ -945,6 +1036,21 @@ function abortError(): Error {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError"
+}
+
+class ActivityRetryScheduledError extends Error {
+  constructor(readonly nextAttemptAt: string) {
+    super(`Activity retry scheduled for ${nextAttemptAt}`)
+    this.name = "ActivityRetryScheduledError"
+  }
+}
+
+function isActivityRetryScheduledError(error: unknown): error is ActivityRetryScheduledError {
+  return error instanceof Error && error.name === "ActivityRetryScheduledError"
+}
+
+function isNonRetryableActivityError(error: unknown): boolean {
+  return isNonRetryableError(error) || isAbortError(error)
 }
 
 function callWaitHandler(

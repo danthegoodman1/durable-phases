@@ -10,6 +10,7 @@ import {
   defineWorkflow,
   DurableRuntime,
   go,
+  NonRetryableError,
   phase,
   query,
   signal,
@@ -57,6 +58,16 @@ function manualClock() {
     advance(ms: number) {
       now = new Date(now.getTime() + ms)
     },
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for condition")
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1))
   }
 }
 
@@ -499,6 +510,1185 @@ describe("durable workflow PoC", () => {
       status: "completed",
       sequence: 1,
       output: { ok: true },
+    })
+  })
+
+  it("passes manual activity heartbeat context and preserves old no-arg activity calls", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const observed: Array<{
+      attempt: number
+      idempotencyKey: string
+      heartbeatDetails: unknown
+      aborted: boolean
+    }> = []
+    let oldStyleCalls = 0
+    const ActivityContextWorkflow = defineWorkflow({
+      name: "activity_context",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean(), value: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const oldValue = await ctx.activity("old_style", () => {
+              oldStyleCalls += 1
+              return "old"
+            })
+            const value = await ctx.activity(
+              "with_context",
+              async (activity) => {
+                observed.push({
+                  attempt: activity.attempt,
+                  idempotencyKey: activity.idempotencyKey,
+                  heartbeatDetails: activity.heartbeatDetails,
+                  aborted: activity.signal.aborted,
+                })
+                await activity.heartbeat({ step: 1 })
+                return `${oldValue}:new`
+              },
+              {
+                startToCloseTimeoutMs: 5_000,
+                heartbeatTimeoutMs: 1_000,
+              },
+            )
+            return complete({ ok: true, value })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [ActivityContextWorkflow],
+      workerId: "activity-context-worker",
+    })
+    const ref = await runtime.start(ActivityContextWorkflow, {}, { workflowId: "activity-context" })
+
+    await runtime.drain()
+
+    expect(oldStyleCalls).toBe(1)
+    expect(observed).toEqual([
+      {
+        attempt: 1,
+        idempotencyKey: "activity-context/run-1/activity-context/run-1/0/run/__run/with_context",
+        heartbeatDetails: undefined,
+        aborted: false,
+      },
+    ])
+    const effects = (await provider.loadInstance(ref))?.effects ?? []
+    expect(effects.find((effect) => effect.key === "with_context")).toMatchObject({
+      status: "completed",
+      attempt: 1,
+      heartbeatAt: "2026-01-01T00:00:00.000Z",
+      heartbeatDetails: { step: 1 },
+    })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { ok: true, value: "old:new" },
+    })
+  })
+
+  it("retries ordinary activity failures with default exponential backoff", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const attempts: number[] = []
+    const RetryWorkflow = defineWorkflow({
+      name: "activity_retry_default",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const value = await ctx.activity("flaky", ({ attempt }) => {
+              attempts.push(attempt)
+              if (attempt < 3) {
+                throw new Error(`attempt ${attempt}`)
+              }
+              return { ok: true }
+            })
+            return complete(value)
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [RetryWorkflow],
+      workerId: "retry-default-worker",
+    })
+    const ref = await runtime.start(RetryWorkflow, {}, { workflowId: "activity-retry-default" })
+
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(attempts).toEqual([1])
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      maxAttempts: 3,
+      initialIntervalMs: 1_000,
+      maxIntervalMs: 30_000,
+      backoffCoefficient: 2,
+      nextAttemptAt: "2026-01-01T00:00:01.000Z",
+      lastFailure: { message: "attempt 1", name: "Error" },
+    })
+
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({
+      activations: 0,
+      nextWakeAt: "2026-01-01T00:00:01.000Z",
+    })
+    expect(attempts).toEqual([1])
+
+    clock.advance(1_000)
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(attempts).toEqual([1, 2])
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "pending",
+      attempt: 3,
+      nextAttemptAt: "2026-01-01T00:00:03.000Z",
+      lastFailure: { message: "attempt 2", name: "Error" },
+    })
+
+    clock.advance(2_000)
+    await runtime.drain({ maxActivations: 1 })
+    expect(attempts).toEqual([1, 2, 3])
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { ok: true },
+    })
+  })
+
+  it("honors custom retry backoff and terminally fails when max elapsed time is exceeded", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const attempts: number[] = []
+    const RetryWindowWorkflow = defineWorkflow({
+      name: "activity_retry_window",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.activity(
+              "always_fails",
+              ({ attempt }) => {
+                attempts.push(attempt)
+                throw new Error(`boom ${attempt}`)
+              },
+              {
+                retry: {
+                  maxAttempts: 5,
+                  initialIntervalMs: 1_000,
+                  backoffCoefficient: 2,
+                  maxIntervalMs: 5_000,
+                  maxElapsedMs: 1_500,
+                },
+              },
+            )
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [RetryWindowWorkflow],
+      workerId: "retry-window-worker",
+    })
+    const ref = await runtime.start(RetryWindowWorkflow, {}, { workflowId: "activity-retry-window" })
+
+    await runtime.drain({ maxActivations: 1 })
+    expect(attempts).toEqual([1])
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      attempt: 2,
+      nextAttemptAt: "2026-01-01T00:00:01.000Z",
+      maxElapsedMs: 1_500,
+    })
+
+    clock.advance(1_000)
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("boom 2")
+    expect(attempts).toEqual([1, 2])
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "failed",
+      attempt: 2,
+      lastFailure: { message: "boom 2", name: "Error" },
+    })
+  })
+
+  it("terminally fails ordinary activity errors after max attempts are exhausted", async () => {
+    const path = await storePath()
+    const attempts: number[] = []
+    const MaxAttemptsWorkflow = defineWorkflow({
+      name: "activity_max_attempts",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.activity(
+              "limited",
+              ({ attempt }) => {
+                attempts.push(attempt)
+                throw new Error(`still failing ${attempt}`)
+              },
+              { retry: { maxAttempts: 2, initialIntervalMs: 0 } },
+            )
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [MaxAttemptsWorkflow],
+      workerId: "max-attempts-worker",
+    })
+    const ref = await runtime.start(MaxAttemptsWorkflow, {}, { workflowId: "activity-max-attempts" })
+
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("still failing 2")
+    expect(attempts).toEqual([1, 2])
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "failed",
+      attempt: 2,
+      nextAttemptAt: undefined,
+      error: { message: "still failing 2", name: "Error" },
+    })
+  })
+
+  it("does not retry NonRetryableError or AbortError activity failures", async () => {
+    const path = await storePath()
+    const nonRetryableCalls: number[] = []
+    const abortCalls: number[] = []
+    class FatalActivityError extends NonRetryableError {}
+    const NonRetryableWorkflow = defineWorkflow({
+      name: "activity_non_retryable",
+      version: 1,
+      input: z.object({ mode: z.enum(["non_retryable", "abort"]) }),
+      output: z.object({ ok: z.boolean() }),
+      initial(input) {
+        return start({ phase: "run", data: { mode: input.mode } })
+      },
+      phases: {
+        run: phase({
+          state: z.object({ mode: z.enum(["non_retryable", "abort"]) }),
+          run: async ({ ctx, data }) => {
+            await ctx.activity(
+              data.mode,
+              ({ attempt }) => {
+                if (data.mode === "non_retryable") {
+                  nonRetryableCalls.push(attempt)
+                  throw new FatalActivityError("validation failed")
+                }
+                abortCalls.push(attempt)
+                const error = new Error("timed out locally")
+                error.name = "AbortError"
+                throw error
+              },
+              { retry: { maxAttempts: 5, initialIntervalMs: 0 } },
+            )
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [NonRetryableWorkflow],
+      workerId: "non-retryable-worker",
+    })
+    const nonRetryableRef = await runtime.start(
+      NonRetryableWorkflow,
+      { mode: "non_retryable" },
+      { workflowId: "activity-non-retryable" },
+    )
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("validation failed")
+    expect(nonRetryableCalls).toEqual([1])
+    expect((await provider.loadInstance(nonRetryableRef))?.effects[0]).toMatchObject({
+      status: "failed",
+      attempt: 1,
+      nextAttemptAt: undefined,
+      error: { name: "FatalActivityError", message: "validation failed" },
+    })
+
+    const abortProvider = testProvider(await storePath())
+    const abortRuntime = new DurableRuntime(abortProvider, {
+      workflows: [NonRetryableWorkflow],
+      workerId: "abort-non-retryable-worker",
+    })
+    const abortRef = await abortRuntime.start(
+      NonRetryableWorkflow,
+      { mode: "abort" },
+      { workflowId: "activity-abort-non-retryable" },
+    )
+    await expect(abortRuntime.drain({ maxActivations: 1 })).rejects.toThrow("timed out locally")
+    expect(abortCalls).toEqual([1])
+    expect((await abortProvider.loadInstance(abortRef))?.effects[0]).toMatchObject({
+      status: "failed",
+      attempt: 1,
+      nextAttemptAt: undefined,
+      error: { name: "AbortError", message: "timed out locally" },
+    })
+  })
+
+  it("reclaims a missed-heartbeat activity quickly and retries with prior heartbeat details", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const attempts: Array<{
+      attempt: number
+      attemptMarker: string
+      idempotencyKey: string
+      heartbeatDetails: unknown
+      signal: AbortSignal
+    }> = []
+    const HeartbeatWorkflow = defineWorkflow({
+      name: "heartbeat_retry",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const value = await ctx.activity(
+              "download",
+              async (activity) => {
+                attempts.push({
+                  attempt: activity.attempt,
+                  attemptMarker: activity.idempotencyKey.endsWith("/download")
+                    ? `${activity.attempt}:${activity.idempotencyKey}`
+                    : "unexpected",
+                  idempotencyKey: activity.idempotencyKey,
+                  heartbeatDetails: activity.heartbeatDetails,
+                  signal: activity.signal,
+                })
+                if (activity.attempt === 1) {
+                  await activity.heartbeat({ bytes: 128 })
+                  await new Promise((_resolve, reject) => {
+                    activity.signal.addEventListener(
+                      "abort",
+                      () => reject(activity.signal.reason ?? new Error("aborted")),
+                      { once: true },
+                    )
+                  })
+                }
+                return `resumed:${(activity.heartbeatDetails as { bytes?: number } | undefined)?.bytes}`
+              },
+              {
+                heartbeatTimeoutMs: 1_000,
+                startToCloseTimeoutMs: 30_000,
+                retry: { maxAttempts: 2, initialIntervalMs: 0 },
+              },
+            )
+            return complete({ value })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const workerA = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [HeartbeatWorkflow],
+      workerId: "heartbeat-worker-a",
+      leaseHeartbeatIntervalMs: 1,
+      activationLeaseMs: 60_000,
+      dispatchLeaseMs: 60_000,
+    })
+    const ref = await workerA.start(HeartbeatWorkflow, {}, { workflowId: "heartbeat-retry" })
+    const firstDrain = workerA.drain({ maxActivations: 1 })
+    await waitFor(() => attempts.length === 1)
+
+    clock.advance(1_000)
+    await expect(firstDrain).rejects.toThrow("Lost activation lease")
+    await waitFor(() => attempts[0].signal.aborted)
+
+    const workerB = new DurableRuntime(testProvider(path), {
+      clock: clock.clock,
+      workflows: [HeartbeatWorkflow],
+      workerId: "heartbeat-worker-b",
+      activationLeaseMs: 60_000,
+      dispatchLeaseMs: 60_000,
+    })
+    await workerB.drain({ maxActivations: 1 })
+
+    expect(attempts).toHaveLength(2)
+    expect(attempts[1]).toMatchObject({
+      attempt: 2,
+      idempotencyKey: attempts[0].idempotencyKey,
+      heartbeatDetails: { bytes: 128 },
+    })
+    expect(attempts[1].attemptMarker).not.toBe(attempts[0].attemptMarker)
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { value: "resumed:128" },
+    })
+  })
+
+  it("does not terminally fail an activity when worker shutdown aborts local execution", async () => {
+    const path = await storePath()
+    const calls: Array<{ attempt: number; aborted: boolean }> = []
+    const ShutdownWorkflow = defineWorkflow({
+      name: "activity_shutdown",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const value = await ctx.activity("cooperative", async (activity) => {
+              calls.push({ attempt: activity.attempt, aborted: activity.signal.aborted })
+              if (calls.length === 1) {
+                await new Promise((_resolve, reject) => {
+                  activity.signal.addEventListener(
+                    "abort",
+                    () => reject(activity.signal.reason ?? new Error("aborted")),
+                    { once: true },
+                  )
+                })
+              }
+              return "after-shutdown"
+            })
+            return complete({ value })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const workerA = new DurableRuntime(provider, {
+      workflows: [ShutdownWorkflow],
+      workerId: "shutdown-worker-a",
+      activationLeaseMs: 60_000,
+      dispatchLeaseMs: 60_000,
+      leaseHeartbeatIntervalMs: 1,
+    })
+    const ref = await workerA.start(ShutdownWorkflow, {}, { workflowId: "activity-shutdown" })
+    const abort = new AbortController()
+    const running = workerA.runWorker({
+      maxActivationsPerDrain: 1,
+      minPollIntervalMs: 1,
+      maxPollIntervalMs: 1,
+      jitterRatio: 0,
+      signal: abort.signal,
+    })
+    await waitFor(() => calls.length === 1)
+
+    abort.abort()
+    await expect(running).resolves.toEqual({ activations: 0 })
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      key: "cooperative",
+      status: "pending",
+    })
+
+    const workerB = new DurableRuntime(testProvider(path), {
+      workflows: [ShutdownWorkflow],
+      workerId: "shutdown-worker-b",
+      activationLeaseMs: 60_000,
+      dispatchLeaseMs: 60_000,
+    })
+    await workerB.drain({ maxActivations: 1 })
+
+    expect(calls).toEqual([
+      { attempt: 1, aborted: false },
+      { attempt: 1, aborted: false },
+    ])
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { value: "after-shutdown" },
+    })
+  })
+
+  it("enforces start-to-close timeout independently of heartbeats and fences stale attempts", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "start_to_close_activity",
+      workflowVersion: 1,
+      workflowId: "start-to-close-activity",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { start_to_close_activity: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(activation).toMatchObject({ kind: "run" })
+
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "slow",
+      now: "2026-01-01T00:00:00.000Z",
+      options: {
+        startToCloseTimeoutMs: 1_000,
+        heartbeatTimeoutMs: 5_000,
+        retry: { maxAttempts: 2, initialIntervalMs: 0 },
+      },
+    })
+    expect(reservation.status).toBe("reserved")
+    if (reservation.status !== "reserved") {
+      throw new Error("expected reserved effect")
+    }
+
+    await provider.heartbeatEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      effectId: reservation.effectId,
+      attemptId: reservation.attemptId,
+      now: "2026-01-01T00:00:00.500Z",
+      details: { bytes: 256 },
+    })
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      attempt: 1,
+      startToCloseDeadline: "2026-01-01T00:00:01.000Z",
+      heartbeatDeadline: "2026-01-01T00:00:05.500Z",
+      heartbeatDetails: { bytes: 256 },
+    })
+
+    await expect(
+      provider.heartbeatActivation({
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        now: "2026-01-01T00:00:01.000Z",
+        leaseMs: 60_000,
+      }),
+    ).rejects.toThrow("Lost activation lease")
+    const timedOut = (await provider.loadInstance(ref))?.effects[0]
+    expect(timedOut).toMatchObject({
+      status: "pending",
+      attempt: 2,
+      heartbeatDetails: { bytes: 256 },
+      timedOutAt: "2026-01-01T00:00:01.000Z",
+      timeoutKind: "start_to_close",
+    })
+    expect(timedOut?.attemptStartedAt).toBeUndefined()
+
+    await expect(
+      provider.completeEffect({
+        ...ref,
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        effectId: reservation.effectId,
+        attemptId: reservation.attemptId,
+        result: { ok: false },
+        now: "2026-01-01T00:00:01.000Z",
+      }),
+    ).rejects.toThrow("Lost activation lease")
+
+    await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:00:01.001Z",
+      leaseMs: 60_000,
+    })
+    const reclaimed = (
+      await provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { start_to_close_activity: { version: 1 } },
+        now: "2026-01-01T00:00:01.001Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(reclaimed?.activationId).toBe(activation!.activationId)
+    const retry = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: reclaimed!.activationId,
+      workerId: "worker-b",
+      key: "slow",
+      now: "2026-01-01T00:00:01.001Z",
+      options: {
+        startToCloseTimeoutMs: 1_000,
+        heartbeatTimeoutMs: 5_000,
+        retry: { maxAttempts: 2, initialIntervalMs: 0 },
+      },
+    })
+    expect(retry).toMatchObject({
+      status: "reserved",
+      attempt: 2,
+      idempotencyKey: reservation.idempotencyKey,
+      heartbeatDetails: { bytes: 256 },
+    })
+    if (retry.status !== "reserved") {
+      throw new Error("expected retried effect")
+    }
+    expect(retry.attemptId).not.toBe(reservation.attemptId)
+  })
+
+  it("fails an activity effect terminally when heartbeat timeout attempts are exhausted", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "heartbeat_exhaustion",
+      workflowVersion: 1,
+      workflowId: "heartbeat-exhaustion",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { heartbeat_exhaustion: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "one-shot",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 1 } },
+    })
+    expect(reservation.status).toBe("reserved")
+
+    await expect(
+      provider.heartbeatActivation({
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        now: "2026-01-01T00:00:01.000Z",
+        leaseMs: 60_000,
+      }),
+    ).rejects.toThrow("Lost activation lease")
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "failed",
+      timeoutKind: "heartbeat",
+      error: {
+        name: "ActivityTimeoutError",
+        message: "Activity one-shot failed due to heartbeat timeout",
+      },
+    })
+
+    await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:00:01.001Z",
+      leaseMs: 60_000,
+    })
+    const reclaimed = (
+      await provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { heartbeat_exhaustion: { version: 1 } },
+        now: "2026-01-01T00:00:01.001Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const failed = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: reclaimed!.activationId,
+      workerId: "worker-b",
+      key: "one-shot",
+      now: "2026-01-01T00:00:01.001Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 1 } },
+    })
+    expect(failed).toMatchObject({
+      status: "failed",
+      error: { name: "ActivityTimeoutError" },
+    })
+  })
+
+  it("does not time out activities with no activity timeout options", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "no_activity_timeout",
+      workflowVersion: 1,
+      workflowId: "no-activity-timeout",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 120_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { no_activity_timeout: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 120_000,
+      })
+    ).activation
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "untimed",
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    expect(reservation).toMatchObject({ status: "reserved", attempt: 1 })
+    if (reservation.status !== "reserved") {
+      throw new Error("expected reserved effect")
+    }
+
+    await provider.heartbeatActivation({
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      now: "2026-01-01T00:01:00.000Z",
+      leaseMs: 120_000,
+    })
+    await provider.completeEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      effectId: reservation.effectId,
+      attemptId: reservation.attemptId,
+      result: { ok: true },
+      now: "2026-01-01T00:01:00.000Z",
+    })
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "completed",
+      startToCloseDeadline: undefined,
+      heartbeatDeadline: undefined,
+    })
+  })
+
+  it("does not let a worker without a shard lease expire another worker activity timeout", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "scoped_activity_expiration",
+      workflowVersion: 1,
+      workflowId: "scoped-activity-expiration",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { scoped_activity_expiration: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const reservation = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "owned-by-a",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 1 } },
+    })
+    expect(reservation.status).toBe("reserved")
+
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { scoped_activity_expiration: { version: 1 } },
+        now: "2026-01-01T00:00:01.000Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toEqual({ activation: null })
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      status: "pending",
+      attempt: 1,
+      attemptOwnerId: "worker-a",
+      attemptStartedAt: "2026-01-01T00:00:00.000Z",
+      heartbeatDeadline: "2026-01-01T00:00:01.000Z",
+    })
+    await expect(
+      provider.heartbeatActivation({
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        now: "2026-01-01T00:00:00.500Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toBeUndefined()
+  })
+
+  it("only consumes timeout attempts for effects whose own deadline expired", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "parallel_activity_timeout",
+      workflowVersion: 1,
+      workflowId: "parallel-activity-timeout",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { parallel_activity_timeout: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const short = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "short",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 1 } },
+    })
+    const long = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "long",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 10_000, retry: { maxAttempts: 1 } },
+    })
+    expect(short.status).toBe("reserved")
+    expect(long.status).toBe("reserved")
+    if (short.status !== "reserved" || long.status !== "reserved") {
+      throw new Error("expected reserved effects")
+    }
+
+    await expect(
+      provider.heartbeatActivation({
+        activationId: activation!.activationId,
+        workerId: "worker-a",
+        now: "2026-01-01T00:00:01.000Z",
+        leaseMs: 60_000,
+      }),
+    ).rejects.toThrow("Lost activation lease")
+    const effects = (await provider.loadInstance(ref))?.effects ?? []
+    expect(effects.find((effect) => effect.key === "short")).toMatchObject({
+      status: "failed",
+      attempt: 1,
+      timeoutKind: "heartbeat",
+    })
+    const longAfterTimeout = effects.find((effect) => effect.key === "long")
+    expect(longAfterTimeout).toMatchObject({
+      status: "pending",
+      attempt: 1,
+      attemptOwnerId: undefined,
+      attemptStartedAt: undefined,
+      heartbeatDeadline: undefined,
+      timeoutKind: undefined,
+    })
+    expect(longAfterTimeout?.attemptId).not.toBe(long.attemptId)
+
+    await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:00:01.001Z",
+      leaseMs: 60_000,
+    })
+    const reclaimed = (
+      await provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { parallel_activity_timeout: { version: 1 } },
+        now: "2026-01-01T00:00:01.001Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const longRetry = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: reclaimed!.activationId,
+      workerId: "worker-b",
+      key: "long",
+      now: "2026-01-01T00:00:01.001Z",
+      options: { heartbeatTimeoutMs: 10_000, retry: { maxAttempts: 1 } },
+    })
+    expect(longRetry).toMatchObject({
+      status: "reserved",
+      attempt: 1,
+      idempotencyKey: long.idempotencyKey,
+    })
+  })
+
+  it("keeps the originally reserved timeout policy when an effect is retried", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "activity_policy_lock",
+      workflowVersion: 1,
+      workflowId: "activity-policy-lock",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 1,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activity_policy_lock: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 1,
+      })
+    ).activation
+    const first = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "policy",
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    expect(first).toMatchObject({ status: "reserved", attempt: 1 })
+
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:00:00.010Z",
+      leaseMs: 60_000,
+    })
+    const reclaimed = (
+      await provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { activity_policy_lock: { version: 1 } },
+        now: "2026-01-01T00:00:00.010Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    const second = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: reclaimed!.activationId,
+      workerId: "worker-b",
+      key: "policy",
+      now: "2026-01-01T00:00:00.010Z",
+      options: { heartbeatTimeoutMs: 1_000, retry: { maxAttempts: 3 } },
+    })
+    expect(second).toMatchObject({
+      status: "reserved",
+      attempt: 1,
+      idempotencyKey: first.idempotencyKey,
+    })
+    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+      heartbeatTimeoutMs: undefined,
+      heartbeatDeadline: undefined,
+      maxAttempts: 3,
+    })
+  })
+
+  it("rotates pending effect attempts when an activation lease is reclaimed", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "lease_reclaimed_effect",
+      workflowVersion: 1,
+      workflowId: "lease-reclaimed-effect",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "stable-worker",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 1,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "stable-worker",
+        shardIds: [0],
+        workflows: { lease_reclaimed_effect: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 1,
+      })
+    ).activation
+    const first = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "stable-worker",
+      key: "maybe-stale",
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    expect(first.status).toBe("reserved")
+    if (first.status !== "reserved") {
+      throw new Error("expected reserved effect")
+    }
+
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "stable-worker",
+      now: "2026-01-01T00:00:00.010Z",
+      leaseMs: 60_000,
+    })
+    const reclaimed = (
+      await provider.claimReadyActivation({
+        workerId: "stable-worker",
+        shardIds: [0],
+        workflows: { lease_reclaimed_effect: { version: 1 } },
+        now: "2026-01-01T00:00:00.010Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    expect(reclaimed?.activationId).toBe(activation!.activationId)
+    const second = await provider.getOrReserveEffect({
+      ...ref,
+      activationId: reclaimed!.activationId,
+      workerId: "stable-worker",
+      key: "maybe-stale",
+      now: "2026-01-01T00:00:00.010Z",
+    })
+    expect(second).toMatchObject({
+      status: "reserved",
+      attempt: 1,
+      idempotencyKey: first.idempotencyKey,
+    })
+    if (second.status !== "reserved") {
+      throw new Error("expected reclaimed effect")
+    }
+    expect(second.attemptId).not.toBe(first.attemptId)
+
+    await expect(
+      provider.completeEffect({
+        ...ref,
+        activationId: reclaimed!.activationId,
+        workerId: "stable-worker",
+        effectId: first.effectId,
+        attemptId: first.attemptId,
+        result: { stale: true },
+        now: "2026-01-01T00:00:00.010Z",
+      }),
+    ).rejects.toThrow("Lost effect attempt")
+  })
+
+  it("uses pending activity timeout deadlines as claim wake hints", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "activity_wake_hint",
+      workflowVersion: 1,
+      workflowId: "activity-wake-hint",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "run", data: {} },
+      waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+    const activation = (
+      await provider.claimReadyActivation({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { activity_wake_hint: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+      })
+    ).activation
+    await provider.getOrReserveEffect({
+      ...ref,
+      activationId: activation!.activationId,
+      workerId: "worker-a",
+      key: "wake",
+      now: "2026-01-01T00:00:00.000Z",
+      options: { heartbeatTimeoutMs: 1_000 },
+    })
+    await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-b",
+      now: "2026-01-01T00:00:00.100Z",
+      leaseMs: 60_000,
+    })
+
+    await expect(
+      provider.claimReadyActivation({
+        workerId: "worker-b",
+        shardIds: [0],
+        workflows: { activity_wake_hint: { version: 1 } },
+        now: "2026-01-01T00:00:00.100Z",
+        leaseMs: 60_000,
+      }),
+    ).resolves.toEqual({
+      activation: null,
+      nextWakeAt: "2026-01-01T00:00:01.000Z",
     })
   })
 
@@ -973,6 +2163,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-a",
         effectId: "effect-missing",
+        attemptId: "attempt-missing",
         result: {},
         now: "2026-01-01T00:00:00.000Z",
       }),
@@ -984,6 +2175,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-a",
         effectId: "effect-missing",
+        attemptId: "attempt-missing",
         error: { message: "nope" },
         now: "2026-01-01T00:00:00.000Z",
       }),
@@ -995,6 +2187,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-a",
         effectId: "effect-missing",
+        attemptId: "attempt-missing",
         now: "2026-01-01T00:00:00.000Z",
         details: {},
       }),
@@ -1421,6 +2614,7 @@ describe("durable workflow PoC", () => {
       activationId: activation!.activationId,
       workerId: "worker-a",
       effectId: reservation.effectId,
+      attemptId: reservation.attemptId,
       result: { ok: true },
       now: "2026-01-01T00:00:00.000Z",
     })
@@ -1430,6 +2624,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-a",
         effectId: reservation.effectId,
+        attemptId: reservation.attemptId,
         error: { message: "late" },
         now: "2026-01-01T00:00:00.000Z",
       }),
@@ -1440,6 +2635,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-b",
         effectId: reservation.effectId,
+        attemptId: reservation.attemptId,
         result: { ok: false },
         now: "2026-01-01T00:00:00.000Z",
       }),
@@ -1450,6 +2646,7 @@ describe("durable workflow PoC", () => {
         activationId: activation!.activationId,
         workerId: "worker-a",
         effectId: reservation.effectId,
+        attemptId: reservation.attemptId,
         now: "2026-01-01T00:00:00.101Z",
       }),
     ).rejects.toThrow("Lost activation lease")
