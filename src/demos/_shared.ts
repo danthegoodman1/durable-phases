@@ -4,35 +4,48 @@ import {
   AnyWorkflow,
   DurableRuntime,
   InstanceRef,
-  JsonFileDurabilityProvider,
   PersistedInstance,
+  SqliteDurabilityProvider,
 } from "../durable.js"
 
 export const addMs = (iso: string, ms: number) => new Date(new Date(iso).getTime() + ms).toISOString()
 
 export type DemoRuntime = {
   runtime: DurableRuntime
-  provider: JsonFileDurabilityProvider
+  provider: SqliteDurabilityProvider
+  workerId: string
   clock(): Date
   advance(ms: number): void
 }
 
 export function demoStorePath(name: string): string {
-  return resolve(`.durable-demo/${name}.json`)
+  return resolve(`.durable-demo/${name}.sqlite`)
+}
+
+export async function cleanupDemoStore(name: string): Promise<void> {
+  const storePath = demoStorePath(name)
+  const legacyJsonPath = resolve(`.durable-demo/${name}.json`)
+  await Promise.all(
+    [storePath, `${storePath}-wal`, `${storePath}-shm`, `${storePath}-journal`, legacyJsonPath].map((path) =>
+      rm(path, { force: true, maxRetries: 3, retryDelay: 10 }),
+    ),
+  )
 }
 
 export async function demoRuntime(name: string, workflows: AnyWorkflow[]): Promise<DemoRuntime> {
   const storePath = demoStorePath(name)
-  await rm(storePath, { force: true })
+  await cleanupDemoStore(name)
 
   let now = new Date("2026-01-01T00:00:00.000Z")
   const clock = () => now
-  const provider = new JsonFileDurabilityProvider(storePath)
-  const runtime = new DurableRuntime(provider, { clock, workflows })
+  const provider = new SqliteDurabilityProvider(storePath)
+  const workerId = `${name}-worker`
+  const runtime = new DurableRuntime(provider, { clock, workflows, workerId })
 
   return {
     runtime,
     provider,
+    workerId,
     clock,
     advance(ms) {
       now = new Date(now.getTime() + ms)
@@ -40,7 +53,7 @@ export async function demoRuntime(name: string, workflows: AnyWorkflow[]): Promi
   }
 }
 
-export async function committed(provider: JsonFileDurabilityProvider, ref: InstanceRef): Promise<unknown> {
+export async function committed(provider: SqliteDurabilityProvider, ref: InstanceRef): Promise<unknown> {
   return summarize(await provider.loadInstance(ref))
 }
 

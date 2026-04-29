@@ -4,21 +4,23 @@
   "type": "module",
   "description": "Node TS ESM Template",
   "dependencies": {
+    "better-sqlite3": "^12.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "~5.8.0",
     "vitest": "^4.1.5"
   },
   "scripts": {
-      "start": "node dist/index.js",
-      "dev": "tsx src/index.ts",
-      "demo": "tsx src/demos/index.ts",
-      "test": "vitest run",
-      "watch": "tsx watch src/index.ts",
-      "build": "tsc"
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "demo": "tsx src/demos/index.ts",
+    "test": "vitest run",
+    "watch": "tsx watch src/index.ts",
+    "build": "tsc"
   },
   "author": "danthegoodman1",
   "license": "ISC"

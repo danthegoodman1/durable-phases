@@ -9,15 +9,15 @@ import {
   complete,
   defineWorkflow,
   DurableRuntime,
-  JsonFileDurabilityProvider,
   phase,
   query,
   signal,
+  SqliteDurabilityProvider,
   start,
   stay,
   timer,
 } from "../durable.js"
-import { addMs, demoRuntime, demoStorePath } from "./_shared.js"
+import { addMs, cleanupDemoStore, demoRuntime, demoStorePath } from "./_shared.js"
 
 const ReminderWorkflow = defineWorkflow({
   name: "demo_timer_stay",
@@ -88,20 +88,31 @@ const ReminderWorkflow = defineWorkflow({
 })
 
 export async function runTimerStayRestartDemo(): Promise<void> {
-  const first = await demoRuntime("timer-stay-restart", [ReminderWorkflow])
+  const demoName = "timer-stay-restart"
+  const first = await demoRuntime(demoName, [ReminderWorkflow])
+  let restartedProvider: SqliteDurabilityProvider | undefined
 
-  const ref = await first.runtime.start(
-    ReminderWorkflow,
-    { name: "Ada" },
-    { workflowId: "timer-demo" },
-  )
-  console.log("timer + stay: pending timer", await first.runtime.query(ReminderWorkflow, ref, "progress"))
+  try {
+    const ref = await first.runtime.start(
+      ReminderWorkflow,
+      { name: "Ada" },
+      { workflowId: "timer-demo" },
+    )
+    console.log("timer + stay: pending timer", await first.runtime.query(ReminderWorkflow, ref, "progress"))
 
-  first.advance(1_000)
-  const restarted = new DurableRuntime(new JsonFileDurabilityProvider(demoStorePath("timer-stay-restart")), {
-    clock: first.clock,
-    workflows: [ReminderWorkflow],
-  })
-  await restarted.drain()
-  console.log("timer + stay: after restart and timer", await restarted.query(ReminderWorkflow, ref, "progress"))
+    first.advance(1_000)
+    first.provider.close()
+    restartedProvider = new SqliteDurabilityProvider(demoStorePath(demoName))
+    const restarted = new DurableRuntime(restartedProvider, {
+      clock: first.clock,
+      workflows: [ReminderWorkflow],
+      workerId: first.workerId,
+    })
+    await restarted.drain()
+    console.log("timer + stay: after restart and timer", await restarted.query(ReminderWorkflow, ref, "progress"))
+  } finally {
+    first.provider.close()
+    restartedProvider?.close()
+    await cleanupDemoStore(demoName)
+  }
 }

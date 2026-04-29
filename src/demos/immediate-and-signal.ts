@@ -15,7 +15,7 @@ import {
   signal,
   start,
 } from "../durable.js"
-import { committed, demoRuntime } from "./_shared.js"
+import { cleanupDemoStore, committed, demoRuntime } from "./_shared.js"
 
 const ImmediateApprovalWorkflow = defineWorkflow({
   name: "demo_immediate_approval",
@@ -86,24 +86,28 @@ const ImmediateApprovalWorkflow = defineWorkflow({
 })
 
 export async function runImmediateAndSignalDemo(): Promise<void> {
-  const { runtime, provider } = await demoRuntime("immediate-and-signal", [
-    ImmediateApprovalWorkflow,
-  ])
+  const demoName = "immediate-and-signal"
+  const { runtime, provider } = await demoRuntime(demoName, [ImmediateApprovalWorkflow])
 
-  const ref = await runtime.start(
-    ImmediateApprovalWorkflow,
-    { name: "Ada" },
-    { workflowId: "immediate-demo" },
-  )
-  await runtime.drain()
-  console.log(
-    "immediate + signal: after immediate boot",
-    await runtime.query(ImmediateApprovalWorkflow, ref, "status"),
-  )
+  try {
+    const ref = await runtime.start(
+      ImmediateApprovalWorkflow,
+      { name: "Ada" },
+      { workflowId: "immediate-demo" },
+    )
+    await runtime.drain()
+    console.log(
+      "immediate + signal: after immediate boot",
+      await runtime.query(ImmediateApprovalWorkflow, ref, "status"),
+    )
 
-  await runtime.signal(ImmediateApprovalWorkflow, ref, "approved", {
-    message: "ship it",
-  })
-  await runtime.drain()
-  console.log("immediate + signal: completed", await committed(provider, ref))
+    await runtime.signal(ImmediateApprovalWorkflow, ref, "approved", {
+      message: "ship it",
+    })
+    await runtime.drain()
+    console.log("immediate + signal: completed", await committed(provider, ref))
+  } finally {
+    provider.close()
+    await cleanupDemoStore(demoName)
+  }
 }

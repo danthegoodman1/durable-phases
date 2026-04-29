@@ -12,7 +12,7 @@ import {
   phase,
   start,
 } from "../durable.js"
-import { committed, demoRuntime } from "./_shared.js"
+import { cleanupDemoStore, committed, demoRuntime } from "./_shared.js"
 
 const BatchWorkflow = defineWorkflow({
   name: "demo_checkpoint_loop",
@@ -60,13 +60,19 @@ const BatchWorkflow = defineWorkflow({
 })
 
 export async function runCheckpointLoopDemo(): Promise<void> {
-  const { runtime, provider } = await demoRuntime("checkpoint-loop", [BatchWorkflow])
+  const demoName = "checkpoint-loop"
+  const { runtime, provider } = await demoRuntime(demoName, [BatchWorkflow])
 
-  const ref = await runtime.start(
-    BatchWorkflow,
-    { items: ["alpha", "bravo", "charlie", "delta", "echo"] },
-    { workflowId: "loop-demo" },
-  )
-  await runtime.drain()
-  console.log("checkpoint loop: completed", await committed(provider, ref))
+  try {
+    const ref = await runtime.start(
+      BatchWorkflow,
+      { items: ["alpha", "bravo", "charlie", "delta", "echo"] },
+      { workflowId: "loop-demo" },
+    )
+    await runtime.drain()
+    console.log("checkpoint loop: completed", await committed(provider, ref))
+  } finally {
+    provider.close()
+    await cleanupDemoStore(demoName)
+  }
 }

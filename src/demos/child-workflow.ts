@@ -11,11 +11,11 @@ import {
   defineWorkflow,
   DurableRuntime,
   go,
-  JsonFileDurabilityProvider,
   phase,
+  SqliteDurabilityProvider,
   start,
 } from "../durable.js"
-import { committed, demoRuntime, demoStorePath } from "./_shared.js"
+import { cleanupDemoStore, committed, demoRuntime, demoStorePath } from "./_shared.js"
 
 const GreetingChildWorkflow = defineWorkflow({
   name: "demo_greeting_child",
@@ -105,22 +105,32 @@ const GreetingParentWorkflow = defineWorkflow({
 })
 
 export async function runChildWorkflowDemo(): Promise<void> {
+  const demoName = "child-workflow"
   const workflows = [GreetingParentWorkflow, GreetingChildWorkflow]
-  const first = await demoRuntime("child-workflow", workflows)
+  const first = await demoRuntime(demoName, workflows)
+  let restartedProvider: SqliteDurabilityProvider | undefined
 
-  const ref = await first.runtime.start(
-    GreetingParentWorkflow,
-    { name: "Ada" },
-    { workflowId: "child-demo" },
-  )
-  await first.runtime.drain({ maxActivations: 1 })
-  console.log("child workflow: parent waiting", await committed(first.provider, ref))
+  try {
+    const ref = await first.runtime.start(
+      GreetingParentWorkflow,
+      { name: "Ada" },
+      { workflowId: "child-demo" },
+    )
+    await first.runtime.drain({ maxActivations: 1 })
+    console.log("child workflow: parent waiting", await committed(first.provider, ref))
 
-  const restartedProvider = new JsonFileDurabilityProvider(demoStorePath("child-workflow"))
-  const restarted = new DurableRuntime(restartedProvider, {
-    clock: first.clock,
-    workflows,
-  })
-  await restarted.drain()
-  console.log("child workflow: completed after restart", await committed(restartedProvider, ref))
+    first.provider.close()
+    restartedProvider = new SqliteDurabilityProvider(demoStorePath(demoName))
+    const restarted = new DurableRuntime(restartedProvider, {
+      clock: first.clock,
+      workflows,
+      workerId: first.workerId,
+    })
+    await restarted.drain()
+    console.log("child workflow: completed after restart", await committed(restartedProvider, ref))
+  } finally {
+    first.provider.close()
+    restartedProvider?.close()
+    await cleanupDemoStore(demoName)
+  }
 }
