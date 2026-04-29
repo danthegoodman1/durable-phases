@@ -506,6 +506,7 @@ async function runConcurrencyScenario(options: {
         workflows,
         workerId: `concurrency-worker-${index}`,
         shardCount: options.shardCount,
+        dispatchShardIds: dispatchShardIdsForWorker(index, options.workerCount, options.shardCount),
         dispatchLeaseMs: 1_000,
         activationLeaseMs: 1_000,
       }),
@@ -531,6 +532,7 @@ async function runConcurrencyScenario(options: {
             workflows,
             workerId: `concurrency-worker-${index}`,
             shardCount: options.shardCount,
+            dispatchShardIds: dispatchShardIdsForWorker(index, options.workerCount, options.shardCount),
             dispatchLeaseMs: 1_000,
             activationLeaseMs: 1_000,
           }),
@@ -601,6 +603,10 @@ async function runConcurrencyScenario(options: {
   const completedClaims = (await providers[0].listActivationClaims()).filter(
     (claim) => claim.completedBySequence !== undefined,
   )
+  const completedOwners = new Set(
+    completedClaims.map((claim) => claim.ownerId).filter((ownerId): ownerId is string => Boolean(ownerId)),
+  )
+  expect(completedOwners.size).toBeGreaterThan(1)
   const completedBySequence = new Map<string, number>()
   for (const claim of completedClaims) {
     const key = `${claim.workflowId}/${claim.runId}/${claim.sequence}`
@@ -614,6 +620,20 @@ function expectExactlyOnce(values: number[], count: number, label: string): void
   expect([...values].sort((left, right) => left - right), `${label} side effects`).toEqual(
     Array.from({ length: count }, (_value, index) => index),
   )
+}
+
+function dispatchShardIdsForWorker(
+  workerIndex: number,
+  workerCount: number,
+  shardCount: number,
+): number[] {
+  const shardIds: number[] = []
+  for (let shardId = 0; shardId < shardCount; shardId += 1) {
+    if (shardId % workerCount === workerIndex) {
+      shardIds.push(shardId)
+    }
+  }
+  return shardIds
 }
 
 describe("durable workflow PoC", () => {
@@ -921,6 +941,24 @@ describe("durable workflow PoC", () => {
       drainBatch: 4,
       maxRounds: 120,
     })
+  })
+
+  it("validates configured dispatch shard assignments", async () => {
+    const provider = testProvider(await storePath())
+    expect(
+      () =>
+        new DurableRuntime(provider, {
+          shardCount: 2,
+          dispatchShardIds: [0, 0],
+        }),
+    ).toThrow("dispatchShardIds must not contain duplicates")
+    expect(
+      () =>
+        new DurableRuntime(provider, {
+          shardCount: 2,
+          dispatchShardIds: [2],
+        }),
+    ).toThrow("dispatchShardIds must be integers between 0 and 1")
   })
 
   const soakIt = process.env.DURABLE_SOAK === "1" ? it : it.skip

@@ -77,6 +77,25 @@ type ReadyCandidate = ClaimedActivation & {
   sort: string[]
 }
 
+type BufferedObservation =
+  | {
+      kind: "log"
+      level: "debug" | "info" | "warn" | "error"
+      event: string
+      fields?: Record<string, unknown>
+    }
+  | {
+      kind: "count"
+      name: string
+      tags?: DurableMetricTags
+    }
+  | {
+      kind: "gauge"
+      name: string
+      value: number
+      tags?: DurableMetricTags
+    }
+
 type InstanceRow = {
   workflow_name: string
   workflow_version: number
@@ -202,6 +221,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   private readonly db: SqliteDatabase
   private readonly busyTimeoutMs: number
   private readonly observability: DurableObservability
+  private observabilityBuffer?: BufferedObservation[]
   private closed = false
 
   constructor(
@@ -288,7 +308,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return ref
     })
 
-    return create.immediate() as InstanceRef
+    return this.withBufferedObservability(() => create.immediate() as InstanceRef)
   }
 
   async createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
@@ -462,7 +482,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
     })
 
-    return create.immediate() as ChildHandle
+    return this.withBufferedObservability(() => create.immediate() as ChildHandle)
   }
 
   async cancelChild(input: CancelChildInput): Promise<void> {
@@ -515,7 +535,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       })
     })
 
-    cancel.immediate()
+    this.withBufferedObservability(() => {
+      cancel.immediate()
+    })
   }
 
   async loadInstance(ref: InstanceRef): Promise<PersistedInstance | null> {
@@ -551,6 +573,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       runId: string
       sequence: number
       kind: ActivationClaimRow["kind"]
+      ownerId?: string
       completedBySequence?: number
     }>
   > {
@@ -565,6 +588,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           runId: claim.run_id,
           sequence: claim.sequence,
           kind: claim.kind,
+          ownerId: claim.owner_id ?? undefined,
           completedBySequence: claim.completed_by_sequence ?? undefined,
         }
       })
@@ -614,7 +638,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return signal
     })
 
-    return append.immediate() as SignalRecord
+    return this.withBufferedObservability(() => append.immediate() as SignalRecord)
   }
 
   async claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null> {
@@ -663,7 +687,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return { shardId: input.shardId, ownerId: input.ownerId, leaseUntil }
     })
 
-    return claim.immediate() as DispatchShardLease | null
+    return this.withBufferedObservability(() => claim.immediate() as DispatchShardLease | null)
   }
 
   async heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void> {
@@ -776,7 +800,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
     })
 
-    return claim.immediate() as ClaimReadyActivationResult
+    return this.withBufferedObservability(() => claim.immediate() as ClaimReadyActivationResult)
   }
 
   async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
@@ -793,7 +817,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         )
         .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now)
     })
-    const result = heartbeat.immediate() as SqliteRunResult
+    const result = this.withBufferedObservability(() => heartbeat.immediate() as SqliteRunResult)
     if (result.changes === 0) {
       this.log("warn", "provider.activation.heartbeat_failed", {
         workerId: input.workerId,
@@ -970,7 +994,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       } satisfies EffectReservation
     })
 
-    return reserve.immediate() as EffectReservation
+    return this.withBufferedObservability(() => reserve.immediate() as EffectReservation)
   }
 
   async heartbeatEffect(input: HeartbeatEffectInput): Promise<void> {
@@ -1001,7 +1025,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.attemptId,
         )
     })
-    const result = heartbeat.immediate() as SqliteRunResult
+    const result = this.withBufferedObservability(() => heartbeat.immediate() as SqliteRunResult)
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
@@ -1039,7 +1063,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.attemptId,
         )
     })
-    const result = complete.immediate() as SqliteRunResult
+    const result = this.withBufferedObservability(() => complete.immediate() as SqliteRunResult)
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
@@ -1132,7 +1156,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return { result: { status: "failed" } satisfies FailEffectResult, changes: result.changes }
     })
 
-    const output = fail.immediate() as { result: FailEffectResult | null; changes: number }
+    const output = this.withBufferedObservability(
+      () => fail.immediate() as { result: FailEffectResult | null; changes: number },
+    )
     if (output.changes === 0 || !output.result) {
       this.throwEffectMutationError(input)
     }
@@ -1273,7 +1299,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return { ok: true, sequence: nextSequence }
     })
 
-    return commit.immediate() as CommitCheckpointResult
+    return this.withBufferedObservability(() => commit.immediate() as CommitCheckpointResult)
   }
 
   private configure(): void {
@@ -2760,15 +2786,70 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     event: string,
     fields?: Record<string, unknown>,
   ): void {
+    if (this.observabilityBuffer) {
+      this.observabilityBuffer.push({ kind: "log", level, event, fields })
+      return
+    }
     logDurable(this.observability, level, event, fields)
   }
 
   private count(name: string, tags?: DurableMetricTags): void {
+    if (this.observabilityBuffer) {
+      this.observabilityBuffer.push({ kind: "count", name, tags })
+      return
+    }
     countDurable(this.observability, name, 1, tags)
   }
 
   private gauge(name: string, value: number, tags?: DurableMetricTags): void {
+    if (this.observabilityBuffer) {
+      this.observabilityBuffer.push({ kind: "gauge", name, value, tags })
+      return
+    }
     gaugeDurable(this.observability, name, value, tags)
+  }
+
+  private withBufferedObservability<T>(fn: () => T): T {
+    if (this.observabilityBuffer) {
+      return fn()
+    }
+
+    const buffer: BufferedObservation[] = []
+    this.observabilityBuffer = buffer
+    let result: T
+    let thrown: unknown
+    let didThrow = false
+    try {
+      result = fn()
+    } catch (error) {
+      thrown = error
+      didThrow = true
+    } finally {
+      this.observabilityBuffer = undefined
+    }
+
+    this.flushObservabilityBuffer(buffer)
+    if (didThrow) {
+      throw thrown
+    }
+    return result!
+  }
+
+  private flushObservabilityBuffer(buffer: BufferedObservation[]): void {
+    for (const observation of buffer) {
+      if (observation.kind === "log") {
+        logDurable(
+          this.observability,
+          observation.level,
+          observation.event,
+          observation.fields,
+        )
+      } else if (observation.kind === "count") {
+        countDurable(this.observability, observation.name, 1, observation.tags)
+      } else {
+        gaugeDurable(this.observability, observation.name, observation.value, observation.tags)
+      }
+    }
   }
 }
 

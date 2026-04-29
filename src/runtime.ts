@@ -51,6 +51,7 @@ import {
 export type DurableRuntimeOptions = DurableObservability & {
   workerId?: string
   shardCount?: number
+  dispatchShardIds?: number[]
   dispatchLeaseMs?: number
   activationLeaseMs?: number
   leaseHeartbeatIntervalMs?: number
@@ -82,6 +83,7 @@ export class DurableRuntime {
   private readonly clock: () => Date
   private readonly workerId: string
   private readonly shardCount: number
+  private readonly dispatchShardIds: number[]
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
@@ -94,6 +96,7 @@ export class DurableRuntime {
     this.clock = options.clock ?? (() => new Date())
     this.workerId = options.workerId ?? `worker-${randomUUID()}`
     this.shardCount = options.shardCount ?? 1
+    this.dispatchShardIds = normalizeDispatchShardIds(options.dispatchShardIds, this.shardCount)
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
     this.activationLeaseMs = options.activationLeaseMs ?? 30_000
     this.leaseHeartbeatIntervalMs =
@@ -375,7 +378,7 @@ export class DurableRuntime {
 
   private async claimDispatchShards(): Promise<number[]> {
     const shardIds: number[] = []
-    for (let shardId = 0; shardId < this.shardCount; shardId += 1) {
+    for (const shardId of this.dispatchShardIds) {
       const lease = await this.provider.claimDispatchShard({
         shardId,
         ownerId: this.workerId,
@@ -390,6 +393,7 @@ export class DurableRuntime {
       workerId: this.workerId,
       shardIds,
       shardCount: this.shardCount,
+      configuredShardIds: this.dispatchShardIds,
     })
     this.gauge("durable.runtime.dispatch_shards.owned", shardIds.length, {
       workerId: this.workerId,
@@ -1329,6 +1333,23 @@ export class DurableRuntime {
 
 function normalizeRef(ref: InstanceRef | string): InstanceRef {
   return typeof ref === "string" ? { workflowId: ref, runId: "run-1" } : ref
+}
+
+function normalizeDispatchShardIds(
+  dispatchShardIds: number[] | undefined,
+  shardCount: number,
+): number[] {
+  const shardIds = dispatchShardIds ?? Array.from({ length: shardCount }, (_value, index) => index)
+  const uniqueShardIds = [...new Set(shardIds)]
+  if (uniqueShardIds.length !== shardIds.length) {
+    throw new Error("dispatchShardIds must not contain duplicates")
+  }
+  for (const shardId of uniqueShardIds) {
+    if (!Number.isInteger(shardId) || shardId < 0 || shardId >= shardCount) {
+      throw new Error(`dispatchShardIds must be integers between 0 and ${shardCount - 1}`)
+    }
+  }
+  return uniqueShardIds
 }
 
 function activationEventKind(activation: ClaimedActivation): string | undefined {

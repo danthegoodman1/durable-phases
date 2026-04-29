@@ -924,6 +924,8 @@ dispatchShard = hash(tenantId, workflowId, runId) % shardCount
 
 Workers lease dispatch shards and poll only the shards they own. Shard leases are short and heartbeated.
 
+TypeScript workers may optionally be configured with a fixed subset of dispatch shard IDs. This is useful for production deployments that assign shard ranges outside the runtime and for tests that need to prove multiple workers are actually committing activations from the same durable store.
+
 ```ts
 type DispatchShardLease = {
   shardId: string
