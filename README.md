@@ -22,5 +22,30 @@ The demos in [`src/demos/`](src/demos/) are intentionally small:
 - checkpoint-boundary workflow migration
 
 This is still intentionally small. Activity retry policy, the public activity
-heartbeat API, remote children, and tenant-aware partitioning are left for later
+heartbeat API, and local child close policies are implemented in the TypeScript
+prototype; remote children and tenant-aware partitioning are left for later
 steps.
+
+## Provider conformance
+
+New TypeScript durability providers should run the shared Vitest conformance
+harness. The helper lives outside the main runtime barrel so production imports
+do not load Vitest:
+
+```ts
+import { describeDurabilityProviderConformance } from "./src/testing/conformance.js"
+
+describeDurabilityProviderConformance({
+  name: "MyDurabilityProvider",
+  async createStore() {
+    const sharedStore = await createIsolatedStore()
+    return {
+      async createProvider() {
+        const provider = new MyDurabilityProvider(sharedStore)
+        return { provider, close: () => provider.close?.() }
+      },
+      cleanup: () => sharedStore.destroy(),
+    }
+  },
+})
+```
