@@ -22,7 +22,6 @@ import type {
   InstanceStatus,
   JsonObject,
   JsonValue,
-  OutputOf,
   PhaseSnapshot,
   Schema,
   SignalWait,
@@ -586,12 +585,22 @@ export class DurableRuntime {
             parentRunId: instance.runId,
             activationId: currentActivationId,
             key,
+            parentClosePolicy: options.parentClosePolicy ?? "cancel",
+            conflictPolicy: options.conflictPolicy ?? "use_existing",
           })
 
           return handle as ChildHandle<W>
         },
-        result: async <W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>> => {
-          return this.provider.readOutput(handle)
+        cancel: async (handle: ChildHandle<any>): Promise<void> => {
+          await this.provider.cancelChild({
+            parentWorkflowId: instance.workflowId,
+            parentRunId: instance.runId,
+            activationId: currentActivationId,
+            workerId: this.workerId,
+            workflowId: handle.workflowId,
+            runId: handle.runId,
+            now: this.now(),
+          })
         },
       },
     }
@@ -897,6 +906,13 @@ export class DurableRuntime {
 
     if (candidates.length === 0) {
       throw new Error(`Unknown signal ${type} on workflow ${workflow.name}`)
+    }
+
+    const uniqueSchemas = new Set(candidates.map((candidate) => candidate.schema))
+    if (uniqueSchemas.size !== 1) {
+      throw new Error(
+        `Ambiguous signal ${type} on workflow ${workflow.name}; send it while the instance is waiting for a matching signal`,
+      )
     }
 
     return candidates[0].schema.parse(payload)

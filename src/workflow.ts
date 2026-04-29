@@ -75,7 +75,7 @@ export type DurableContext = {
       input: InputOf<W>,
       options?: ChildOptions,
     ): Promise<ChildHandle<W>>
-    result<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>>
+    cancel(handle: ChildHandle<any>): Promise<void>
   }
 }
 
@@ -104,6 +104,8 @@ export type ActivityRetryOptions = {
 
 export type ChildOptions = {
   workflowId?: string
+  parentClosePolicy?: "cancel" | "abandon"
+  conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
 }
 
 export type HandlerArgs<Event = unknown> = {

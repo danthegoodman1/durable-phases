@@ -1,5 +1,4 @@
 import type {
-  AnyWorkflow,
   ActivityOptions,
   ChildEvent,
   ChildHandle,
@@ -7,7 +6,6 @@ import type {
   InstanceStatus,
   JsonObject,
   JsonValue,
-  OutputOf,
   PhaseSnapshot,
   SerializedError,
 } from "./workflow.js"
@@ -99,7 +97,8 @@ export type ChildRecord = {
   workflowVersion: number
   workflowId: string
   runId: string
-  status: "started" | "completed" | "failed"
+  status: "started" | "completed" | "failed" | "abandoned"
+  parentClosePolicy: "cancel" | "abandon"
   completedAt?: string
   output?: JsonValue
   error?: SerializedError
@@ -127,6 +126,18 @@ export type CreateChildInstanceInput = CreateInstanceInput & {
   parentRunId: string
   activationId: string
   key: string
+  parentClosePolicy?: "cancel" | "abandon"
+  conflictPolicy?: ConflictPolicy
+}
+
+export type CancelChildInput = {
+  parentWorkflowId: string
+  parentRunId: string
+  activationId: string
+  workerId: string
+  workflowId: string
+  runId: string
+  now: string
 }
 
 export type AppendSignalInput = {
@@ -326,6 +337,7 @@ export type CommitCheckpointResult = {
 export type DurabilityProvider = {
   createInstance(input: CreateInstanceInput): Promise<InstanceRef>
   createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
+  cancelChild(input: CancelChildInput): Promise<void>
   loadInstance(ref: InstanceRef): Promise<PersistedInstance | null>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
@@ -339,7 +351,6 @@ export type DurabilityProvider = {
   completeEffect(input: CompleteEffectInput): Promise<void>
   failEffect(input: FailEffectInput): Promise<FailEffectResult>
   commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
-  readOutput<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>>
 }
 
 export function workflowPartitionShard(workflowId: string, runId: string, shardCount: number): number {

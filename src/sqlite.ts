@@ -4,6 +4,7 @@ import { createRequire } from "node:module"
 import { dirname } from "node:path"
 import type {
   AppendSignalInput,
+  CancelChildInput,
   ChildRecord,
   ClaimDispatchShardInput,
   ClaimedActivation,
@@ -32,12 +33,10 @@ import type {
   SignalRecord,
 } from "./interface.js"
 import type {
-  AnyWorkflow,
   ChildHandle,
   InstanceRef,
   JsonObject,
   JsonValue,
-  OutputOf,
   SerializedError,
 } from "./workflow.js"
 import { clone, isPlainObject, toJson } from "./workflow.js"
@@ -110,7 +109,8 @@ type ChildRow = {
   workflow_version: number
   workflow_id: string
   run_id: string
-  status: "started" | "completed" | "failed"
+  status: "started" | "completed" | "failed" | "abandoned"
+  parent_close_policy: "cancel" | "abandon"
   completed_at: string | null
   output_json: string | null
   error_json: string | null
@@ -269,6 +269,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   async createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
     const create = this.db.transaction(() => {
+      const conflictPolicy = input.conflictPolicy ?? "use_existing"
+      const parentClosePolicy = input.parentClosePolicy ?? "cancel"
       const existing = oneRow<ChildRow>(
         this.db
           .prepare(
@@ -282,11 +284,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
 
       if (existing) {
-        return childHandle(rowToChildRecord(existing))
+        if (conflictPolicy === "fail") {
+          throw new Error(
+            `Child workflow already exists for activation key: ${input.parentWorkflowId}/${input.parentRunId}/${input.activationId}/${input.key}`,
+          )
+        }
+        if (conflictPolicy === "terminate_existing") {
+          this.deleteInstanceRecords(existing.workflow_id, existing.run_id)
+        } else {
+          return childHandle(rowToChildRecord(existing))
+        }
       }
 
       if (this.instanceRow(input)) {
-        throw new Error(`Child workflow instance already exists: ${input.workflowId}/${input.runId}`)
+        if (conflictPolicy === "terminate_existing") {
+          this.deleteInstanceRecords(input.workflowId, input.runId)
+        } else {
+          throw new Error(`Child workflow instance already exists: ${input.workflowId}/${input.runId}`)
+        }
       }
 
       const childRecordId = `child-${randomUUID()}`
@@ -323,8 +338,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           `
           INSERT INTO children (
             child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-            workflow_name, workflow_version, workflow_id, run_id, status
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'started')
+            workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)
         `,
         )
         .run(
@@ -337,6 +352,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.workflowVersion,
           input.workflowId,
           input.runId,
+          parentClosePolicy,
         )
 
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
@@ -350,6 +366,46 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
 
     return create.immediate() as ChildHandle
+  }
+
+  async cancelChild(input: CancelChildInput): Promise<void> {
+    const cancel = this.db.transaction(() => {
+      this.assertLiveActivationLease({
+        workflowId: input.parentWorkflowId,
+        runId: input.parentRunId,
+        activationId: input.activationId,
+        workerId: input.workerId,
+        now: input.now,
+      })
+
+      const childInstance = this.instanceRow(input)
+      if (!childInstance) {
+        throw new Error(`Unknown child workflow: ${input.workflowId}/${input.runId}`)
+      }
+      if (
+        childInstance.parent_workflow_id !== input.parentWorkflowId ||
+        childInstance.parent_run_id !== input.parentRunId ||
+        !childInstance.parent_child_record_id
+      ) {
+        throw new Error(`Child workflow is not owned by this parent: ${input.workflowId}/${input.runId}`)
+      }
+
+      const childRecord = oneRow<ChildRow>(
+        this.db
+          .prepare("SELECT * FROM children WHERE child_record_id = ? LIMIT 1")
+          .get(childInstance.parent_child_record_id),
+      )
+      if (!childRecord) {
+        throw new Error(`Unknown child record: ${childInstance.parent_child_record_id}`)
+      }
+
+      this.cancelStartedChild(childRecord, input.now, {
+        deliverToParent: true,
+        reason: childCanceledError(),
+      })
+    })
+
+    cancel.immediate()
   }
 
   async loadInstance(ref: InstanceRef): Promise<PersistedInstance | null> {
@@ -851,6 +907,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       this.updateParentChildRecord(instance, input, nextSequence)
+      this.applyParentClosePolicy(instance, input, nextSequence)
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
       this.db
@@ -867,19 +924,6 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
 
     return commit.immediate() as CommitCheckpointResult
-  }
-
-  async readOutput<W extends AnyWorkflow>(handle: ChildHandle<W>): Promise<OutputOf<W>> {
-    const instance = this.instanceRow(handle)
-    if (!instance) {
-      throw new Error(`Unknown child workflow: ${handle.workflowId}/${handle.runId}`)
-    }
-
-    if (instance.status !== "completed") {
-      throw new Error(`Child workflow is not complete: ${handle.workflowId}/${handle.runId}`)
-    }
-
-    return decodeJson(instance.output_json, null) as OutputOf<W>
   }
 
   private configure(): void {
@@ -934,7 +978,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         workflow_version INTEGER NOT NULL,
         workflow_id TEXT NOT NULL,
         run_id TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed')),
+        status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed', 'abandoned')),
+        parent_close_policy TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon')),
         completed_at TEXT,
         output_json TEXT,
         error_json TEXT,
@@ -1043,6 +1088,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       CREATE INDEX IF NOT EXISTS ready_events_instance
         ON ready_events(workflow_id, run_id, sequence);
     `)
+    this.migrateChildrenTableShape()
+    this.addColumnIfMissing(
+      "children",
+      "parent_close_policy",
+      "TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon'))",
+    )
     this.addColumnIfMissing("activation_claims", "activation_time", "TEXT")
     this.addColumnIfMissing("effects", "attempt", "INTEGER DEFAULT 1")
     this.addColumnIfMissing("effects", "attempt_id", "TEXT")
@@ -1065,6 +1116,63 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     this.addColumnIfMissing("effects", "timeout_kind", "TEXT")
     this.backfillEffectAttemptColumns()
     this.rebuildAllReadyEvents()
+  }
+
+  private migrateChildrenTableShape(): void {
+    const table = oneRow<{ sql: string }>(
+      this.db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'children'")
+        .get(),
+    )
+    const columns = this.db.prepare("PRAGMA table_info(children)").all()
+    const hasParentClosePolicy = columns.some(
+      (row) => isPlainObject(row) && row.name === "parent_close_policy",
+    )
+    if (!table || (table.sql.includes("'abandoned'") && hasParentClosePolicy)) {
+      return
+    }
+
+    const parentClosePolicyExpression = hasParentClosePolicy ? "parent_close_policy" : "'cancel'"
+    this.db.exec(`
+      ALTER TABLE children RENAME TO children_old;
+
+      CREATE TABLE children (
+        child_record_id TEXT PRIMARY KEY,
+        parent_workflow_id TEXT NOT NULL,
+        parent_run_id TEXT NOT NULL,
+        activation_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        workflow_name TEXT NOT NULL,
+        workflow_version INTEGER NOT NULL,
+        workflow_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed', 'abandoned')),
+        parent_close_policy TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon')),
+        completed_at TEXT,
+        output_json TEXT,
+        error_json TEXT,
+        delivered_by_sequence INTEGER,
+        UNIQUE(parent_workflow_id, parent_run_id, activation_id, key)
+      );
+
+      INSERT INTO children (
+        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+        workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy,
+        completed_at, output_json, error_json, delivered_by_sequence
+      )
+      SELECT
+        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+        workflow_name, workflow_version, workflow_id, run_id, status, ${parentClosePolicyExpression},
+        completed_at, output_json, error_json, delivered_by_sequence
+      FROM children_old;
+
+      DROP TABLE children_old;
+
+      CREATE INDEX IF NOT EXISTS children_parent_delivery
+        ON children(parent_workflow_id, parent_run_id, delivered_by_sequence, completed_at, child_record_id);
+      CREATE INDEX IF NOT EXISTS children_child_instance
+        ON children(workflow_id, run_id, status, delivered_by_sequence);
+    `)
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -1322,7 +1430,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
             .prepare(
               `
               SELECT * FROM children
-              WHERE workflow_id = ? AND run_id = ? AND status <> 'started' AND delivered_by_sequence IS NULL
+              WHERE workflow_id = ? AND run_id = ? AND status IN ('completed', 'failed') AND delivered_by_sequence IS NULL
               ORDER BY completed_at, child_record_id
               LIMIT 1
             `,
@@ -2136,6 +2244,142 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     void nextSequence
   }
 
+  private applyParentClosePolicy(
+    previous: InstanceRow,
+    input: CommitCheckpointInput,
+    nextSequence: number,
+  ): void {
+    if (input.next.status !== "canceled" && input.next.status !== "failed") {
+      return
+    }
+
+    this.closeStartedChildren(
+      previous.workflow_id,
+      previous.run_id,
+      input.now,
+      nextSequence,
+      input.next.status,
+    )
+  }
+
+  private closeStartedChildren(
+    parentWorkflowId: string,
+    parentRunId: string,
+    now: string,
+    deliveredBySequence: number,
+    status: "canceled" | "failed",
+  ): void {
+    const children = this.db
+      .prepare(
+        `
+        SELECT * FROM children
+        WHERE parent_workflow_id = ? AND parent_run_id = ? AND status = 'started'
+        ORDER BY child_record_id
+      `,
+      )
+      .all(parentWorkflowId, parentRunId)
+      .map((row) => requireRow<ChildRow>(row))
+
+    for (const child of children) {
+      if (child.parent_close_policy === "abandon") {
+        this.abandonStartedChild(child, now, deliveredBySequence)
+      } else {
+        this.cancelStartedChild(child, now, {
+          deliverToParent: false,
+          deliveredBySequence,
+          reason: parentClosedChildError(status),
+        })
+      }
+    }
+  }
+
+  private cancelStartedChild(
+    child: ChildRow,
+    now: string,
+    options: {
+      deliverToParent: boolean
+      deliveredBySequence?: number
+      reason: SerializedError
+    },
+  ): void {
+    if (child.status !== "started") {
+      return
+    }
+
+    const instance = this.instanceRow({ workflowId: child.workflow_id, runId: child.run_id })
+    if (instance?.status === "running") {
+      const childCloseSequence = instance.sequence + 1
+      this.db
+        .prepare(
+          `
+          UPDATE instances
+          SET sequence = sequence + 1, status = 'canceled',
+            common_json = NULL, phase_name = NULL, phase_data_json = NULL,
+            output_json = NULL, error_json = NULL, cancel_reason = ?,
+            waits_json = ?, updated_at = ?
+          WHERE workflow_id = ? AND run_id = ? AND status = 'running'
+        `,
+        )
+        .run(
+          options.reason.message,
+          encodeJson([]),
+          now,
+          child.workflow_id,
+          child.run_id,
+        )
+      this.db
+        .prepare(
+          `
+          UPDATE activation_claims
+          SET owner_id = NULL, lease_until = NULL
+          WHERE workflow_id = ? AND run_id = ? AND completed_by_sequence IS NULL
+        `,
+        )
+        .run(child.workflow_id, child.run_id)
+      this.replaceReadyEventsForInstance(child.workflow_id, child.run_id)
+      this.closeStartedChildren(
+        child.workflow_id,
+        child.run_id,
+        now,
+        childCloseSequence,
+        "canceled",
+      )
+    }
+
+    this.db
+      .prepare(
+        `
+        UPDATE children
+        SET status = 'failed', completed_at = ?, output_json = NULL, error_json = ?,
+          delivered_by_sequence = ?
+        WHERE child_record_id = ? AND status = 'started'
+      `,
+      )
+      .run(
+        now,
+        encodeJson(options.reason),
+        options.deliverToParent ? null : (options.deliveredBySequence ?? null),
+        child.child_record_id,
+      )
+
+    if (options.deliverToParent) {
+      this.replaceReadyEventsForInstance(child.parent_workflow_id, child.parent_run_id)
+    }
+  }
+
+  private abandonStartedChild(child: ChildRow, now: string, deliveredBySequence: number): void {
+    this.db
+      .prepare(
+        `
+        UPDATE children
+        SET status = 'abandoned', completed_at = ?, output_json = NULL, error_json = NULL,
+          delivered_by_sequence = ?
+        WHERE child_record_id = ? AND status = 'started'
+      `,
+      )
+      .run(now, deliveredBySequence, child.child_record_id)
+  }
+
   private deleteInstanceRecords(workflowId: string, runId: string): void {
     this.db
       .prepare(
@@ -2156,6 +2400,17 @@ function childHandle(record: ChildRecord): ChildHandle {
     workflowVersion: record.workflowVersion,
     workflowId: record.workflowId,
     runId: record.runId,
+  }
+}
+
+function childCanceledError(): SerializedError {
+  return { name: "ChildCanceled", message: "Child canceled by parent" }
+}
+
+function parentClosedChildError(status: "canceled" | "failed"): SerializedError {
+  return {
+    name: "ParentClosed",
+    message: `Child canceled because parent ${status}`,
   }
 }
 
@@ -2432,6 +2687,7 @@ function rowToChildRecord(row: ChildRow): ChildRecord {
     workflowId: row.workflow_id,
     runId: row.run_id,
     status: row.status,
+    parentClosePolicy: row.parent_close_policy,
     completedAt: row.completed_at ?? undefined,
     output: decodeJson<JsonValue | undefined>(row.output_json, undefined),
     error: decodeJson<SerializedError | undefined>(row.error_json, undefined),

@@ -422,18 +422,7 @@ type DurableContext = {
       options?: ChildOptions
     ): Promise<ChildHandle<W>>
 
-    result<W extends WorkflowContract<any, any>>(
-      handle: ChildHandle<W>
-    ): Promise<OutputOf<W>>
-
     cancel(handle: ChildHandle<any>): Promise<void>
-
-    run<W extends WorkflowContract<any, any>>(
-      key: string,
-      workflow: W,
-      input: InputOf<W>,
-      options?: ChildOptions
-    ): Promise<OutputOf<W>>
   }
 }
 ```
@@ -602,10 +591,19 @@ type ChildHandle<W> = {
 }
 ```
 
-So this is type-safe:
+Use a phase-level `child(...)` wait to receive the typed child completion event:
 
 ```ts
-const result = await ctx.child.result(handle)
+kyc_finished: child(
+  ({ data }) => data.kyc,
+  async ({ event }) => {
+    if (!event.ok) {
+      return cancel("KYC workflow failed")
+    }
+
+    return complete(event.output)
+  }
+)
 ```
 
 Child options:
@@ -613,7 +611,7 @@ Child options:
 ```ts
 type ChildOptions = {
   workflowId?: string
-  parentClosePolicy?: "cancel" | "abandon" | "wait"
+  parentClosePolicy?: "cancel" | "abandon"
   conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
 }
 ```
@@ -627,7 +625,9 @@ Default:
 }
 ```
 
-All workflows used locally must be registered:
+`ctx.child.cancel(handle)` cancels a running local child workflow. If the child is already terminal, cancellation is idempotent and does not overwrite the child's terminal state.
+
+All child workflows must be registered locally:
 
 ```ts
 registerWorkflows([
@@ -636,8 +636,6 @@ registerWorkflows([
   SignatureWorkflow,
 ])
 ```
-
-Remote children may use `defineWorkflowContract(...)` instead of a local implementation, but the runtime must know how to route that contract.
 
 ---
 
@@ -713,7 +711,7 @@ compact the completed activation's effect ledger
 schedule next phase
 ```
 
-If a `run` handler waits on a long child result, the runtime may suspend and later replay the same phase handler from the phase checkpoint. Already-completed effects return memoized results.
+If a workflow needs to wait for a child result, it should transition to an `on` phase with a durable `child(...)` wait. Already-completed effects return memoized results when a handler activation is retried.
 
 Execution history is bounded at checkpoint boundaries. A committed transition means the previous activation's effects are no longer required for correctness, though they may be copied to audit history.
 
@@ -1118,7 +1116,7 @@ Use:
 ```ts
 ctx.activity(...)
 ctx.child.start(...)
-ctx.child.result(...)
+ctx.child.cancel(...)
 ctx.now()
 ```
 

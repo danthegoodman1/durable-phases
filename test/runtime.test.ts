@@ -4,11 +4,13 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { z } from "zod"
 import {
+  cancel,
   checkpoint,
   child,
   complete,
   defineWorkflow,
   DurableRuntime,
+  fail,
   go,
   NonRetryableError,
   phase,
@@ -2958,7 +2960,479 @@ describe("durable workflow PoC", () => {
     })
   })
 
-  it("does not expose ctx.child.run", async () => {
+  it("rejects ambiguous duplicate signal names when there is no current matching wait", async () => {
+    const FirstSchema = z.object({ a: z.string() })
+    const SecondSchema = z.object({ b: z.string() })
+    const AmbiguousSignalWorkflow = defineWorkflow({
+      name: "ambiguous_signal",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "idle", data: {} })
+      },
+      phases: {
+        idle: phase({
+          run: async () => stay(),
+        }),
+        first: phase({
+          on: {
+            same: signal(FirstSchema, async () => complete({ ok: true })),
+          },
+        }),
+        second: phase({
+          on: {
+            same: signal(SecondSchema, async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [AmbiguousSignalWorkflow],
+      workerId: "ambiguous-signal-worker",
+    })
+    const ref = await runtime.start(AmbiguousSignalWorkflow, {}, { workflowId: "ambiguous-signal" })
+    await expect(runtime.signal(AmbiguousSignalWorkflow, ref, "same", { a: "x" })).rejects.toThrow(
+      "Ambiguous signal same",
+    )
+  })
+
+  it("ctx.child.cancel cancels a running child and delivers a failed child event", async () => {
+    const WaitingChildWorkflow = defineWorkflow({
+      name: "cancel_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const CancelParentWorkflow = defineWorkflow({
+      name: "cancel_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ errorName: z.string() }),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            const handle = await ctx.child.start("child", WaitingChildWorkflow, {})
+            return go("canceling", { handle })
+          },
+        }),
+        canceling: phase({
+          state: z.object({ handle: z.any() }),
+          run: async ({ ctx, data }) => {
+            await ctx.child.cancel(data.handle)
+            return go("waiting", { handle: data.handle })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ handle: z.any() }),
+          on: {
+            child_done: child(
+              ({ data }) => data.handle,
+              async ({ event }) => complete({ errorName: event.ok ? "none" : (event.error.name ?? "") }),
+            ),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [CancelParentWorkflow, WaitingChildWorkflow],
+      workerId: "cancel-child-worker",
+    })
+    const ref = await runtime.start(CancelParentWorkflow, {}, { workflowId: "cancel-parent" })
+    await runtime.drain({ maxActivations: 3 })
+
+    const children = await provider.listChildren()
+    expect(children).toHaveLength(1)
+    expect(children[0]).toMatchObject({
+      status: "failed",
+      error: { name: "ChildCanceled", message: "Child canceled by parent" },
+      deliveredBySequence: 3,
+    })
+    expect(await provider.loadInstance({ workflowId: children[0].workflowId, runId: children[0].runId })).toMatchObject({
+      status: "canceled",
+      cancelReason: "Child canceled by parent",
+    })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { errorName: "ChildCanceled" },
+    })
+  })
+
+  it("ctx.child.cancel is idempotent after child completion and does not overwrite output", async () => {
+    const FastChildWorkflow = defineWorkflow({
+      name: "completed_cancel_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async () => complete({ value: "done" }),
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "completed_cancel_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "start", data: {} })
+      },
+      phases: {
+        start: phase({
+          run: async ({ ctx }) => {
+            const handle = await ctx.child.start("child", FastChildWorkflow, {})
+            return go("waiting", { handle })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ handle: z.any() }),
+          on: {
+            child_done: child(
+              ({ data }) => data.handle,
+              async ({ event, data }) => go("cancel_completed", { handle: data.handle, value: event.ok ? event.output.value : "failed" }),
+            ),
+          },
+        }),
+        cancel_completed: phase({
+          state: z.object({ handle: z.any(), value: z.string() }),
+          run: async ({ ctx, data }) => {
+            await ctx.child.cancel(data.handle)
+            return complete({ value: data.value })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, FastChildWorkflow],
+      workerId: "cancel-completed-child-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "completed-cancel-parent" })
+    await runtime.drain({ maxActivations: 4 })
+
+    const childRecord = (await provider.listChildren())[0]
+    expect(childRecord).toMatchObject({ status: "completed", output: { value: "done" } })
+    expect(await provider.loadInstance({ workflowId: childRecord.workflowId, runId: childRecord.runId })).toMatchObject({
+      status: "completed",
+      output: { value: "done" },
+    })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { value: "done" },
+    })
+  })
+
+  it("parent cancellation cancels started children by default", async () => {
+    const WaitingChildWorkflow = defineWorkflow({
+      name: "parent_close_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "parent_close_cancel",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", WaitingChildWorkflow, {})
+            return cancel("stop")
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, WaitingChildWorkflow],
+      workerId: "parent-close-cancel-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "parent-close-cancel" })
+    await runtime.drain({ maxActivations: 1 })
+
+    const childRecord = (await provider.listChildren())[0]
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "canceled", cancelReason: "stop" })
+    expect(childRecord).toMatchObject({
+      status: "failed",
+      parentClosePolicy: "cancel",
+      deliveredBySequence: 1,
+      error: { name: "ParentClosed" },
+    })
+    expect(await provider.loadInstance({ workflowId: childRecord.workflowId, runId: childRecord.runId })).toMatchObject({
+      status: "canceled",
+    })
+  })
+
+  it("parent failure cancels started children by default", async () => {
+    const WaitingChildWorkflow = defineWorkflow({
+      name: "parent_fail_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "parent_fail_cancel",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", WaitingChildWorkflow, {})
+            return fail(new Error("boom"))
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, WaitingChildWorkflow],
+      workerId: "parent-fail-cancel-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "parent-fail-cancel" })
+    await runtime.drain({ maxActivations: 1 })
+
+    const childRecord = (await provider.listChildren())[0]
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "failed" })
+    expect(childRecord).toMatchObject({
+      status: "failed",
+      parentClosePolicy: "cancel",
+      deliveredBySequence: 1,
+      error: { name: "ParentClosed" },
+    })
+  })
+
+  it("parentClosePolicy abandon leaves children running and detached after parent cancellation", async () => {
+    const WaitingChildWorkflow = defineWorkflow({
+      name: "abandon_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "abandon_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", WaitingChildWorkflow, {}, { parentClosePolicy: "abandon" })
+            return cancel("stop")
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, WaitingChildWorkflow],
+      workerId: "abandon-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "abandon-parent" })
+    await runtime.drain({ maxActivations: 1 })
+
+    const childRecord = (await provider.listChildren())[0]
+    expect(childRecord).toMatchObject({
+      status: "abandoned",
+      parentClosePolicy: "abandon",
+      deliveredBySequence: 1,
+    })
+    expect(await provider.loadInstance({ workflowId: childRecord.workflowId, runId: childRecord.runId })).toMatchObject({
+      status: "running",
+    })
+
+    await runtime.signal(WaitingChildWorkflow, { workflowId: childRecord.workflowId, runId: childRecord.runId }, "finish", {})
+    await runtime.drain({ maxActivations: 1 })
+    expect(await provider.loadInstance({ workflowId: childRecord.workflowId, runId: childRecord.runId })).toMatchObject({
+      status: "completed",
+      output: { ok: true },
+    })
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "canceled", cancelReason: "stop" })
+    expect((await provider.listChildren())[0]).toMatchObject({ status: "abandoned" })
+  })
+
+  it("applies child conflict policies for repeated starts", async () => {
+    const ChildWorkflow = defineWorkflow({
+      name: "conflict_child",
+      version: 1,
+      input: z.object({ value: z.string() }),
+      output: z.object({ value: z.string() }),
+      common: z.object({ value: z.string() }),
+      initial(input) {
+        return start({ common: { value: input.value }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => complete({ value: common.value }),
+        }),
+      },
+    })
+    const UseExistingParent = defineWorkflow({
+      name: "use_existing_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ same: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const first = await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "use-existing-child" })
+            const second = await ctx.child.start("child", ChildWorkflow, { value: "second" }, { workflowId: "use-existing-child" })
+            return complete({ same: first.workflowId === second.workflowId && first.runId === second.runId })
+          },
+        }),
+      },
+    })
+    const FailParent = defineWorkflow({
+      name: "fail_conflict_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ failed: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "fail-child" })
+            try {
+              await ctx.child.start("child", ChildWorkflow, { value: "second" }, { workflowId: "fail-child", conflictPolicy: "fail" })
+              return complete({ failed: false })
+            } catch {
+              return complete({ failed: true })
+            }
+          },
+        }),
+      },
+    })
+    const TerminateParent = defineWorkflow({
+      name: "terminate_conflict_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "terminate-child" })
+            const second = await ctx.child.start("child", ChildWorkflow, { value: "second" }, {
+              workflowId: "terminate-child",
+              conflictPolicy: "terminate_existing",
+            })
+            return go("waiting", { handle: second })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ handle: z.any() }),
+          on: {
+            done: child(
+              ({ data }) => data.handle,
+              async ({ event }) => complete({ value: event.ok ? event.output.value : "failed" }),
+            ),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ChildWorkflow, UseExistingParent, FailParent, TerminateParent],
+      workerId: "child-conflict-worker",
+    })
+
+    const useExistingRef = await runtime.start(UseExistingParent, {}, { workflowId: "use-existing-parent" })
+    await runtime.drain({ maxActivations: 10 })
+    expect(await provider.loadInstance(useExistingRef)).toMatchObject({
+      status: "completed",
+      output: { same: true },
+    })
+
+    const failRef = await runtime.start(FailParent, {}, { workflowId: "fail-conflict-parent" })
+    await runtime.drain({ maxActivations: 10 })
+    expect(await provider.loadInstance(failRef)).toMatchObject({
+      status: "completed",
+      output: { failed: true },
+    })
+
+    const terminateRef = await runtime.start(TerminateParent, {}, { workflowId: "terminate-conflict-parent" })
+    await runtime.drain({ maxActivations: 10 })
+    expect(await provider.loadInstance(terminateRef)).toMatchObject({
+      status: "completed",
+      output: { value: "second" },
+    })
+    expect((await provider.listChildren()).filter((record) => record.workflowId === "terminate-child")).toHaveLength(1)
+  })
+
+  it("exposes only ctx.child.start and ctx.child.cancel", async () => {
     let childKeys: string[] = []
     const NoChildRunWorkflow = defineWorkflow({
       name: "no_child_run",
@@ -2972,7 +3446,7 @@ describe("durable workflow PoC", () => {
         run: phase({
           run: async ({ ctx }) => {
             childKeys = Object.keys(ctx.child).sort()
-            return complete({ ok: !("run" in ctx.child) })
+            return complete({ ok: !("run" in ctx.child) && !("result" in ctx.child) })
           },
         }),
       },
@@ -2985,7 +3459,7 @@ describe("durable workflow PoC", () => {
     })
     const ref = await runtime.start(NoChildRunWorkflow, {}, { workflowId: "no-child-run" })
     await runtime.drain()
-    expect(childKeys).toEqual(["result", "start"])
+    expect(childKeys).toEqual(["cancel", "start"])
     expect(await provider.loadInstance(ref)).toMatchObject({
       status: "completed",
       output: { ok: true },
