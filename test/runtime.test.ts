@@ -975,6 +975,12 @@ describe("durable workflow PoC", () => {
           dispatchShardIds: [2],
         }),
     ).toThrow("dispatchShardIds must be integers between 0 and 1")
+    expect(
+      () =>
+        new SqliteDurabilityProvider(":memory:", {
+          synchronous: "off" as never,
+        }),
+    ).toThrow('SqliteDurabilityProvider synchronous must be "full" or "normal"')
   })
 
   it("validates activation concurrency and activation limits", async () => {
@@ -999,6 +1005,141 @@ describe("durable workflow PoC", () => {
     await expect(runtime.runWorker({ maxConcurrentActivations: 0 })).rejects.toThrow(
       "maxConcurrentActivations must be a positive integer",
     )
+  })
+
+  it("parses DB-loaded snapshots at boundaries only during activation", async () => {
+    const counts = {
+      common: 0,
+      waitingState: 0,
+      signal: 0,
+      nextState: 0,
+      output: 0,
+    }
+    const BoundaryWorkflow = defineWorkflow({
+      name: "boundary_parse",
+      version: 1,
+      input: z.object({ label: z.string() }),
+      output: z.object({ ok: z.boolean() }).superRefine(() => {
+        counts.output += 1
+      }),
+      common: z.object({ label: z.string() }).superRefine(() => {
+        counts.common += 1
+      }),
+      initial(input) {
+        return start({
+          common: { label: input.label },
+          phase: "waiting",
+          data: { value: 1 },
+        })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ value: z.number() }).superRefine(() => {
+            counts.waitingState += 1
+          }),
+          on: {
+            finish: signal(
+              z.object({ inc: z.number() }).superRefine(() => {
+                counts.signal += 1
+              }),
+              async ({ data, event }) => go("run_after_signal", { value: data.value + event.inc }),
+            ),
+          },
+        }),
+        run_after_signal: phase({
+          state: z.object({ value: z.number() }).superRefine(() => {
+            counts.nextState += 1
+          }),
+          run: async () => complete({ ok: true }),
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [BoundaryWorkflow],
+      workerId: "boundary-parse-worker",
+    })
+    const ref = await runtime.start(BoundaryWorkflow, { label: "Ada" }, { workflowId: "boundary-parse" })
+    await runtime.signal(BoundaryWorkflow, ref, "finish", { inc: 2 })
+    expect(counts).toMatchObject({
+      common: 1,
+      waitingState: 1,
+      signal: 1,
+      nextState: 0,
+      output: 0,
+    })
+
+    counts.common = 0
+    counts.waitingState = 0
+    counts.nextState = 0
+    counts.output = 0
+    const signalParsesAfterAppend = counts.signal
+
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(counts).toMatchObject({
+      common: 0,
+      waitingState: 0,
+      signal: signalParsesAfterAppend,
+      nextState: 1,
+      output: 0,
+    })
+
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(counts).toMatchObject({
+      common: 0,
+      waitingState: 0,
+      signal: signalParsesAfterAppend,
+      nextState: 1,
+      output: 1,
+    })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { ok: true },
+    })
+  })
+
+  it("does not persist handler mutations without an explicit transition", async () => {
+    const MutationWorkflow = defineWorkflow({
+      name: "handler_mutation_isolated",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      common: z.object({ value: z.string() }),
+      initial() {
+        return start({
+          common: { value: "original-common" },
+          phase: "waiting",
+          data: { value: "original-data" },
+        })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ value: z.string() }),
+          on: {
+            mutate: signal(z.object({}), async ({ common, data }) => {
+              common.value = "mutated-common"
+              data.value = "mutated-data"
+              return stay()
+            }),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [MutationWorkflow],
+      workerId: "mutation-isolation-worker",
+    })
+    const ref = await runtime.start(MutationWorkflow, {}, { workflowId: "mutation-isolated" })
+    await runtime.signal(MutationWorkflow, ref, "mutate", {})
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "running",
+      common: { value: "original-common" },
+      phase: { name: "waiting", data: { value: "original-data" } },
+    })
   })
 
   const soakIt = process.env.DURABLE_SOAK === "1" ? it : it.skip
@@ -3376,6 +3517,109 @@ describe("durable workflow PoC", () => {
     })
     expect(signalSleeps[0]).toBe(50)
     expect(await signalProvider.loadInstance(ref)).toMatchObject({ status: "completed" })
+  })
+
+  it("runWorker keeps dispatch shard leases while idle and releases them on shutdown", async () => {
+    const clock = manualClock()
+    const StickyShardWorkflow = defineWorkflow({
+      name: "worker_sticky_shard",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: { wakeAt: "2026-01-01T00:00:05.000Z" } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ wakeAt: z.string() }),
+          on: {
+            wake: timer(({ data }) => data.wakeAt, async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+
+    const path = await storePath()
+    const provider = testProvider(path)
+    const competitor = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [StickyShardWorkflow],
+      workerId: "sticky-worker",
+      shardCount: 1,
+      dispatchLeaseMs: 30_000,
+      leaseHeartbeatIntervalMs: 5,
+    })
+    await runtime.start(StickyShardWorkflow, {}, { workflowId: "sticky-worker-shard" })
+    const abort = new AbortController()
+
+    await runtime.runWorker({
+      signal: abort.signal,
+      minPollIntervalMs: 1,
+      maxPollIntervalMs: 10_000,
+      jitterRatio: 0,
+      sleep: async () => {
+        await expect(
+          competitor.claimDispatchShard({
+            shardId: 0,
+            ownerId: "competing-worker",
+            now: clock.clock().toISOString(),
+            leaseMs: 30_000,
+          }),
+        ).resolves.toBeNull()
+        abort.abort()
+      },
+    })
+
+    await expect(
+      competitor.claimDispatchShard({
+        shardId: 0,
+        ownerId: "competing-worker",
+        now: clock.clock().toISOString(),
+        leaseMs: 30_000,
+      }),
+    ).resolves.toMatchObject({ ownerId: "competing-worker" })
+  })
+
+  it("runWorker releases dispatch shard leases after a fatal activation error", async () => {
+    const FailingWorkerWorkflow = defineWorkflow({
+      name: "worker_fatal_release",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async () => {
+            throw new Error("fatal worker activation")
+          },
+        }),
+      },
+    })
+
+    const path = await storePath()
+    const provider = testProvider(path)
+    const competitor = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [FailingWorkerWorkflow],
+      workerId: "fatal-release-worker",
+      shardCount: 1,
+    })
+    await runtime.start(FailingWorkerWorkflow, {}, { workflowId: "fatal-release" })
+
+    await expect(runtime.runWorker({ maxActivationsPerDrain: 1 })).rejects.toThrow(
+      "fatal worker activation",
+    )
+    await expect(
+      competitor.claimDispatchShard({
+        shardId: 0,
+        ownerId: "after-fatal-worker",
+        now: new Date("2026-01-01T00:00:00.000Z").toISOString(),
+        leaseMs: 30_000,
+      }),
+    ).resolves.toMatchObject({ ownerId: "after-fatal-worker" })
   })
 
   it("runs multiple ready activations concurrently by default", async () => {

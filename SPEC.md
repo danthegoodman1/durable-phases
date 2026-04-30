@@ -17,6 +17,14 @@ The runtime owns the durable loop. User code only defines phases, waits, handler
 
 This system does **not** snapshot the process stack or rely on unbounded event-history replay.
 
+Implementations should validate data at trust boundaries. Public workflow
+inputs, signal payloads, child inputs, query outputs, migrations, and handler
+transition outputs are external/user-code boundaries and should be parsed with
+their schemas. Provider-loaded snapshots and claimed event payloads are trusted
+durable JSON and do not need to be reparsed on every activation, though runtimes
+must still preserve handler isolation so mutating `common` or `data` directly
+does not persist without an explicit transition.
+
 ---
 
 ## 2. Core model
@@ -924,6 +932,10 @@ dispatchShard = hash(tenantId, workflowId, runId) % shardCount
 
 Workers lease dispatch shards and poll only the shards they own. Shard leases are short and heartbeated.
 
+Long-running workers should retain owned shard leases across idle poll sleeps
+and repeated drain cycles, heartbeating those leases until shutdown or fatal
+error. One-shot drain calls may still claim and release shard leases per call.
+
 TypeScript workers may optionally be configured with a fixed subset of dispatch shard IDs. This is useful for production deployments that assign shard ranges outside the runtime and for tests that need to prove multiple workers are actually committing activations from the same durable store.
 
 Worker identity and local execution concurrency are separate concerns. `workerId`
@@ -947,6 +959,11 @@ type DispatchShardLease = {
 Shard leases assign polling responsibility, not correctness ownership. If a worker dies, the shard lease expires and another worker may poll that shard.
 
 Small or embedded providers may omit explicit shard leasing and poll directly. They must still preserve the same activation-lease and checkpoint-CAS invariants.
+
+The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`, and
+a conservative `synchronous: "full"` default. `synchronous: "normal"` may be
+opted into when a deployment prefers higher write throughput and accepts
+SQLite's weaker crash-recovery window for the most recent transactions.
 
 ### Activation claiming
 

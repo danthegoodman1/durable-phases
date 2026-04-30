@@ -32,23 +32,38 @@ The SQLite benchmark runs real workflows with activities, signals, timers, and
 child completions. These are local sanity numbers, not a production guarantee.
 
 ```bash
-npm run benchmark -- --activation-concurrency 4
+npm run benchmark -- --activation-concurrency 4 --sqlite-synchronous full
 ```
 
-Measured on this workspace with 250 workflows, batch 32, and the default
-SQLite provider:
+The benchmark now reports setup, processing, and verification time separately.
+Processing throughput excludes one-time workflow creation, final debug-store
+verification, and result loading.
 
-| workers | shards | activation concurrency | workflows/sec | activations/sec | mixed actions/sec |
-| --- | --- | --- | ---: | ---: | ---: |
-| 4 | 4 | 1 | 55.1 | 275.6 | 440.9 |
-| 4 | 4 | 4 | 53.2 | 266.2 | 425.9 |
-| 1 | 1 | 1 | 17.4 | 87.0 | 139.2 |
-| 1 | 1 | 4 | 16.9 | 84.3 | 134.9 |
+Measured on this workspace with 250 workflows, 4 workers, 4 shards, batch 32,
+and zero artificial activity delay:
+
+| SQLite synchronous | activation concurrency | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| full | 1 | 272 | 1,358 | 2,173 | 1,452 | 2,323 |
+| full | 4 | 272 | 1,362 | 2,179 | 1,455 | 2,327 |
+| normal | 4 | 320 | 1,601 | 2,562 | 1,701 | 2,721 |
 
 This benchmark is mostly SQLite/CPU-bound, so higher activation concurrency does
 not improve this particular throughput row. The concurrency path is still useful
 for workers with long in-flight async activations because one blocked activation
 no longer occupies the entire worker.
+
+With 100 workflows and a 5 ms async delay inside each activity, the same local
+machine measured:
+
+| activation concurrency | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 891 | 1,426 | 944 | 1,511 |
+| 4 | 1,434 | 2,295 | 1,559 | 2,494 |
+
+`synchronous=full` is the conservative default. `synchronous=normal` is available
+for deployments that accept SQLite's weaker crash window in exchange for higher
+write throughput.
 
 ## Provider conformance
 

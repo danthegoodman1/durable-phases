@@ -1352,6 +1352,12 @@ async function claim(
 
 function requireActivation(result: Awaited<ReturnType<typeof claim>>): ClaimedActivation {
   expect(result.activation).not.toBeNull()
+  expect(result.instance).toMatchObject({
+    workflowId: result.activation!.workflowId,
+    runId: result.activation!.runId,
+    sequence: result.activation!.sequence,
+    status: "running",
+  })
   return result.activation!
 }
 

@@ -71,6 +71,7 @@ const Database = require("better-sqlite3") as SqliteConstructor
 
 export type SqliteDurabilityProviderOptions = DurableObservability & {
   busyTimeoutMs?: number
+  synchronous?: "full" | "normal"
 }
 
 type ReadyCandidate = ClaimedActivation & {
@@ -220,7 +221,9 @@ type ReadyEventRow = {
 export class SqliteDurabilityProvider implements DurabilityProvider {
   private readonly db: SqliteDatabase
   private readonly busyTimeoutMs: number
+  private readonly synchronous: "full" | "normal"
   private readonly observability: DurableObservability
+  private readonly statements = new Map<string, SqliteStatement>()
   private observabilityBuffer?: BufferedObservation[]
   private closed = false
 
@@ -229,6 +232,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     options: SqliteDurabilityProviderOptions = {},
   ) {
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000
+    this.synchronous = normalizeSqliteSynchronous(options.synchronous)
     this.observability = { logger: options.logger, metrics: options.metrics }
     if (filePath !== ":memory:") {
       mkdirSync(dirname(filePath), { recursive: true })
@@ -243,6 +247,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return
     }
     this.db.close()
+    this.statements.clear()
     this.closed = true
   }
 
@@ -263,8 +268,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         this.deleteInstanceRecords(input.workflowId, input.runId)
       }
 
-      this.db
-        .prepare(
+      this.prepare(
           `
           INSERT INTO instances (
             workflow_name, workflow_version, workflow_id, run_id, partition_shard,
@@ -323,8 +327,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const conflictPolicy = input.conflictPolicy ?? "use_existing"
       const parentClosePolicy = input.parentClosePolicy ?? "cancel"
       const existing = oneRow<ChildRow>(
-        this.db
-          .prepare(
+        this.prepare(
             `
             SELECT * FROM children
             WHERE parent_workflow_id = ? AND parent_run_id = ? AND activation_id = ? AND key = ?
@@ -407,8 +410,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       const childRecordId = `child-${randomUUID()}`
-      this.db
-        .prepare(
+      this.prepare(
           `
           INSERT INTO instances (
             workflow_name, workflow_version, workflow_id, run_id, partition_shard,
@@ -435,8 +437,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.now,
         )
 
-      this.db
-        .prepare(
+      this.prepare(
           `
           INSERT INTO children (
             child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
@@ -508,8 +509,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       const childRecord = oneRow<ChildRow>(
-        this.db
-          .prepare("SELECT * FROM children WHERE child_record_id = ? LIMIT 1")
+        this.prepare("SELECT * FROM children WHERE child_record_id = ? LIMIT 1")
           .get(childInstance.parent_child_record_id),
       )
       if (!childRecord) {
@@ -546,22 +546,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async listInstances(): Promise<PersistedInstance[]> {
-    return this.db
-      .prepare("SELECT * FROM instances ORDER BY workflow_id, run_id")
+    return this.prepare("SELECT * FROM instances ORDER BY workflow_id, run_id")
       .all()
       .map((row) => this.persistedInstance(requireRow<InstanceRow>(row)))
   }
 
   async listSignals(): Promise<SignalRecord[]> {
-    return this.db
-      .prepare("SELECT * FROM signals ORDER BY received_at, signal_id")
+    return this.prepare("SELECT * FROM signals ORDER BY received_at, signal_id")
       .all()
       .map((row) => rowToSignalRecord(requireRow<SignalRow>(row)))
   }
 
   async listChildren(): Promise<ChildRecord[]> {
-    return this.db
-      .prepare("SELECT * FROM children ORDER BY child_record_id")
+    return this.prepare("SELECT * FROM children ORDER BY child_record_id")
       .all()
       .map((row) => rowToChildRecord(requireRow<ChildRow>(row)))
   }
@@ -577,8 +574,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       completedBySequence?: number
     }>
   > {
-    return this.db
-      .prepare("SELECT * FROM activation_claims ORDER BY workflow_id, run_id, sequence, activation_id")
+    return this.prepare("SELECT * FROM activation_claims ORDER BY workflow_id, run_id, sequence, activation_id")
       .all()
       .map((row) => {
         const claim = requireRow<ActivationClaimRow>(row)
@@ -610,8 +606,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         receivedAt: input.receivedAt,
       }
 
-      this.db
-        .prepare(
+      this.prepare(
           `
           INSERT INTO signals (signal_id, workflow_id, run_id, type, payload_json, received_at)
           VALUES (?, ?, ?, ?, ?, ?)
@@ -645,8 +640,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const claim = this.db.transaction(() => {
       const leaseUntil = addMs(input.now, input.leaseMs)
 
-      const result = this.db
-        .prepare(
+      const result = this.prepare(
           `
           INSERT INTO dispatch_shards (shard_id, owner_id, lease_until)
           VALUES (?, ?, ?)
@@ -691,8 +685,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void> {
-    const result = this.db
-      .prepare(
+    const result = this.prepare(
         `
         UPDATE dispatch_shards
         SET lease_until = ?
@@ -724,8 +717,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void> {
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE dispatch_shards
         SET owner_id = NULL, lease_until = NULL
@@ -748,7 +740,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const claim = this.db.transaction(() => {
       const ownedShards = input.shardIds.filter((shardId) => {
         const shard = oneRow<DispatchShardRow>(
-          this.db.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(shardId),
+          this.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(shardId),
         )
         return shard?.owner_id === input.workerId && (shard.lease_until ?? "") >= input.now
       })
@@ -768,14 +760,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       this.expireActivityTimeouts(input.now, { shardIds: ownedShards })
 
-      const candidates = this.indexedReadyCandidates({
+      const candidates = this.readyCandidates({
         ...input,
         shardIds: ownedShards,
       })
 
       for (const candidate of candidates) {
         if (this.tryWriteActivationClaim(candidate, input.workerId, input.now, input.leaseMs)) {
-          return { activation: stripSort(candidate) }
+          const instance = this.instanceRow({
+            workflowId: candidate.workflowId,
+            runId: candidate.runId,
+          })
+          if (!instance || instance.status !== "running" || instance.sequence !== candidate.sequence) {
+            continue
+          }
+          return {
+            activation: stripSort(candidate),
+            instance: this.persistedInstance(instance),
+          }
         }
       }
 
@@ -806,8 +808,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
     const heartbeat = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
-      return this.db
-        .prepare(
+      return this.prepare(
           `
           UPDATE activation_claims
           SET lease_until = ?
@@ -840,8 +841,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async releaseActivation(input: ReleaseActivationInput): Promise<void> {
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE activation_claims
         SET owner_id = NULL, lease_until = NULL
@@ -866,8 +866,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const options = normalizeEffectOptions(input)
 
       const existing = oneRow<EffectRow>(
-        this.db
-          .prepare(
+        this.prepare(
             `
             SELECT * FROM effects
             WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND key = ?
@@ -938,8 +937,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const effectId = `effect-${randomUUID()}`
       const attemptId = `attempt-${randomUUID()}`
       const idempotencyKey = `${input.workflowId}/${input.runId}/${input.activationId}/${input.key}`
-      this.db
-        .prepare(
+      this.prepare(
           `
           INSERT INTO effects (
             effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
@@ -1005,8 +1003,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const heartbeatDeadline = effect?.heartbeat_timeout_ms
         ? addMs(input.now, effect.heartbeat_timeout_ms)
         : null
-      return this.db
-        .prepare(
+      return this.prepare(
           `
           UPDATE effects
           SET heartbeat_at = ?, heartbeat_details_json = ?, heartbeat_deadline = ?
@@ -1044,8 +1041,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const complete = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
       this.assertLiveActivationLease(input)
-      return this.db
-        .prepare(
+      return this.prepare(
           `
           UPDATE effects
           SET status = 'completed', result_json = ?, error_json = NULL,
@@ -1089,8 +1085,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const retry = retryDecision(effect, input.error, input.now, input.retryable !== false)
       if (retry.status === "retry_scheduled") {
-        const result = this.db
-          .prepare(
+        const result = this.prepare(
             `
             UPDATE effects
             SET attempt = ?, attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
@@ -1124,8 +1119,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         return { result: retry, changes: result.changes }
       }
 
-      const result = this.db
-        .prepare(
+      const result = this.prepare(
           `
           UPDATE effects
           SET status = 'failed', error_json = ?, last_failure_json = ?,
@@ -1196,7 +1190,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       const claim = oneRow<ActivationClaimRow>(
-        this.db.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+        this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
       )
 
       if (
@@ -1218,8 +1212,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const signalToConsume = input.consumeSignalId
         ? oneRow<SignalRow>(
-            this.db
-              .prepare(
+            this.prepare(
                 `
                 SELECT * FROM signals
                 WHERE signal_id = ? AND workflow_id = ? AND run_id = ? AND consumed_by_sequence IS NULL
@@ -1236,8 +1229,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const childToConsume = input.consumeChildRecordId
         ? oneRow<ChildRow>(
-            this.db
-              .prepare(
+            this.prepare(
                 `
                 SELECT * FROM children
                 WHERE child_record_id = ? AND parent_workflow_id = ? AND parent_run_id = ?
@@ -1257,14 +1249,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       this.writeNextInstance(input, nextSequence)
 
       if (signalToConsume) {
-        this.db
-          .prepare("UPDATE signals SET consumed_by_sequence = ? WHERE signal_id = ?")
+        this.prepare("UPDATE signals SET consumed_by_sequence = ? WHERE signal_id = ?")
           .run(nextSequence, signalToConsume.signal_id)
       }
 
       if (childToConsume) {
-        this.db
-          .prepare("UPDATE children SET delivered_by_sequence = ? WHERE child_record_id = ?")
+        this.prepare("UPDATE children SET delivered_by_sequence = ? WHERE child_record_id = ?")
           .run(nextSequence, childToConsume.child_record_id)
       }
 
@@ -1272,8 +1262,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       this.applyParentClosePolicy(instance, input, nextSequence)
       this.replaceReadyEventsForInstance(input.workflowId, input.runId)
 
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE activation_claims
           SET completed_by_sequence = ?, completed_at = ?, lease_until = ?, owner_id = ?
@@ -1304,8 +1293,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private configure(): void {
     this.db.pragma("journal_mode = WAL")
+    this.db.pragma(`synchronous = ${this.synchronous.toUpperCase()}`)
     this.db.pragma("foreign_keys = ON")
     this.db.pragma(`busy_timeout = ${this.busyTimeoutMs}`)
+  }
+
+  private prepare(sql: string): SqliteStatement {
+    const existing = this.statements.get(sql)
+    if (existing) {
+      return existing
+    }
+    const statement = this.db.prepare(sql)
+    this.statements.set(sql, statement)
+    return statement
   }
 
   private migrate(): void {
@@ -1459,6 +1459,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         ON effects(status, next_attempt_at);
       CREATE INDEX IF NOT EXISTS activation_claims_owner_lease
         ON activation_claims(owner_id, lease_until, completed_by_sequence);
+      CREATE INDEX IF NOT EXISTS activation_claims_instance_sequence
+        ON activation_claims(workflow_id, run_id, sequence, completed_by_sequence, activation_id);
       CREATE INDEX IF NOT EXISTS ready_events_claim
         ON ready_events(partition_shard, ready_at, sort_key);
       CREATE INDEX IF NOT EXISTS ready_events_instance
@@ -1474,8 +1476,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     effectId: string
   }): EffectRow | null {
     return oneRow<EffectRow>(
-      this.db
-        .prepare(
+      this.prepare(
           `
           SELECT * FROM effects
           WHERE workflow_id = ? AND run_id = ? AND activation_id = ? AND effect_id = ?
@@ -1488,15 +1489,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private instanceRow(ref: InstanceRef): InstanceRow | null {
     return oneRow<InstanceRow>(
-      this.db
-        .prepare("SELECT * FROM instances WHERE workflow_id = ? AND run_id = ? LIMIT 1")
+      this.prepare("SELECT * FROM instances WHERE workflow_id = ? AND run_id = ? LIMIT 1")
         .get(ref.workflowId, ref.runId),
     )
   }
 
   private persistedInstance(row: InstanceRow): PersistedInstance {
-    const effects = this.db
-      .prepare("SELECT * FROM effects WHERE workflow_id = ? AND run_id = ? ORDER BY effect_id")
+    const effects = this.prepare("SELECT * FROM effects WHERE workflow_id = ? AND run_id = ? ORDER BY effect_id")
       .all(row.workflow_id, row.run_id)
       .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
 
@@ -1535,9 +1534,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private rebuildAllReadyEvents(): void {
     const rebuild = this.db.transaction(() => {
-      this.db.prepare("DELETE FROM ready_events").run()
-      const rows = this.db
-        .prepare("SELECT workflow_id, run_id FROM instances WHERE status = 'running'")
+      this.prepare("DELETE FROM ready_events").run()
+      const rows = this.prepare("SELECT workflow_id, run_id FROM instances WHERE status = 'running'")
         .all()
       for (const row of rows) {
         const instance = requireRow<{ workflow_id: string; run_id: string }>(row)
@@ -1548,29 +1546,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private replaceReadyEventsForInstance(workflowId: string, runId: string): void {
-    this.db.prepare("DELETE FROM ready_events WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
+    this.prepare("DELETE FROM ready_events WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
 
     const instance = this.instanceRow({ workflowId, runId })
     if (!instance || instance.status !== "running") {
       return
     }
-
-    this.insertReadyEvent({
-      readyEventId: `${instance.workflow_id}/${instance.run_id}/${instance.sequence}/migration`,
-      workflowId: instance.workflow_id,
-      runId: instance.run_id,
-      workflowName: instance.workflow_name,
-      workflowVersion: instance.workflow_version,
-      partitionShard: instance.partition_shard,
-      sequence: instance.sequence,
-      kind: "migration",
-      waitName: null,
-      activationId: null,
-      readyAt: instance.updated_at,
-      sortKey: sortKey(instance.updated_at, "migration", instance.workflow_id, instance.run_id),
-      wait: null,
-      event: null,
-    })
 
     for (const wait of decodeJson<DurableWait[]>(instance.waits_json, [])) {
       if (wait.kind === "run") {
@@ -1599,8 +1580,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         })
       } else if (wait.kind === "signal") {
         const signalRow = oneRow<SignalRow>(
-          this.db
-            .prepare(
+          this.prepare(
               `
               SELECT * FROM signals
               WHERE workflow_id = ? AND run_id = ? AND type = ? AND consumed_by_sequence IS NULL
@@ -1675,8 +1655,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         })
       } else {
         const childRow = oneRow<ChildRow>(
-          this.db
-            .prepare(
+          this.prepare(
               `
               SELECT * FROM children
               WHERE workflow_id = ? AND run_id = ? AND status IN ('completed', 'failed') AND delivered_by_sequence IS NULL
@@ -1748,8 +1727,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     wait: DurableWait | null
     event: ReadyEvent | null
   }): void {
-    this.db
-      .prepare(
+    this.prepare(
         `
         INSERT INTO ready_events (
           ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
@@ -1776,131 +1754,154 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
   }
 
-  private indexedReadyCandidates(input: ClaimReadyActivationInput): ReadyCandidate[] {
+  private readyCandidates(input: ClaimReadyActivationInput): ReadyCandidate[] {
+    const limit = readyCandidateLimit(input.shardIds.length)
+    return [
+      ...this.migrationReadyCandidates(input, limit),
+      ...this.indexedReadyCandidates(input, limit),
+    ]
+      .sort(compareReadyCandidates)
+      .slice(0, limit)
+  }
+
+  private migrationReadyCandidates(
+    input: ClaimReadyActivationInput,
+    limit: number,
+  ): ReadyCandidate[] {
+    const workflowEntries = Object.entries(input.workflows)
+    if (input.shardIds.length === 0 || workflowEntries.length === 0) {
+      return []
+    }
+
+    const shardPlaceholders = input.shardIds.map(() => "?").join(", ")
+    const versionClauses = workflowEntries
+      .map(() => "(i.workflow_name = ? AND i.workflow_version < ?)")
+      .join(" OR ")
+    const rows = this.prepare(
+      `
+      SELECT i.*
+      FROM instances i
+      WHERE i.status = 'running'
+        AND i.partition_shard IN (${shardPlaceholders})
+        AND (${versionClauses})
+        AND NOT EXISTS (
+          SELECT 1 FROM activation_claims competing
+          WHERE competing.workflow_id = i.workflow_id
+            AND competing.run_id = i.run_id
+            AND competing.sequence = i.sequence
+            AND competing.kind <> 'migration'
+            AND competing.completed_by_sequence IS NULL
+          LIMIT 1
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM activation_claims same_migration
+          WHERE same_migration.workflow_id = i.workflow_id
+            AND same_migration.run_id = i.run_id
+            AND same_migration.sequence = i.sequence
+            AND same_migration.kind = 'migration'
+            AND same_migration.completed_by_sequence IS NULL
+            AND same_migration.owner_id IS NOT NULL
+            AND same_migration.lease_until > ?
+          LIMIT 1
+        )
+      ORDER BY i.updated_at, i.workflow_id, i.run_id
+      LIMIT ?
+    `,
+    )
+      .all(
+        ...input.shardIds,
+        ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
+        input.now,
+        limit,
+      )
+      .map((row) => requireRow<InstanceRow>(row))
+
+    return rows.map((instance) => {
+      const target = input.workflows[instance.workflow_name]
+      return {
+        kind: "migration",
+        activationId: activationIdFromParts(
+          instance.workflow_id,
+          instance.run_id,
+          instance.sequence,
+          "migration",
+          `${instance.workflow_version}->${target.version}`,
+        ),
+        workflowName: instance.workflow_name,
+        workflowId: instance.workflow_id,
+        runId: instance.run_id,
+        sequence: instance.sequence,
+        activationTime: instance.updated_at,
+        leaseUntil: "",
+        sort: [sortKey(instance.updated_at, "migration", instance.workflow_id, instance.run_id)],
+      }
+    })
+  }
+
+  private indexedReadyCandidates(input: ClaimReadyActivationInput, limit: number): ReadyCandidate[] {
     const workflowEntries = Object.entries(input.workflows)
     if (input.shardIds.length === 0 || workflowEntries.length === 0) {
       return []
     }
 
     const placeholders = input.shardIds.map(() => "?").join(", ")
-    const migrationClauses = workflowEntries
-      .map(() => "(kind = 'migration' AND workflow_name = ? AND workflow_version < ?)")
-      .join(" OR ")
     const currentClauses = workflowEntries
-      .map(() => "(kind <> 'migration' AND workflow_name = ? AND workflow_version = ?)")
+      .map(() => "(re.workflow_name = ? AND re.workflow_version = ?)")
       .join(" OR ")
-    const versionParams = [
-      ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
-      ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
-    ]
-    const rows = this.db
-      .prepare(
-        `
-        SELECT * FROM ready_events
-        WHERE partition_shard IN (${placeholders}) AND ready_at <= ?
-          AND (${migrationClauses} OR ${currentClauses})
-        ORDER BY sort_key
+    const rows = this.prepare(
+      `
+        SELECT re.*
+        FROM ready_events re
+        JOIN instances i ON i.workflow_id = re.workflow_id AND i.run_id = re.run_id
+        WHERE re.partition_shard IN (${placeholders})
+          AND re.ready_at <= ?
+          AND re.kind <> 'migration'
+          AND (${currentClauses})
+          AND i.status = 'running'
+          AND i.sequence = re.sequence
+          AND NOT EXISTS (
+            SELECT 1 FROM activation_claims same_activation
+            WHERE same_activation.activation_id = re.activation_id
+              AND same_activation.completed_by_sequence IS NULL
+              AND same_activation.owner_id IS NOT NULL
+              AND same_activation.lease_until > ?
+            LIMIT 1
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM activation_claims competing
+            WHERE competing.workflow_id = re.workflow_id
+              AND competing.run_id = re.run_id
+              AND competing.sequence = re.sequence
+              AND competing.activation_id <> re.activation_id
+              AND competing.completed_by_sequence IS NULL
+            LIMIT 1
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM effects blocked
+            WHERE blocked.activation_id = re.activation_id
+              AND blocked.status = 'pending'
+              AND blocked.next_attempt_at IS NOT NULL
+              AND blocked.next_attempt_at > ?
+            LIMIT 1
+          )
+        ORDER BY re.sort_key
+        LIMIT ?
       `,
+    )
+      .all(
+        ...input.shardIds,
+        input.now,
+        ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
+        input.now,
+        input.now,
+        limit,
       )
-      .all(...input.shardIds, input.now, ...versionParams)
       .map((row) => requireRow<ReadyEventRow>(row))
 
     const candidates: ReadyCandidate[] = []
     for (const row of rows) {
-      const instance = this.instanceRow({ workflowId: row.workflow_id, runId: row.run_id })
-      if (!instance || instance.status !== "running" || instance.sequence !== row.sequence) {
-        this.db.prepare("DELETE FROM ready_events WHERE ready_event_id = ?").run(row.ready_event_id)
-        continue
-      }
-
-      const workflow = input.workflows[instance.workflow_name]
-      if (!workflow) {
-        continue
-      }
-
-      if (row.kind === "migration") {
-        if (instance.workflow_version >= workflow.version) {
-          continue
-        }
-        if (this.hasUncompletedNonMigrationActivation(instance)) {
-          this.log("debug", "provider.activation.blocked_by_competing_activation", {
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            sequence: instance.sequence,
-            activationKind: "migration",
-          })
-          this.count("durable.provider.activation.claim", {
-            workflowName: instance.workflow_name,
-            activationKind: "migration",
-            status: "blocked",
-            reason: "competing_activation",
-          })
-          continue
-        }
-        candidates.push({
-          kind: "migration",
-          activationId: activationIdFromParts(
-            instance.workflow_id,
-            instance.run_id,
-            instance.sequence,
-            "migration",
-            `${instance.workflow_version}->${workflow.version}`,
-          ),
-          workflowName: instance.workflow_name,
-          workflowId: instance.workflow_id,
-          runId: instance.run_id,
-          sequence: instance.sequence,
-          activationTime: row.ready_at,
-          leaseUntil: "",
-          sort: [row.sort_key],
-        })
-        continue
-      }
-
-      if (instance.workflow_version !== workflow.version) {
-        continue
-      }
-
-      const candidate = this.readyCandidateFromRow(row, instance)
+      const candidate = this.readyCandidateFromRow(row)
       if (candidate) {
-        if (this.hasCompetingUncompletedActivation(instance, candidate.activationId)) {
-          this.log("debug", "provider.activation.blocked_by_competing_activation", {
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            activationId: candidate.activationId,
-            activationKind: candidate.kind,
-            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
-            sequence: instance.sequence,
-          })
-          this.count("durable.provider.activation.claim", {
-            workflowName: instance.workflow_name,
-            activationKind: candidate.kind,
-            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
-            status: "blocked",
-            reason: "competing_activation",
-          })
-          continue
-        }
-        const blockedUntil = this.activationRetryBlockedUntil(candidate.activationId, input.now)
-        if (blockedUntil) {
-          this.log("debug", "provider.activation.blocked_by_effect_retry", {
-            workflowName: instance.workflow_name,
-            workflowId: instance.workflow_id,
-            runId: instance.run_id,
-            activationId: candidate.activationId,
-            blockedUntil,
-          })
-          this.count("durable.provider.activation.claim", {
-            workflowName: instance.workflow_name,
-            activationKind: candidate.kind,
-            eventKind: candidate.kind === "event" ? candidate.event.kind : undefined,
-            status: "blocked",
-            reason: "effect_retry",
-          })
-          continue
-        }
         candidates.push(candidate)
       }
     }
@@ -1908,7 +1909,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return candidates
   }
 
-  private readyCandidateFromRow(row: ReadyEventRow, instance: InstanceRow): ReadyCandidate | null {
+  private readyCandidateFromRow(row: ReadyEventRow): ReadyCandidate | null {
     if (row.kind === "run") {
       if (!row.activation_id) {
         return null
@@ -1916,10 +1917,10 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return {
         kind: "run",
         activationId: row.activation_id,
-        workflowName: instance.workflow_name,
-        workflowId: instance.workflow_id,
-        runId: instance.run_id,
-        sequence: instance.sequence,
+        workflowName: row.workflow_name,
+        workflowId: row.workflow_id,
+        runId: row.run_id,
+        sequence: row.sequence,
         activationTime: row.ready_at,
         leaseUntil: "",
         sort: [row.sort_key],
@@ -1933,10 +1934,10 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return {
         kind: "event",
         activationId: row.activation_id,
-        workflowName: instance.workflow_name,
-        workflowId: instance.workflow_id,
-        runId: instance.run_id,
-        sequence: instance.sequence,
+        workflowName: row.workflow_name,
+        workflowId: row.workflow_id,
+        runId: row.run_id,
+        sequence: row.sequence,
         activationTime: row.ready_at,
         waitName: row.wait_name,
         wait: decodeJson<Exclude<DurableWait, { kind: "run" }>>(row.wait_json, {
@@ -1960,8 +1961,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   private hasUncompletedNonMigrationActivation(instance: InstanceRow): boolean {
     return Boolean(
       oneRow(
-        this.db
-          .prepare(
+        this.prepare(
             `
             SELECT activation_id FROM activation_claims
             WHERE workflow_id = ? AND run_id = ? AND sequence = ?
@@ -1980,8 +1980,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   ): boolean {
     return Boolean(
       oneRow(
-        this.db
-          .prepare(
+        this.prepare(
             `
             SELECT activation_id FROM activation_claims
             WHERE workflow_id = ? AND run_id = ? AND sequence = ?
@@ -1996,8 +1995,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private activationRetryBlockedUntil(activationId: string, now: string): string | undefined {
     const row = oneRow<{ blocked_until: string | null }>(
-      this.db
-        .prepare(
+      this.prepare(
           `
           SELECT MAX(next_attempt_at) AS blocked_until
           FROM effects
@@ -2032,8 +2030,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const maxAttempts = effect.max_attempts ?? 3
     const firstAttemptStartedAt = effect.first_attempt_started_at ?? input.now
 
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE effects
         SET attempt = ?, attempt_id = ?, attempt_owner_id = ?, attempt_started_at = ?,
@@ -2092,8 +2089,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       params.push(...scope.shardIds)
     }
 
-    const expired = this.db
-      .prepare(
+    const expired = this.prepare(
         `
         SELECT DISTINCT e.activation_id
         FROM effects e
@@ -2118,8 +2114,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private expirePendingEffectsForActivation(activationId: string, now: string): void {
-    const effects = this.db
-      .prepare(
+    const effects = this.prepare(
         `
         SELECT * FROM effects
         WHERE activation_id = ? AND status = 'pending' AND attempt_started_at IS NOT NULL
@@ -2138,8 +2133,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const timeoutError = activityTimeoutError(effect, timeoutKind)
       const retry = retryDecision(effect, timeoutError, now, true)
       if (retry.status === "failed") {
-        this.db
-          .prepare(
+        this.prepare(
             `
             UPDATE effects
             SET status = 'failed', error_json = ?, last_failure_json = ?,
@@ -2171,8 +2165,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         continue
       }
 
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE effects
           SET attempt = ?, attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
@@ -2206,8 +2199,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       })
     }
 
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE activation_claims
         SET owner_id = NULL, lease_until = NULL
@@ -2218,8 +2210,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private fencePendingEffectAttempt(effect: EffectRow): void {
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE effects
         SET attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
@@ -2244,8 +2235,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const versionClauses = workflowEntries.map(() => "(workflow_name = ? AND workflow_version = ?)").join(" OR ")
     const versionParams = workflowEntries.flatMap(([name, workflow]) => [name, workflow.version])
     const row = oneRow<{ ready_at: string }>(
-      this.db
-        .prepare(
+      this.prepare(
           `
           SELECT ready_at FROM ready_events
           WHERE partition_shard IN (${placeholders})
@@ -2259,8 +2249,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         .get(...shardIds, now, ...versionParams),
     )
     const effectDeadline = oneRow<{ deadline: string }>(
-      this.db
-        .prepare(
+      this.prepare(
           `
           SELECT MIN(deadline) AS deadline FROM (
             SELECT e.start_to_close_deadline AS deadline
@@ -2300,8 +2289,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     )
 
     const retryWake = oneRow<{ ready_at: string | null }>(
-      this.db
-        .prepare(
+      this.prepare(
           `
           SELECT MIN(blocked_until) AS ready_at
           FROM (
@@ -2332,10 +2320,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   ): boolean {
     const leaseUntil = addMs(now, leaseMs)
     const existing = oneRow<ActivationClaimRow>(
-      this.db.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
+      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
     )
-    const result = this.db
-      .prepare(
+    const result = this.prepare(
         `
         INSERT INTO activation_claims (
           activation_id, workflow_id, run_id, sequence, kind, wait_name,
@@ -2398,8 +2385,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private resetPendingEffectsForActivationReclaim(activationId: string): void {
-    const effects = this.db
-      .prepare(
+    const effects = this.prepare(
         `
         SELECT * FROM effects
         WHERE activation_id = ? AND status = 'pending' AND attempt_started_at IS NOT NULL
@@ -2409,8 +2395,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       .map((row) => requireRow<EffectRow>(row))
 
     for (const effect of effects) {
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE effects
           SET attempt_id = ?, attempt_owner_id = NULL, attempt_started_at = NULL,
@@ -2430,7 +2415,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     now: string
   }): ActivationClaimRow {
     const claim = oneRow<ActivationClaimRow>(
-      this.db.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
     )
     if (
       !claim ||
@@ -2464,8 +2449,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private writeNextInstance(input: CommitCheckpointInput, nextSequence: number): void {
     if (input.next.status === "running") {
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE instances
           SET workflow_version = ?, sequence = ?, status = 'running',
@@ -2489,8 +2473,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
 
     if (input.next.status === "completed") {
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE instances
           SET workflow_version = ?, sequence = ?, status = 'completed',
@@ -2512,8 +2495,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
 
     if (input.next.status === "canceled") {
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE instances
           SET workflow_version = ?, sequence = ?, status = 'canceled',
@@ -2534,8 +2516,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return
     }
 
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE instances
         SET workflow_version = ?, sequence = ?, status = 'failed',
@@ -2565,8 +2546,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
 
     const existing = oneRow<ChildRow>(
-      this.db
-        .prepare("SELECT * FROM children WHERE child_record_id = ? AND status = 'started'")
+      this.prepare("SELECT * FROM children WHERE child_record_id = ? AND status = 'started'")
         .get(previous.parent_child_record_id),
     )
     if (!existing) {
@@ -2574,8 +2554,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
 
     if (input.next.status === "completed") {
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE children
           SET status = 'completed', completed_at = ?, output_json = ?, error_json = NULL
@@ -2588,8 +2567,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         input.next.status === "failed"
           ? input.next.error
           : { message: input.next.reason || "Child canceled" }
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE children
           SET status = 'failed', completed_at = ?, output_json = NULL, error_json = ?
@@ -2628,8 +2606,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     deliveredBySequence: number,
     status: "canceled" | "failed",
   ): void {
-    const children = this.db
-      .prepare(
+    const children = this.prepare(
         `
         SELECT * FROM children
         WHERE parent_workflow_id = ? AND parent_run_id = ? AND status = 'started'
@@ -2685,8 +2662,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const instance = this.instanceRow({ workflowId: child.workflow_id, runId: child.run_id })
     if (instance?.status === "running") {
       const childCloseSequence = instance.sequence + 1
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE instances
           SET sequence = sequence + 1, status = 'canceled',
@@ -2703,8 +2679,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           child.workflow_id,
           child.run_id,
         )
-      this.db
-        .prepare(
+      this.prepare(
           `
           UPDATE activation_claims
           SET owner_id = NULL, lease_until = NULL
@@ -2722,8 +2697,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
     }
 
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE children
         SET status = 'failed', completed_at = ?, output_json = NULL, error_json = ?,
@@ -2744,8 +2718,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private abandonStartedChild(child: ChildRow, now: string, deliveredBySequence: number): void {
-    this.db
-      .prepare(
+    this.prepare(
         `
         UPDATE children
         SET status = 'abandoned', completed_at = ?, output_json = NULL, error_json = NULL,
@@ -2769,8 +2742,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private deleteInstanceRecords(workflowId: string, runId: string): void {
-    this.db
-      .prepare(
+    this.prepare(
         `
         DELETE FROM children
         WHERE (parent_workflow_id = ? AND parent_run_id = ?)
@@ -2778,7 +2750,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       `,
       )
       .run(workflowId, runId, workflowId, runId)
-    this.db.prepare("DELETE FROM instances WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
+    this.prepare("DELETE FROM instances WHERE workflow_id = ? AND run_id = ?").run(workflowId, runId)
   }
 
   private log(
@@ -2920,6 +2892,32 @@ function shouldResetPendingEffectAttemptsOnClaim(
 
 function sortKey(...parts: string[]): string {
   return parts.join("\u0000")
+}
+
+function readyCandidateLimit(shardCount: number): number {
+  return Math.max(32, shardCount * 32)
+}
+
+function compareReadyCandidates(left: ReadyCandidate, right: ReadyCandidate): number {
+  const leftKey = left.sort.join("\u0000")
+  const rightKey = right.sort.join("\u0000")
+  if (leftKey < rightKey) {
+    return -1
+  }
+  if (leftKey > rightKey) {
+    return 1
+  }
+  return 0
+}
+
+function normalizeSqliteSynchronous(value: SqliteDurabilityProviderOptions["synchronous"]): "full" | "normal" {
+  if (value === undefined) {
+    return "full"
+  }
+  if (value !== "full" && value !== "normal") {
+    throw new Error('SqliteDurabilityProvider synchronous must be "full" or "normal"')
+  }
+  return value
 }
 
 function stripSort(candidate: ReadyCandidate): ClaimedActivation {

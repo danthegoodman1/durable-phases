@@ -9,7 +9,7 @@ import type {
   PersistedInstance,
   SignalRecord,
 } from "./interface.js"
-import type { DurableMetricTags, DurableObservability } from "./observability.js"
+import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import {
   countDurable,
   errorFields,
@@ -119,6 +119,9 @@ export class DurableRuntime {
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
   private readonly observability: DurableObservability
+  private readonly hasLogger: boolean
+  private readonly hasMetrics: boolean
+  private workflowVersionsCache?: Record<string, { version: number }>
 
   constructor(
     private readonly provider: DurabilityProvider,
@@ -138,12 +141,22 @@ export class DurableRuntime {
       options.leaseHeartbeatIntervalMs ??
       Math.max(1, Math.floor(Math.min(this.dispatchLeaseMs, this.activationLeaseMs) / 3))
     this.observability = { logger: options.logger, metrics: options.metrics }
+    this.hasLogger = Boolean(options.logger)
+    this.hasMetrics = Boolean(options.metrics)
     this.registerWorkflows(options.workflows ?? [])
   }
 
   registerWorkflows(workflows: AnyWorkflow[]): void {
+    let changed = false
     for (const workflow of workflows) {
+      const existing = this.workflows.get(workflow.name)
+      if (existing?.version !== workflow.version || existing !== workflow) {
+        changed = true
+      }
       this.workflows.set(workflow.name, workflow)
+    }
+    if (changed) {
+      this.workflowVersionsCache = undefined
     }
   }
 
@@ -236,6 +249,30 @@ export class DurableRuntime {
   }
 
   async drain(options: DrainOptions = {}): Promise<DrainResult> {
+    const shardIds = await this.claimDispatchShards()
+    let dispatchHeartbeat: DispatchHeartbeat | undefined
+    let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
+    try {
+      if (shardIds.length > 0) {
+        await this.heartbeatDispatchShards(shardIds)
+        dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
+        dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
+          kind: "dispatch_heartbeat_failed",
+          error,
+        }))
+      }
+      return await this.drainOwnedShards(shardIds, options, dispatchFailure)
+    } finally {
+      dispatchHeartbeat?.stop()
+      await this.releaseDispatchShards(shardIds)
+    }
+  }
+
+  private async drainOwnedShards(
+    shardIds: number[],
+    options: DrainOptions,
+    dispatchFailure?: Promise<DispatchHeartbeatFailure>,
+  ): Promise<DrainResult> {
     const startedAt = Date.now()
     const maxActivations = positiveInteger(options.maxActivations ?? 100, "maxActivations")
     const maxConcurrentActivations = positiveInteger(
@@ -250,7 +287,6 @@ export class DurableRuntime {
       maxActivations,
       maxConcurrentActivations,
     })
-    const shardIds = await this.claimDispatchShards()
 
     if (shardIds.length === 0) {
       this.log("debug", "runtime.drain.no_shards", {
@@ -277,10 +313,10 @@ export class DurableRuntime {
     }
 
     const tasks = new Set<ActivationTask>()
-    const startActivation = (activation: ClaimedActivation) => {
+    const startActivation = (activation: ClaimedActivation, instance: PersistedInstance) => {
       claimedActivations += 1
       const task: ActivationTask = {
-        promise: this.runClaimedActivation(activation, drainController.signal).catch(
+        promise: this.runClaimedActivation(activation, instance, drainController.signal).catch(
           (error: unknown): ActivationTaskOutcome => ({ kind: "failed", activation, error }),
         ),
       }
@@ -295,8 +331,6 @@ export class DurableRuntime {
 
     let firstError: unknown
     let claimMissed = false
-    let dispatchHeartbeat: DispatchHeartbeat | undefined
-    let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
 
     const abortDrain = (error: unknown) => {
       firstError ??= error
@@ -349,13 +383,6 @@ export class DurableRuntime {
     }
 
     try {
-      await this.heartbeatDispatchShards(shardIds)
-      dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
-      dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
-        kind: "dispatch_heartbeat_failed",
-        error,
-      }))
-
       while (claimedActivations < maxActivations || tasks.size > 0) {
         while (
           !firstError &&
@@ -379,20 +406,20 @@ export class DurableRuntime {
           if (!claim.activation) {
             nextWakeAt = claim.nextWakeAt
             claimMissed = true
-            this.log("debug", "runtime.activation.claim_miss", {
+            this.log("debug", "runtime.activation.claim_miss", () => ({
               workerId: this.workerId,
               nextWakeAt,
               inFlight: tasks.size,
               maxConcurrentActivations,
-            })
-            this.count("durable.runtime.activation.claim", {
+            }))
+            this.count("durable.runtime.activation.claim", () => ({
               workerId: this.workerId,
               status: "miss",
-            })
+            }))
             break
           }
 
-          this.log("debug", "runtime.activation.claimed", {
+          this.log("debug", "runtime.activation.claimed", () => ({
             workerId: this.workerId,
             workflowName: claim.activation.workflowName,
             workflowId: claim.activation.workflowId,
@@ -403,12 +430,12 @@ export class DurableRuntime {
             sequence: claim.activation.sequence,
             activeSlots: tasks.size + 1,
             maxConcurrentActivations,
-          })
+          }))
           this.count(
             "durable.runtime.activation.claim",
-            this.activationTags(claim.activation, "claimed"),
+            () => this.activationTags(claim.activation, "claimed"),
           )
-          startActivation(claim.activation)
+          startActivation(claim.activation, claim.instance)
         }
 
         if (tasks.size === 0) {
@@ -440,9 +467,7 @@ export class DurableRuntime {
       }
       throw firstError
     } finally {
-      dispatchHeartbeat?.stop()
       options.signal?.removeEventListener("abort", onExternalAbort)
-      await this.releaseDispatchShards(shardIds)
       const resultTags = { workerId: this.workerId, status: firstError ? "failed" : "complete" }
       this.log("debug", "runtime.drain.end", {
         workerId: this.workerId,
@@ -474,21 +499,46 @@ export class DurableRuntime {
     const jitterRatio = options.jitterRatio ?? 0.1
     const sleep = options.sleep ?? sleepMs
     let activations = 0
+    let shardIds: number[] = []
+    let dispatchHeartbeat: DispatchHeartbeat | undefined
+    let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
     this.log("info", "runtime.worker.start", {
       workerId: this.workerId,
       maxConcurrentActivations: maxConcurrentActivations ?? this.maxConcurrentActivations,
     })
     this.count("durable.runtime.worker", { workerId: this.workerId, status: "start" })
 
+    const releaseWorkerShards = async () => {
+      dispatchHeartbeat?.stop()
+      dispatchHeartbeat = undefined
+      dispatchFailure = undefined
+      if (shardIds.length > 0) {
+        await this.releaseDispatchShards(shardIds)
+        shardIds = []
+      }
+    }
+
     try {
       while (!options.signal?.aborted) {
         let result: DrainResult
         try {
-          result = await this.drain({
+          if (shardIds.length === 0) {
+            shardIds = await this.claimDispatchShards()
+            if (shardIds.length > 0) {
+              await this.heartbeatDispatchShards(shardIds)
+              dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
+              dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
+                kind: "dispatch_heartbeat_failed",
+                error,
+              }))
+            }
+          }
+
+          result = await this.drainOwnedShards(shardIds, {
             maxActivations: maxActivationsPerDrain,
             maxConcurrentActivations,
             signal: options.signal,
-          })
+          }, dispatchFailure)
         } catch (error) {
           if (isAbortError(error) || options.signal?.aborted) {
             break
@@ -523,7 +573,13 @@ export class DurableRuntime {
         this.histogram("durable.runtime.worker.sleep_ms", delayMs, { workerId: this.workerId })
 
         try {
-          await sleep(delayMs, options.signal)
+          const sleeper = sleep(delayMs, options.signal)
+          const wake = await (dispatchFailure
+            ? Promise.race([sleeper.then(() => undefined), dispatchFailure])
+            : sleeper.then(() => undefined))
+          if (wake?.kind === "dispatch_heartbeat_failed") {
+            throw wake.error
+          }
         } catch (error) {
           if (isAbortError(error) || options.signal?.aborted) {
             break
@@ -537,6 +593,7 @@ export class DurableRuntime {
         }
       }
     } finally {
+      await releaseWorkerShards()
       this.log("info", "runtime.worker.stop", { workerId: this.workerId, activations })
       this.count("durable.runtime.worker", { workerId: this.workerId, status: "stop" })
     }
@@ -594,16 +651,21 @@ export class DurableRuntime {
   }
 
   private workflowVersions(): Record<string, { version: number }> {
-    return Object.fromEntries(
+    this.workflowVersionsCache ??= Object.fromEntries(
       [...this.workflows.values()].map((workflow) => [
         workflow.name,
         { version: workflow.version },
       ]),
     )
+    return this.workflowVersionsCache
   }
 
-  private async runActivation(activation: ClaimedActivation, signal: AbortSignal): Promise<void> {
-    this.log("debug", "runtime.activation.started", {
+  private async runActivation(
+    activation: ClaimedActivation,
+    latest: PersistedInstance,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.log("debug", "runtime.activation.started", () => ({
       workerId: this.workerId,
       workflowName: activation.workflowName,
       workflowId: activation.workflowId,
@@ -612,24 +674,20 @@ export class DurableRuntime {
       activationKind: activation.kind,
       eventKind: activationEventKind(activation),
       sequence: activation.sequence,
-    })
-    const latest = await this.requireInstance({
-      workflowId: activation.workflowId,
-      runId: activation.runId,
-    })
+    }))
     if (latest.status !== "running" || latest.sequence !== activation.sequence) {
       await this.provider.releaseActivation({
         activationId: activation.activationId,
         workerId: this.workerId,
       })
-      this.log("debug", "runtime.activation.released", {
+      this.log("debug", "runtime.activation.released", () => ({
         workerId: this.workerId,
         workflowName: activation.workflowName,
         workflowId: activation.workflowId,
         runId: activation.runId,
         activationId: activation.activationId,
         reason: "stale_instance",
-      })
+      }))
       return
     }
 
@@ -639,14 +697,14 @@ export class DurableRuntime {
         activationId: activation.activationId,
         workerId: this.workerId,
       })
-      this.log("warn", "runtime.activation.released", {
+      this.log("warn", "runtime.activation.released", () => ({
         workerId: this.workerId,
         workflowName: latest.workflowName,
         workflowId: latest.workflowId,
         runId: latest.runId,
         activationId: activation.activationId,
         reason: "unknown_workflow",
-      })
+      }))
       return
     }
 
@@ -672,7 +730,7 @@ export class DurableRuntime {
       return
     }
 
-    const common = commonSchema(workflow).parse(latest.common)
+    const common = trustedJsonCopy(latest.common ?? {})
     const phaseSnapshot = latest.phase
     if (!phaseSnapshot) {
       throw new Error(`Running workflow ${latest.workflowId} has no phase`)
@@ -683,7 +741,7 @@ export class DurableRuntime {
       throw new Error(`Unknown phase ${phaseSnapshot.name} on workflow ${workflow.name}`)
     }
 
-    const data = phaseDefinition.state.parse(phaseSnapshot.data)
+    const data = trustedJsonCopy(phaseSnapshot.data)
     const ctx = this.contextFor(
       workflow,
       latest,
@@ -712,7 +770,7 @@ export class DurableRuntime {
           ctx,
           common,
           data,
-          event: waitDefinition.schema.parse(event.payload),
+          event: trustedJsonCopy(event.payload),
         })
       } else if (event.kind === "timer") {
         transition = await callWaitHandler(waitDefinition, {
@@ -727,7 +785,7 @@ export class DurableRuntime {
           ctx,
           common,
           data,
-          event: event.event,
+          event: trustedJsonCopy(event.event),
         })
       }
     }
@@ -772,7 +830,7 @@ export class DurableRuntime {
     })
 
     if (!result.ok) {
-      this.log("warn", "runtime.activation.commit_conflict", {
+      this.log("warn", "runtime.activation.commit_conflict", () => ({
         workerId: this.workerId,
         workflowName: workflow.name,
         workflowId: latest.workflowId,
@@ -780,12 +838,12 @@ export class DurableRuntime {
         activationId,
         expectedSequence: latest.sequence,
         actualSequence: result.sequence,
-      })
-      this.count("durable.runtime.activation", {
+      }))
+      this.count("durable.runtime.activation", () => ({
         workerId: this.workerId,
         workflowName: workflow.name,
         status: "commit_conflict",
-      })
+      }))
       await this.provider.releaseActivation({
         activationId,
         workerId: this.workerId,
@@ -793,7 +851,7 @@ export class DurableRuntime {
       return result
     }
 
-    this.log("info", "runtime.activation.completed", {
+    this.log("info", "runtime.activation.completed", () => ({
       workerId: this.workerId,
       workflowName: workflow.name,
       workflowId: latest.workflowId,
@@ -801,12 +859,12 @@ export class DurableRuntime {
       activationId,
       sequence: result.sequence,
       nextStatus: next.status,
-    })
-    this.count("durable.runtime.activation", {
+    }))
+    this.count("durable.runtime.activation", () => ({
       workerId: this.workerId,
       workflowName: workflow.name,
       status: "completed",
-    })
+    }))
     return result
   }
 
@@ -835,24 +893,24 @@ export class DurableRuntime {
         })
 
         if (reservation.status === "completed") {
-          this.log("debug", "runtime.activity.memoized", {
+          this.log("debug", "runtime.activity.memoized", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             workflowId: instance.workflowId,
             runId: instance.runId,
             activationId: currentActivationId,
             key,
-          })
-          this.count("durable.runtime.activity", {
+          }))
+          this.count("durable.runtime.activity", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             status: "memoized",
-          })
+          }))
           return clone(reservation.result) as T
         }
 
         if (reservation.status === "failed") {
-          this.log("warn", "runtime.activity.failed", {
+          this.log("warn", "runtime.activity.failed", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             workflowId: instance.workflowId,
@@ -860,16 +918,16 @@ export class DurableRuntime {
             activationId: currentActivationId,
             key,
             error: reservation.error,
-          })
-          this.count("durable.runtime.activity", {
+          }))
+          this.count("durable.runtime.activity", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             status: "failed",
-          })
+          }))
           throw new Error(reservation.error.message)
         }
 
-        this.log("debug", "runtime.activity.reserved", {
+        this.log("debug", "runtime.activity.reserved", () => ({
           workerId: this.workerId,
           workflowName: workflow.name,
           workflowId: instance.workflowId,
@@ -879,12 +937,12 @@ export class DurableRuntime {
           attemptId: reservation.attemptId,
           key,
           attempt: reservation.attempt,
-        })
-        this.count("durable.runtime.activity", {
+        }))
+        this.count("durable.runtime.activity", () => ({
           workerId: this.workerId,
           workflowName: workflow.name,
           status: "reserved",
-        })
+        }))
 
         const activityContext = {
           heartbeat: async (details?: JsonValue): Promise<void> => {
@@ -901,7 +959,7 @@ export class DurableRuntime {
               now: this.now(),
               details: details === undefined ? undefined : toJson(details),
             })
-            this.log("debug", "runtime.activity.heartbeat", {
+            this.log("debug", "runtime.activity.heartbeat", () => ({
               workerId: this.workerId,
               workflowName: workflow.name,
               workflowId: instance.workflowId,
@@ -910,12 +968,12 @@ export class DurableRuntime {
               effectId: reservation.effectId,
               attemptId: reservation.attemptId,
               key,
-            })
-            this.count("durable.runtime.activity", {
+            }))
+            this.count("durable.runtime.activity", () => ({
               workerId: this.workerId,
               workflowName: workflow.name,
               status: "heartbeat",
-            })
+            }))
           },
           heartbeatDetails: clone(reservation.heartbeatDetails),
           idempotencyKey: reservation.idempotencyKey,
@@ -945,7 +1003,7 @@ export class DurableRuntime {
             retryable: !isNonRetryableActivityError(error),
           })
           if (failure.status === "retry_scheduled") {
-            this.log("info", "runtime.activity.retry_scheduled", {
+            this.log("info", "runtime.activity.retry_scheduled", () => ({
               workerId: this.workerId,
               workflowName: workflow.name,
               workflowId: instance.workflowId,
@@ -955,15 +1013,15 @@ export class DurableRuntime {
               attemptId: reservation.attemptId,
               key,
               nextAttemptAt: failure.nextAttemptAt,
-            })
-            this.count("durable.runtime.activity", {
+            }))
+            this.count("durable.runtime.activity", () => ({
               workerId: this.workerId,
               workflowName: workflow.name,
               status: "retry_scheduled",
-            })
+            }))
             throw new ActivityRetryScheduledError(failure.nextAttemptAt)
           }
-          this.log("error", "runtime.activity.failed", {
+          this.log("error", "runtime.activity.failed", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             workflowId: instance.workflowId,
@@ -973,12 +1031,12 @@ export class DurableRuntime {
             attemptId: reservation.attemptId,
             key,
             ...errorFields(error),
-          })
-          this.count("durable.runtime.activity", {
+          }))
+          this.count("durable.runtime.activity", () => ({
             workerId: this.workerId,
             workflowName: workflow.name,
             status: "failed",
-          })
+          }))
           throw error
         }
 
@@ -992,7 +1050,7 @@ export class DurableRuntime {
           result: toJson(result),
           now: this.now(),
         })
-        this.log("debug", "runtime.activity.completed", {
+        this.log("debug", "runtime.activity.completed", () => ({
           workerId: this.workerId,
           workflowName: workflow.name,
           workflowId: instance.workflowId,
@@ -1001,12 +1059,12 @@ export class DurableRuntime {
           effectId: reservation.effectId,
           attemptId: reservation.attemptId,
           key,
-        })
-        this.count("durable.runtime.activity", {
+        }))
+        this.count("durable.runtime.activity", () => ({
           workerId: this.workerId,
           workflowName: workflow.name,
           status: "completed",
-        })
+        }))
         return result
       },
       child: {
@@ -1104,40 +1162,41 @@ export class DurableRuntime {
 
   private async runClaimedActivation(
     activation: ClaimedActivation,
+    instance: PersistedInstance,
     signal: AbortSignal,
   ): Promise<ActivationTaskOutcome> {
     try {
       await this.withActivationHeartbeat(activation, signal, (activationSignal) =>
-        this.runActivation(activation, activationSignal),
+        this.runActivation(activation, instance, activationSignal),
       )
       return { kind: "handled", activation }
     } catch (error) {
       await this.releaseActivationQuietly(activation.activationId)
       if (isActivityRetryScheduledError(error)) {
-        this.log("info", "runtime.activation.retry_scheduled", {
+        this.log("info", "runtime.activation.retry_scheduled", () => ({
           workerId: this.workerId,
           workflowName: activation.workflowName,
           workflowId: activation.workflowId,
           runId: activation.runId,
           activationId: activation.activationId,
           nextAttemptAt: error.nextAttemptAt,
-        })
+        }))
         this.count(
           "durable.runtime.activation",
-          this.activationTags(activation, "retry_scheduled"),
+          () => this.activationTags(activation, "retry_scheduled"),
         )
         return { kind: "retry_scheduled", activation }
       }
 
-      this.log("error", "runtime.activation.failed", {
+      this.log("error", "runtime.activation.failed", () => ({
         workerId: this.workerId,
         workflowName: activation.workflowName,
         workflowId: activation.workflowId,
         runId: activation.runId,
         activationId: activation.activationId,
         ...errorFields(error),
-      })
-      this.count("durable.runtime.activation", this.activationTags(activation, "failed"))
+      }))
+      this.count("durable.runtime.activation", () => this.activationTags(activation, "failed"))
       return { kind: "failed", activation, error }
     }
   }
@@ -1258,21 +1317,53 @@ export class DurableRuntime {
   private log(
     level: "debug" | "info" | "warn" | "error",
     event: string,
-    fields?: Record<string, unknown>,
+    fields?: DurableLogFields | (() => DurableLogFields),
   ): void {
-    logDurable(this.observability, level, event, fields)
+    if (!this.hasLogger) {
+      return
+    }
+    logDurable(
+      this.observability,
+      level,
+      event,
+      typeof fields === "function" ? fields() : fields,
+    )
   }
 
-  private count(name: string, tags?: DurableMetricTags): void {
-    countDurable(this.observability, name, 1, tags)
+  private count(name: string, tags?: DurableMetricTags | (() => DurableMetricTags)): void {
+    if (!this.hasMetrics) {
+      return
+    }
+    countDurable(
+      this.observability,
+      name,
+      1,
+      typeof tags === "function" ? tags() : tags,
+    )
   }
 
-  private histogram(name: string, value: number, tags?: DurableMetricTags): void {
-    histogramDurable(this.observability, name, value, tags)
+  private histogram(name: string, value: number, tags?: DurableMetricTags | (() => DurableMetricTags)): void {
+    if (!this.hasMetrics) {
+      return
+    }
+    histogramDurable(
+      this.observability,
+      name,
+      value,
+      typeof tags === "function" ? tags() : tags,
+    )
   }
 
-  private gauge(name: string, value: number, tags?: DurableMetricTags): void {
-    gaugeDurable(this.observability, name, value, tags)
+  private gauge(name: string, value: number, tags?: DurableMetricTags | (() => DurableMetricTags)): void {
+    if (!this.hasMetrics) {
+      return
+    }
+    gaugeDurable(
+      this.observability,
+      name,
+      value,
+      typeof tags === "function" ? tags() : tags,
+    )
   }
 
   private activationTags(
@@ -1634,6 +1725,10 @@ function snapshotFromInstance(instance: PersistedInstance): InstanceStatus<any> 
   }
 
   return { status: "failed", error: clone(instance.error ?? { message: "failed" }) }
+}
+
+function trustedJsonCopy<T>(value: T): T {
+  return clone(value)
 }
 
 function normalizePhaseSnapshot(value: unknown): PhaseSnapshot {

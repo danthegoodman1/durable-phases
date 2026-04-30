@@ -233,10 +233,17 @@ export type ClaimReadyActivationInput = {
   leaseMs: number
 }
 
-export type ClaimReadyActivationResult = {
-  activation: ClaimedActivation | null
-  nextWakeAt?: string
-}
+export type ClaimReadyActivationResult =
+  | {
+      activation: ClaimedActivation
+      instance: PersistedInstance
+      nextWakeAt?: undefined
+    }
+  | {
+      activation: null
+      instance?: undefined
+      nextWakeAt?: string
+    }
 
 export type HeartbeatActivationInput = {
   activationId: string
