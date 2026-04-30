@@ -49,11 +49,18 @@ The Compose file defaults to the pinned official image
 `${POSTGRES_IMAGE:-postgres:18.3}` on local port `${POSTGRES_PORT:-55432}`.
 
 `PostgresDurabilityProvider.create(...)` accepts a connection string or shared
-`pg.Pool`, schema name, pool size, statement/lock timeouts, and optional
-observability sinks. The provider uses explicit transactions, row locks,
-`FOR UPDATE SKIP LOCKED`, conflict-aware upserts, a unified `activation_tasks`
-table for ready work plus leases, partial hot-path indexes, and an advisory
-transaction lock for concurrent schema initialization.
+`pg.Pool`, schema name, pool size, statement/lock timeouts,
+`physicalPartitions`, and optional observability sinks. The provider uses
+explicit transactions, row locks, `FOR UPDATE SKIP LOCKED`, conflict-aware
+upserts, a unified `activation_tasks` table for ready work plus leases, partial
+hot-path indexes, and an advisory transaction lock for concurrent schema
+initialization.
+
+`physicalPartitions` is fixed when a schema is created and is persisted in
+provider metadata. Hot workflow/run tables are manually suffixed
+(`instances_p00`, `signals_p00`, `activation_tasks_p00`, and so on), while
+dispatch shards remain logical worker leases. The runtime API does not change;
+the provider routes each workflow/run to its physical table set internally.
 
 ## Benchmarks
 
@@ -64,40 +71,45 @@ production guarantee.
 ```bash
 npm run benchmark -- --activation-concurrency 4 --sqlite-synchronous full
 npm run benchmark:postgres -- --activation-concurrency 4 --activation-prefetch-limit 32 --json
+npm run benchmark:postgres -- --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
+npm run benchmark:postgres:diagnose -- --physical-partitions 4 --workflows 1000 --workers 16 --shards 16 --pool-size 64 --json
 ```
 
-The benchmark now reports setup, processing, and verification time separately.
+The benchmark reports setup, processing, and verification time separately.
 Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
 
-Measured on this workspace with 250 workflows, 4 workers, 4 shards, batch 32,
-activation concurrency 4, activation prefetch limit 32, and zero artificial
-activity delay:
+Measured on this workspace with 1,000 workflows, zero artificial activity delay,
+activation concurrency 4, activation prefetch 32, batch 32, and
+`synchronous_commit=on`:
 
-| Provider | durability mode | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| SQLite | synchronous=full | 611 | 3,054 | 4,886 | 3,562 | 5,699 |
-| SQLite | synchronous=normal | 737 | 3,686 | 5,898 | 4,187 | 6,700 |
-| Postgres | Docker postgres:18.3, pool=24 | 170 | 849 | 1,358 | 1,673 | 2,677 |
+| Provider | workers/shards | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 201 | 1,005 | 1,814 | 2,902 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 213 | 1,066 | 2,046 | 3,274 |
+| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 258 | 1,291 | 3,861 | 6,178 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 273 | 1,365 | 3,898 | 6,237 |
+| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 294 | 1,469 | 3,980 | 6,368 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 270 | 1,351 | 3,788 | 6,060 |
+
+`npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
+sampling of pool pressure, active Postgres wait events, WAL/database deltas,
+Node CPU, and event loop utilization. The profiled 16-worker,
+`physicalPartitions=4` row measured 3,677 processing activations/sec with 4.3
+processing SQL calls per activation. The sampler saw no pg pool waiters; the
+remaining local contention showed up mostly as WAL sync/write and lightweight
+lock wait samples.
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The
 concurrency path is still useful for workers with long in-flight async
 activations because one blocked activation no longer occupies the entire worker.
 
-With SQLite `synchronous=full`, 100 workflows, and a 5 ms async delay inside
-each activity, the same local machine measured:
-
-| activation concurrency | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 874 | 1,398 | 921 | 1,474 |
-| 4 | 1,461 | 2,337 | 1,611 | 2,578 |
-
 `synchronous=full` is SQLite's conservative default. `synchronous=normal` is
 available for deployments that accept SQLite's weaker crash window in exchange
-for higher write throughput. The Postgres row is from local Docker on the same
-machine, so it includes client/server and container overhead.
+for higher write throughput. The Postgres rows are from local Docker on the same
+machine, so they include client/server and container overhead.
 
 ## Provider conformance
 

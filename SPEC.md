@@ -984,6 +984,16 @@ error. One-shot drain calls may still claim and release shard leases per call.
 
 TypeScript workers may optionally be configured with a fixed subset of dispatch shard IDs. This is useful for production deployments that assign shard ranges outside the runtime and for tests that need to prove multiple workers are actually committing activations from the same durable store.
 
+A provider may also use internal physical partitions to spread hot storage
+tables. Physical partitions are not runtime dispatch shards: dispatch shards are
+logical worker leases, while physical partitions are a provider-local table
+layout. The TypeScript Postgres provider supports a fixed `physicalPartitions`
+constructor option, persists the count in provider metadata at schema creation,
+and rejects startup if the configured count does not match the durable store.
+Changing the count requires a future explicit repartitioning tool. Workflow/run
+state still routes by the same workflow identity, and public workflow refs remain
+`{ workflowId, runId }`.
+
 Worker identity and local execution concurrency are separate concerns. `workerId`
 is the durable lease owner recorded on shard leases, activation leases, and effect
 attempt ownership. Activation concurrency is a local worker setting that controls
@@ -997,9 +1007,11 @@ queued claims on shutdown, abort, or fatal handler error.
 
 Activation completions may be batched by the runtime before provider commit.
 `activationCommitBatchSize` controls the maximum number of completed activations
-submitted to `commitActivations(...)` together. Provider fencing remains
-authoritative, so a conflict for one activation must discard only that
-activation's completion while allowing siblings in the same batch to commit.
+submitted to `commitActivations(...)` together, and
+`activationCommitMaxDelayMs` is a small bounded coalescing delay before a
+partial batch is flushed. Provider fencing remains authoritative, so a conflict
+for one activation must discard only that activation's completion while allowing
+siblings in the same batch to commit.
 
 Activities currently execute inside activation slots. A long-running activity
 therefore occupies one activation slot until it completes, fails, retries, or is
@@ -1028,12 +1040,13 @@ transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
 conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
 pending/ready paths, statement and lock timeouts, and an advisory transaction
 lock for concurrent schema initialization. Its ready and activation-lease state
-is stored in a single `activation_tasks` table so Postgres can claim work with a
-set-oriented row-locking update rather than coordinating a separate ready index
-and activation-claim table. Provider startup must not rebuild or rewrite live
-ready indexes; readiness is maintained transactionally by instance creation,
-signal append, child completion/cancel, failure retry recording, and checkpoint
-commits.
+is stored in a compact live `activation_tasks` table so Postgres can claim work
+with a set-oriented row-locking update rather than coordinating a separate ready
+index and activation-claim table. Successful checkpoint commits delete the old
+sequence's live tasks and insert only the next live tasks. Provider startup must
+not rebuild or rewrite live ready indexes; readiness is maintained
+transactionally by instance creation, signal append, child completion/cancel,
+failure retry recording, and checkpoint commits.
 
 ### Activation claiming
 
@@ -1057,7 +1070,12 @@ Claims are leased. If a worker crashes, another worker may claim the activation 
 Providers should expose batch heartbeat/release helpers so a worker can manage
 prefetched activation leases without issuing one provider call per queued claim.
 
-In a sharded provider, claim calls should verify that the caller owns the dispatch shard for the requested work, or otherwise use an equivalent mechanism that prevents all workers from scanning all shards.
+In a sharded provider, claim calls should verify that the caller owns the
+dispatch shard for the requested work, or otherwise use an equivalent mechanism
+that prevents all workers from scanning all shards. `shardCount` is included in
+claim input so providers with private physical partitioning can map logical
+shards to possible physical table partitions without maintaining hot-path shard
+routing rows.
 
 The instance snapshot returned with a claim is for activation execution, not
 debug introspection. It includes identity, version, current sequence, status,
@@ -1067,7 +1085,21 @@ carries the activation's current effect ledger separately. Full
 `loadInstance(...)` reads may include provider-specific debug details such as
 effects when explicitly requested.
 
+Providers may avoid loading effect ledgers for claimed activations that have no
+pending eager effect state or retry-blocking metadata. The Postgres provider
+stores task-level `has_effects` and `blocked_until` fields so normal
+checkpoint-local activations can be claimed without effect-ledger reads.
+
 ```ts
+type ClaimReadyActivationInput = {
+  workerId: string
+  shardIds: number[]
+  shardCount?: number
+  workflows: Record<string, { version: number }>
+  now: string
+  leaseMs: number
+}
+
 type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
   limit: number
 }
@@ -1197,14 +1229,14 @@ verify instance is still at expectedSequence
 verify activation lease is held or still valid
 consume the selected signal, if any
 consume the selected child completion, if any
-persist checkpoint-durable effect mutations, if any
+persist checkpoint-durable retry/failure effect mutations, if any
 persist checkpoint-durable child starts, if any
 write the new instance snapshot or terminal state
 replace the current wait set
 persist child completion delivery and parent-close updates
 increment sequence
-mark the activation complete
-make the completed activation's effects compactable
+delete the committed activation's live task and compact successful
+checkpoint-local effect rows
 enqueue or wake the next activation if the next phase is run-immediate
 ```
 

@@ -235,6 +235,7 @@ export type ClaimedActivation =
 export type ClaimReadyActivationInput = {
   workerId: string
   shardIds: number[]
+  shardCount?: number
   workflows: Record<string, { version: number }>
   now: string
   leaseMs: number

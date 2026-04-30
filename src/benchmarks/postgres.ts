@@ -2,7 +2,8 @@ import pg from "pg"
 import { performance } from "node:perf_hooks"
 import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
-import type { Pool as PgPool, PoolClient } from "pg"
+import { setTimeout as sleep } from "node:timers/promises"
+import type { Pool as PgPool, PoolClient, PoolConfig } from "pg"
 import { DurableRuntime, PostgresDurabilityProvider } from "../durable.js"
 import {
   activityCount,
@@ -19,6 +20,7 @@ const { Pool } = pg
 export type PostgresBenchmarkOptions = {
   connectionString: string
   schema: string
+  physicalPartitions: number
   poolSize: number
   workflows: number
   workers: number
@@ -28,8 +30,11 @@ export type PostgresBenchmarkOptions = {
   activityDelayMs: number
   batch: number
   maxRounds: number
+  diagnose: boolean
+  diagnosticSampleIntervalMs: number
   keepSchema: boolean
   profileQueries: boolean
+  synchronousCommit: "on" | "off"
   json: boolean
 }
 
@@ -49,6 +54,12 @@ export type PostgresQueryProfile = {
   queriesPerActivation: number
   totalSqlMs: number
   avgQueryMs: number
+  poolWait: {
+    connectCount: number
+    totalWaitMs: number
+    avgWaitMs: number
+    maxWaitMs: number
+  }
   byPhase: Record<QueryProfilePhase, {
     totalQueries: number
     queriesPerActivation: number
@@ -57,6 +68,31 @@ export type PostgresQueryProfile = {
   }>
   topByTotal: QueryProfileEntry[]
   topByCount: QueryProfileEntry[]
+}
+
+export type PostgresBenchmarkDiagnostics = {
+  sampleIntervalMs: number
+  sampleCount: number
+  maxPoolWaiting: number
+  avgPoolWaiting: number
+  maxPoolTotal: number
+  maxActiveBackends: number
+  avgActiveBackends: number
+  maxWaitingBackends: number
+  waitEventSamples: Record<string, number>
+  databaseDelta?: Record<string, number>
+  walDelta?: Record<string, number>
+  processingCpuMs?: {
+    user: number
+    system: number
+    total: number
+  }
+  processingEventLoopUtilization?: {
+    activeMs: number
+    idleMs: number
+    utilization: number
+  }
+  samplerErrors: string[]
 }
 
 export type PostgresBenchmarkResult = {
@@ -82,12 +118,14 @@ export type PostgresBenchmarkResult = {
   processingWorkflowsPerSecond: number
   counters: BenchmarkCounters
   queryProfile?: PostgresQueryProfile
+  diagnostics?: PostgresBenchmarkDiagnostics
 }
 
 const defaultOptions: PostgresBenchmarkOptions = {
   connectionString:
     process.env.DURABLE_POSTGRES_URL ?? "postgresql://durable:durable@127.0.0.1:55432/durable",
   schema: `durable_bench_${randomUUID().replaceAll("-", "_")}`,
+  physicalPartitions: 1,
   poolSize: 24,
   workflows: 250,
   workers: 4,
@@ -97,8 +135,11 @@ const defaultOptions: PostgresBenchmarkOptions = {
   activityDelayMs: 0,
   batch: 32,
   maxRounds: 10_000,
+  diagnose: false,
+  diagnosticSampleIntervalMs: 25,
   keepSchema: false,
   profileQueries: false,
+  synchronousCommit: "on",
   json: false,
 }
 
@@ -106,7 +147,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running Postgres durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, pool size ${options.poolSize}, schema ${options.schema}...\n\n`,
+      `Running Postgres durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, physical partitions ${options.physicalPartitions}, pool size ${options.poolSize}, synchronous_commit ${options.synchronousCommit}, schema ${options.schema}...\n\n`,
     )
   }
   const result = await runPostgresBenchmark(options)
@@ -124,13 +165,18 @@ export async function runPostgresBenchmark(
   const { ParentWorkflow, workflows } = createBenchmarkWorkflows(counters, {
     activityDelayMs: options.activityDelayMs,
   })
-  const pool = new Pool({
-    connectionString: options.connectionString,
-    max: options.poolSize,
-  })
+  const pool = new Pool(poolConfig(options.connectionString, options.poolSize, options.synchronousCommit))
   let profilePhase: QueryProfilePhase = "setup"
-  const queryProfiler = options.profileQueries
+  const queryProfiler = options.profileQueries || options.diagnose
     ? installPostgresQueryProfiler(pool, () => profilePhase)
+    : undefined
+  const diagnostics = options.diagnose
+    ? await startPostgresDiagnostics({
+        connectionString: options.connectionString,
+        intervalMs: options.diagnosticSampleIntervalMs,
+        pool,
+        synchronousCommit: options.synchronousCommit,
+      })
     : undefined
   const providers: PostgresDurabilityProvider[] = []
   let schemaInitialized = false
@@ -146,12 +192,17 @@ export async function runPostgresBenchmark(
   let setupFinishedAt = setupStartedAt
   let processingStartedAt = setupStartedAt
   let processingFinishedAt = setupStartedAt
+  let processingCpuUsage: NodeJS.CpuUsage | undefined
+  let processingEventLoopUtilization:
+    | ReturnType<typeof performance.eventLoopUtilization>
+    | undefined
 
   try {
     for (let workerIndex = 0; workerIndex < options.workers; workerIndex += 1) {
       const provider = await PostgresDurabilityProvider.create({
         pool,
         schema: options.schema,
+        physicalPartitions: options.physicalPartitions,
       })
       schemaInitialized = true
       providers.push(provider)
@@ -192,6 +243,8 @@ export async function runPostgresBenchmark(
 
     setupFinishedAt = performance.now()
     profilePhase = "processing"
+    const processingCpuStartedAt = process.cpuUsage()
+    const processingEventLoopStartedAt = performance.eventLoopUtilization()
     processingStartedAt = setupFinishedAt
 
     for (; rounds < options.maxRounds; rounds += 1) {
@@ -211,6 +264,10 @@ export async function runPostgresBenchmark(
     }
 
     processingFinishedAt = performance.now()
+    processingCpuUsage = process.cpuUsage(processingCpuStartedAt)
+    processingEventLoopUtilization = performance.eventLoopUtilization(
+      processingEventLoopStartedAt,
+    )
     profilePhase = "verify"
     const verifyStartedAt = processingFinishedAt
     if (activations < expectedActivations) {
@@ -271,6 +328,10 @@ export async function runPostgresBenchmark(
       processingWorkflowsPerSecond: completedWorkflows / processingSeconds,
       counters,
       queryProfile: queryProfiler?.snapshot(activations),
+      diagnostics: await diagnostics?.snapshot({
+        processingCpuUsage,
+        processingEventLoopUtilization,
+      }),
     }
     return result
   } finally {
@@ -279,6 +340,7 @@ export async function runPostgresBenchmark(
       await providers[0].dropSchema().catch(() => undefined)
     }
     await Promise.all(providers.map((provider) => provider.close()))
+    await diagnostics?.close()
     await pool.end()
   }
 }
@@ -306,6 +368,8 @@ function parseArgs(args: string[]): PostgresBenchmarkOptions {
       options.connectionString = nextValue()
     } else if (flag === "--schema") {
       options.schema = nextValue()
+    } else if (flag === "--physical-partitions") {
+      options.physicalPartitions = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--pool-size") {
       options.poolSize = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--workflows") {
@@ -324,10 +388,17 @@ function parseArgs(args: string[]): PostgresBenchmarkOptions {
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--diagnose") {
+      options.diagnose = true
+      options.profileQueries = true
+    } else if (flag === "--diagnostic-sample-interval-ms") {
+      options.diagnosticSampleIntervalMs = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--keep-schema") {
       options.keepSchema = true
     } else if (flag === "--profile-queries") {
       options.profileQueries = true
+    } else if (flag === "--synchronous-commit") {
+      options.synchronousCommit = parseSynchronousCommit(nextValue(), flag)
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -343,6 +414,13 @@ function parsePositiveInteger(value: string, flag: string): number {
     throw new Error(`${flag} must be a positive integer`)
   }
   return parsed
+}
+
+function parseSynchronousCommit(value: string, flag: string): PostgresBenchmarkOptions["synchronousCommit"] {
+  if (value === "on" || value === "off") {
+    return value
+  }
+  throw new Error(`${flag} must be on or off`)
 }
 
 function parseNonNegativeInteger(value: string, flag: string): number {
@@ -362,6 +440,8 @@ Options:
   --connection-string <url>
                     Postgres connection string. Default: DURABLE_POSTGRES_URL or local Docker.
   --schema <name>   Isolated schema to create/drop. Default: generated durable_bench_* schema.
+  --physical-partitions <n>
+                    Manual physical table partitions for hot provider tables. Default: ${defaultOptions.physicalPartitions}
   --pool-size <n>   Shared pg pool size. Default: ${defaultOptions.poolSize}
   --workflows <n>   Parent workflow count. Default: ${defaultOptions.workflows}
   --workers <n>     Logical in-process worker count. Default: ${defaultOptions.workers}
@@ -374,9 +454,14 @@ Options:
                     Async delay inside each activity. Default: ${defaultOptions.activityDelayMs}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
+  --diagnose        Sample Postgres activity, pool pressure, WAL/database stats, Node CPU, and event loop use.
+  --diagnostic-sample-interval-ms <n>
+                    Diagnostic sampler interval. Default: ${defaultOptions.diagnosticSampleIntervalMs}
   --keep-schema     Keep the benchmark schema for inspection.
   --profile-queries
                     Include pg query counts and latency grouped by SQL fingerprint.
+  --synchronous-commit <on|off>
+                    Diagnostic Postgres synchronous_commit setting. Default: ${defaultOptions.synchronousCommit}
   --json            Print machine-readable JSON.
 `)
 }
@@ -390,9 +475,12 @@ function printResult(result: PostgresBenchmarkResult): void {
   shards: ${result.options.shards}
   activation concurrency: ${result.options.activationConcurrency} per worker
   activation prefetch limit: ${result.options.activationPrefetchLimit}
+  physical partitions: ${result.options.physicalPartitions}
   activity delay: ${formatMs(result.options.activityDelayMs)}
   pool size: ${result.options.poolSize}
+  synchronous_commit: ${result.options.synchronousCommit}
   query profiling: ${result.options.profileQueries ? "on" : "off"}
+  diagnostics: ${result.options.diagnose ? "on" : "off"}
   schema: ${result.options.schema}${result.options.keepSchema ? " (kept)" : ""}
   batch: ${result.options.batch}
   rounds: ${result.rounds}
@@ -423,6 +511,21 @@ Query profile:
   total queries: ${result.queryProfile.totalQueries}
   queries/activation: ${result.queryProfile.queriesPerActivation.toFixed(1)}
   avg query: ${formatMs(result.queryProfile.avgQueryMs)}
+  pool connect waits: ${result.queryProfile.poolWait.connectCount} waits, ${formatMs(result.queryProfile.poolWait.totalWaitMs)} total, ${formatMs(result.queryProfile.poolWait.maxWaitMs)} max
+`)
+  }
+  if (result.diagnostics) {
+    const diagnostics = result.diagnostics
+    process.stdout.write(`
+Diagnostics:
+  samples: ${diagnostics.sampleCount} every ${diagnostics.sampleIntervalMs} ms
+  pool waiting: avg ${diagnostics.avgPoolWaiting.toFixed(2)}, max ${diagnostics.maxPoolWaiting}
+  pool total connections max: ${diagnostics.maxPoolTotal}
+  active backends: avg ${diagnostics.avgActiveBackends.toFixed(2)}, max ${diagnostics.maxActiveBackends}
+  waiting backends max: ${diagnostics.maxWaitingBackends}
+  processing CPU: ${diagnostics.processingCpuMs ? formatMs(diagnostics.processingCpuMs.total) : "n/a"}
+  event loop utilization: ${diagnostics.processingEventLoopUtilization ? diagnostics.processingEventLoopUtilization.utilization.toFixed(3) : "n/a"}
+  wait events: ${Object.keys(diagnostics.waitEventSamples).length === 0 ? "none sampled" : JSON.stringify(diagnostics.waitEventSamples)}
 `)
   }
 }
@@ -445,6 +548,270 @@ function redactConnectionString(connectionString: string): string {
   return connectionString.replace(/:\/\/([^:/?#]+):([^@/?#]+)@/, "://$1:***@")
 }
 
+function poolConfig(
+  connectionString: string,
+  max: number,
+  synchronousCommit: PostgresBenchmarkOptions["synchronousCommit"],
+): PoolConfig {
+  return {
+    connectionString,
+    max,
+    ...(synchronousCommit === "on"
+      ? {}
+      : { options: `-c synchronous_commit=${synchronousCommit}` }),
+  }
+}
+
+type DiagnosticSample = {
+  poolTotal: number
+  poolIdle: number
+  poolWaiting: number
+  activeBackends: number
+  waitingBackends: number
+  waitEvents: Record<string, number>
+}
+
+async function startPostgresDiagnostics(input: {
+  connectionString: string
+  intervalMs: number
+  pool: PgPool
+  synchronousCommit: PostgresBenchmarkOptions["synchronousCommit"]
+}): Promise<{
+  snapshot(context: {
+    processingCpuUsage?: NodeJS.CpuUsage
+    processingEventLoopUtilization?: ReturnType<typeof performance.eventLoopUtilization>
+  }): Promise<PostgresBenchmarkDiagnostics>
+  close(): Promise<void>
+}> {
+  const samplePool = new Pool(poolConfig(input.connectionString, 1, input.synchronousCommit))
+  const samples: DiagnosticSample[] = []
+  const samplerErrors: string[] = []
+  const initialDatabase = await readDatabaseStats(samplePool, samplerErrors)
+  const initialWal = await readWalStats(samplePool, samplerErrors)
+  let stopped = false
+  let ended = false
+
+  const sample = async () => {
+    try {
+      const rows = await samplePool.query<{
+        count: number
+        state: string | null
+        wait_event: string | null
+        wait_event_type: string | null
+      }>(`
+        SELECT state, wait_event_type, wait_event, count(*)::int AS count
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+        GROUP BY state, wait_event_type, wait_event
+      `)
+      const waitEvents: Record<string, number> = {}
+      let activeBackends = 0
+      let waitingBackends = 0
+      for (const row of rows.rows) {
+        const count = Number(row.count)
+        if (row.state === "active") {
+          activeBackends += count
+        }
+        if (row.state === "active" && row.wait_event_type) {
+          waitingBackends += count
+          const key = `${row.wait_event_type}:${row.wait_event ?? "unknown"}`
+          waitEvents[key] = (waitEvents[key] ?? 0) + count
+        }
+      }
+      samples.push({
+        poolTotal: input.pool.totalCount,
+        poolIdle: input.pool.idleCount,
+        poolWaiting: input.pool.waitingCount,
+        activeBackends,
+        waitingBackends,
+        waitEvents,
+      })
+    } catch (error) {
+      samplerErrors.push(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const loop = (async () => {
+    while (!stopped) {
+      const startedAt = performance.now()
+      await sample()
+      const delayMs = Math.max(0, input.intervalMs - (performance.now() - startedAt))
+      await sleep(delayMs)
+    }
+  })()
+
+  const stop = async () => {
+    stopped = true
+    await loop.catch((error: unknown) => {
+      samplerErrors.push(error instanceof Error ? error.message : String(error))
+    })
+  }
+
+  const close = async () => {
+    await stop()
+    if (!ended) {
+      ended = true
+      await samplePool.end()
+    }
+  }
+
+  return {
+    async snapshot(context): Promise<PostgresBenchmarkDiagnostics> {
+      await stop()
+      const finalDatabase = await readDatabaseStats(samplePool, samplerErrors)
+      const finalWal = await readWalStats(samplePool, samplerErrors)
+      await close()
+      return summarizeDiagnostics({
+        context,
+        finalDatabase,
+        finalWal,
+        initialDatabase,
+        initialWal,
+        sampleIntervalMs: input.intervalMs,
+        samplerErrors,
+        samples,
+      })
+    },
+    close,
+  }
+}
+
+async function readDatabaseStats(
+  pool: PgPool,
+  errors: string[],
+): Promise<Record<string, number> | undefined> {
+  try {
+    const result = await pool.query<Record<string, unknown>>(`
+      SELECT
+        xact_commit,
+        xact_rollback,
+        blks_read,
+        blks_hit,
+        tup_returned,
+        tup_fetched,
+        tup_inserted,
+        tup_updated,
+        tup_deleted,
+        temp_files,
+        temp_bytes,
+        deadlocks,
+        blk_read_time,
+        blk_write_time
+      FROM pg_stat_database
+      WHERE datname = current_database()
+    `)
+    return numericStats(result.rows[0])
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error))
+    return undefined
+  }
+}
+
+async function readWalStats(
+  pool: PgPool,
+  errors: string[],
+): Promise<Record<string, number> | undefined> {
+  try {
+    const result = await pool.query<Record<string, unknown>>(`
+      SELECT
+        wal_records,
+        wal_fpi,
+        wal_bytes,
+        wal_buffers_full
+      FROM pg_stat_wal
+    `)
+    return numericStats(result.rows[0])
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error))
+    return undefined
+  }
+}
+
+function summarizeDiagnostics(input: {
+  context: {
+    processingCpuUsage?: NodeJS.CpuUsage
+    processingEventLoopUtilization?: ReturnType<typeof performance.eventLoopUtilization>
+  }
+  finalDatabase?: Record<string, number>
+  finalWal?: Record<string, number>
+  initialDatabase?: Record<string, number>
+  initialWal?: Record<string, number>
+  sampleIntervalMs: number
+  samplerErrors: string[]
+  samples: DiagnosticSample[]
+}): PostgresBenchmarkDiagnostics {
+  const samples = input.samples
+  const sampleCount = samples.length
+  const sum = (field: keyof DiagnosticSample) =>
+    samples.reduce((total, sample) => total + Number(sample[field]), 0)
+  const max = (field: keyof DiagnosticSample) =>
+    samples.reduce((largest, sample) => Math.max(largest, Number(sample[field])), 0)
+  const waitEventSamples: Record<string, number> = {}
+  for (const sample of samples) {
+    for (const [event, count] of Object.entries(sample.waitEvents)) {
+      waitEventSamples[event] = (waitEventSamples[event] ?? 0) + count
+    }
+  }
+  const cpu = input.context.processingCpuUsage
+  const elu = input.context.processingEventLoopUtilization
+  return {
+    sampleIntervalMs: input.sampleIntervalMs,
+    sampleCount,
+    maxPoolWaiting: max("poolWaiting"),
+    avgPoolWaiting: sampleCount > 0 ? round(sum("poolWaiting") / sampleCount) : 0,
+    maxPoolTotal: max("poolTotal"),
+    maxActiveBackends: max("activeBackends"),
+    avgActiveBackends: sampleCount > 0 ? round(sum("activeBackends") / sampleCount) : 0,
+    maxWaitingBackends: max("waitingBackends"),
+    waitEventSamples,
+    databaseDelta:
+      input.initialDatabase && input.finalDatabase
+        ? diffStats(input.initialDatabase, input.finalDatabase)
+        : undefined,
+    walDelta:
+      input.initialWal && input.finalWal
+        ? diffStats(input.initialWal, input.finalWal)
+        : undefined,
+    processingCpuMs: cpu
+      ? {
+          user: round(cpu.user / 1_000),
+          system: round(cpu.system / 1_000),
+          total: round((cpu.user + cpu.system) / 1_000),
+        }
+      : undefined,
+    processingEventLoopUtilization: elu
+      ? {
+          activeMs: round(elu.active),
+          idleMs: round(elu.idle),
+          utilization: round(elu.utilization),
+        }
+      : undefined,
+    samplerErrors: [...new Set(input.samplerErrors)],
+  }
+}
+
+function numericStats(row: Record<string, unknown> | undefined): Record<string, number> {
+  const stats: Record<string, number> = {}
+  if (!row) {
+    return stats
+  }
+  for (const [key, value] of Object.entries(row)) {
+    stats[key] = Number(value ?? 0)
+  }
+  return stats
+}
+
+function diffStats(
+  before: Record<string, number>,
+  after: Record<string, number>,
+): Record<string, number> {
+  const delta: Record<string, number> = {}
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    delta[key] = round((after[key] ?? 0) - (before[key] ?? 0))
+  }
+  return delta
+}
+
 function installPostgresQueryProfiler(
   pool: PgPool,
   currentPhase: () => QueryProfilePhase,
@@ -456,6 +823,11 @@ function installPostgresQueryProfiler(
     sql: string
     totalMs: number
   }>()
+  const poolWait = {
+    connectCount: 0,
+    totalWaitMs: 0,
+    maxWaitMs: 0,
+  }
 
   const record = (sql: string, elapsedMs: number) => {
     const fingerprint = queryFingerprint(sql)
@@ -505,13 +877,24 @@ function installPostgresQueryProfiler(
 
   const originalConnect = pool.connect.bind(pool) as (...args: any[]) => any
   pool.connect = function profiledConnect(...args: any[]) {
+    const startedAt = performance.now()
+    const recordConnectWait = () => {
+      const elapsedMs = performance.now() - startedAt
+      poolWait.connectCount += 1
+      poolWait.totalWaitMs += elapsedMs
+      poolWait.maxWaitMs = Math.max(poolWait.maxWaitMs, elapsedMs)
+    }
     if (typeof args[0] === "function") {
       const callback = args[0]
       return originalConnect((error: Error | undefined, client: PoolClient, done: () => void) => {
+        recordConnectWait()
         callback(error, client ? wrapClient(client) : client, done)
       })
     }
-    return Promise.resolve(originalConnect()).then(wrapClient)
+    return Promise.resolve(originalConnect()).then((client) => {
+      recordConnectWait()
+      return wrapClient(client)
+    })
   } as PgPool["connect"]
 
   return {
@@ -528,6 +911,13 @@ function installPostgresQueryProfiler(
       const totals = summarizeProfileEntries(all, activations)
       return {
         ...totals,
+        poolWait: {
+          connectCount: poolWait.connectCount,
+          totalWaitMs: round(poolWait.totalWaitMs),
+          avgWaitMs:
+            poolWait.connectCount > 0 ? round(poolWait.totalWaitMs / poolWait.connectCount) : 0,
+          maxWaitMs: round(poolWait.maxWaitMs),
+        },
         byPhase: {
           setup: summarizeProfileEntries(entries.filter((entry) => entry.phase === "setup"), activations),
           processing: summarizeProfileEntries(

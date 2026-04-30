@@ -6,8 +6,8 @@ import { PostgresDurabilityProvider } from "../src/durable.js"
 const connectionString = process.env.DURABLE_POSTGRES_URL
 
 if (connectionString) {
-  describeDurabilityProviderConformance({
-    name: "PostgresDurabilityProvider",
+  const registerConformance = (physicalPartitions: number) => describeDurabilityProviderConformance({
+    name: `PostgresDurabilityProvider physicalPartitions=${physicalPartitions}`,
     createStore() {
       const schema = `durable_test_${randomUUID().replaceAll("-", "_")}`
       return {
@@ -15,6 +15,7 @@ if (connectionString) {
           const provider = await PostgresDurabilityProvider.create({
             connectionString,
             schema,
+            physicalPartitions,
             poolSize: 8,
           })
           return {
@@ -26,6 +27,7 @@ if (connectionString) {
           const provider = await PostgresDurabilityProvider.create({
             connectionString,
             schema,
+            physicalPartitions,
             poolSize: 1,
           })
           try {
@@ -37,6 +39,9 @@ if (connectionString) {
       }
     },
   })
+
+  registerConformance(1)
+  registerConformance(4)
 } else {
   describe.skip("PostgresDurabilityProvider durability provider conformance", () => {
     // Requires DURABLE_POSTGRES_URL and is run by npm run test:postgres.

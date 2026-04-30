@@ -61,6 +61,7 @@ export type DurableRuntimeOptions = DurableObservability & {
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
   activationCommitBatchSize?: number
+  activationCommitMaxDelayMs?: number
   dispatchLeaseMs?: number
   activationLeaseMs?: number
   leaseHeartbeatIntervalMs?: number
@@ -78,6 +79,7 @@ export type RunWorkerOptions = {
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
   activationCommitBatchSize?: number
+  activationCommitMaxDelayMs?: number
   minPollIntervalMs?: number
   maxPollIntervalMs?: number
   jitterRatio?: number
@@ -90,6 +92,7 @@ export type DrainOptions = {
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
   activationCommitBatchSize?: number
+  activationCommitMaxDelayMs?: number
   signal?: AbortSignal
 }
 
@@ -154,6 +157,7 @@ class ActivationCommitBatcher {
   constructor(
     private readonly provider: DurabilityProvider,
     private readonly batchSize: number,
+    private readonly maxDelayMs: number,
   ) {}
 
   commit(input: CommitActivationInput): Promise<CommitCheckpointResult> {
@@ -172,10 +176,10 @@ class ActivationCommitBatcher {
       return
     }
     this.scheduled = true
-    setImmediate(() => {
+    const timer = setTimeout(() => {
       this.scheduled = false
       void this.flush()
-    })
+    }, this.maxDelayMs)
   }
 
   private async flush(): Promise<void> {
@@ -218,6 +222,7 @@ export class DurableRuntime {
   private readonly maxConcurrentActivations: number
   private readonly activationPrefetchLimit: number
   private readonly activationCommitBatchSize: number
+  private readonly activationCommitMaxDelayMs: number
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
@@ -245,6 +250,10 @@ export class DurableRuntime {
     this.activationCommitBatchSize = positiveInteger(
       options.activationCommitBatchSize ?? 32,
       "activationCommitBatchSize",
+    )
+    this.activationCommitMaxDelayMs = nonNegativeInteger(
+      options.activationCommitMaxDelayMs ?? 2,
+      "activationCommitMaxDelayMs",
     )
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
     this.activationLeaseMs = options.activationLeaseMs ?? 30_000
@@ -398,6 +407,10 @@ export class DurableRuntime {
       options.activationCommitBatchSize ?? this.activationCommitBatchSize,
       "activationCommitBatchSize",
     )
+    const activationCommitMaxDelayMs = nonNegativeInteger(
+      options.activationCommitMaxDelayMs ?? this.activationCommitMaxDelayMs,
+      "activationCommitMaxDelayMs",
+    )
     let activations = 0
     let totalClaimed = 0
     let nextWakeAt: string | undefined
@@ -407,6 +420,7 @@ export class DurableRuntime {
       maxConcurrentActivations,
       activationPrefetchLimit,
       activationCommitBatchSize,
+      activationCommitMaxDelayMs,
     })
 
     if (shardIds.length === 0) {
@@ -415,6 +429,7 @@ export class DurableRuntime {
         maxConcurrentActivations,
         activationPrefetchLimit,
         activationCommitBatchSize,
+        activationCommitMaxDelayMs,
       })
       this.count("durable.runtime.drain", { workerId: this.workerId, status: "no_shards" })
       this.histogram("durable.runtime.drain.duration_ms", Date.now() - startedAt, {
@@ -437,7 +452,11 @@ export class DurableRuntime {
 
     const tasks = new Set<ActivationTask>()
     const queuedClaims: ClaimedActivationWithInstance[] = []
-    const commitBatcher = new ActivationCommitBatcher(this.provider, activationCommitBatchSize)
+    const commitBatcher = new ActivationCommitBatcher(
+      this.provider,
+      activationCommitBatchSize,
+      activationCommitMaxDelayMs,
+    )
     const queuedHeartbeat = this.startQueuedActivationHeartbeat(() =>
       queuedClaims.map((claim) => claim.activation.activationId),
     )
@@ -588,6 +607,7 @@ export class DurableRuntime {
           const batch = await this.provider.claimReadyActivations({
             workerId: this.workerId,
             shardIds,
+            shardCount: this.shardCount,
             workflows: this.workflowVersions(),
             now: this.now(),
             leaseMs: this.activationLeaseMs,
@@ -627,6 +647,7 @@ export class DurableRuntime {
               prefetched: queuedClaims.length + 1,
               maxConcurrentActivations,
               activationPrefetchLimit,
+              activationCommitMaxDelayMs,
             }))
             this.count(
               "durable.runtime.activation.claim",
@@ -691,6 +712,7 @@ export class DurableRuntime {
         nextWakeAt,
         maxConcurrentActivations,
         activationPrefetchLimit,
+        activationCommitMaxDelayMs,
         durationMs: Date.now() - startedAt,
       })
       this.count("durable.runtime.drain", resultTags)
@@ -718,6 +740,10 @@ export class DurableRuntime {
       options.activationCommitBatchSize === undefined
         ? undefined
         : positiveInteger(options.activationCommitBatchSize, "activationCommitBatchSize")
+    const activationCommitMaxDelayMs =
+      options.activationCommitMaxDelayMs === undefined
+        ? undefined
+        : nonNegativeInteger(options.activationCommitMaxDelayMs, "activationCommitMaxDelayMs")
     const minPollIntervalMs = options.minPollIntervalMs ?? 10
     const maxPollIntervalMs = options.maxPollIntervalMs ?? 1_000
     const jitterRatio = options.jitterRatio ?? 0.1
@@ -731,6 +757,7 @@ export class DurableRuntime {
       maxConcurrentActivations: maxConcurrentActivations ?? this.maxConcurrentActivations,
       activationPrefetchLimit: activationPrefetchLimit ?? this.activationPrefetchLimit,
       activationCommitBatchSize: activationCommitBatchSize ?? this.activationCommitBatchSize,
+      activationCommitMaxDelayMs: activationCommitMaxDelayMs ?? this.activationCommitMaxDelayMs,
     })
     this.count("durable.runtime.worker", { workerId: this.workerId, status: "start" })
 
@@ -765,6 +792,7 @@ export class DurableRuntime {
             maxConcurrentActivations,
             activationPrefetchLimit,
             activationCommitBatchSize,
+            activationCommitMaxDelayMs,
             signal: options.signal,
           }, dispatchFailure)
         } catch (error) {
@@ -1074,7 +1102,7 @@ export class DurableRuntime {
       now,
       consumeSignalId: options.consumeSignalId,
       consumeChildRecordId: options.consumeChildRecordId,
-      effects: options.effects,
+      effects: compactCheckpointEffectMutations(options.effects),
       childStarts: options.childStarts,
     }
     const result =
@@ -2383,6 +2411,20 @@ function positiveInteger(value: number, name: string): number {
     throw new Error(`${name} must be a positive integer`)
   }
   return value
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+  return value
+}
+
+function compactCheckpointEffectMutations(
+  effects: CheckpointEffectMutation[] | undefined,
+): CheckpointEffectMutation[] | undefined {
+  const retained = effects?.filter((effect) => effect.status !== "completed")
+  return retained && retained.length > 0 ? retained : undefined
 }
 
 function activationEventKind(activation: ClaimedActivation): string | undefined {

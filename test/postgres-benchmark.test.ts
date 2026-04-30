@@ -17,15 +17,21 @@ function benchmarkOptions(
   return {
     connectionString: connectionString ?? "postgresql://durable:durable@127.0.0.1:55432/durable",
     schema: `durable_bench_test_${randomUUID().replaceAll("-", "_")}`,
+    physicalPartitions: 1,
     poolSize: 8,
     workflows: 6,
     workers: 2,
     shards: 2,
     activationConcurrency: 2,
+    activationPrefetchLimit: 8,
     activityDelayMs: 0,
     batch: 4,
     maxRounds: 100,
+    diagnose: false,
+    diagnosticSampleIntervalMs: 25,
     keepSchema: false,
+    profileQueries: false,
+    synchronousCommit: "on",
     json: true,
     ...overrides,
   }
@@ -34,7 +40,9 @@ function benchmarkOptions(
 describeIfPostgres("Postgres benchmark", () => {
   it("runs the shared workflow workload and drops its schema", async () => {
     const schema = `durable_bench_test_${randomUUID().replaceAll("-", "_")}`
-    const result = await runPostgresBenchmark(benchmarkOptions({ schema }))
+    const result = await runPostgresBenchmark(
+      benchmarkOptions({ diagnose: true, profileQueries: true, schema }),
+    )
 
     expect(result.backend).toBe("postgres")
     expect(result.completedWorkflows).toBe(6)
@@ -52,6 +60,9 @@ describeIfPostgres("Postgres benchmark", () => {
       finishActivities: 6,
     })
     expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
+    expect(result.queryProfile?.poolWait.connectCount).toBeGreaterThan(0)
+    expect(result.diagnostics?.sampleCount).toBeGreaterThan(0)
+    expect(result.diagnostics?.databaseDelta?.xact_commit).toBeGreaterThan(0)
 
     const pool = new Pool({ connectionString })
     try {

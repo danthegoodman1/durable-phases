@@ -1542,13 +1542,7 @@ describe("durable workflow PoC", () => {
     await expect(provider.loadInstance(ref, { includeEffects: true })).resolves.toMatchObject({
       status: "completed",
       output: { first: 2, second: 2 },
-      effects: [
-        expect.objectContaining({
-          key: "local_once",
-          status: "completed",
-          result: 2,
-        }),
-      ],
+      effects: [],
     })
   })
 
