@@ -52,6 +52,7 @@ export type DurableRuntimeOptions = DurableObservability & {
   workerId?: string
   shardCount?: number
   dispatchShardIds?: number[]
+  maxConcurrentActivations?: number
   dispatchLeaseMs?: number
   activationLeaseMs?: number
   leaseHeartbeatIntervalMs?: number
@@ -66,6 +67,7 @@ export type DrainResult = {
 
 export type RunWorkerOptions = {
   maxActivationsPerDrain?: number
+  maxConcurrentActivations?: number
   minPollIntervalMs?: number
   maxPollIntervalMs?: number
   jitterRatio?: number
@@ -75,8 +77,36 @@ export type RunWorkerOptions = {
 
 export type DrainOptions = {
   maxActivations?: number
+  maxConcurrentActivations?: number
   signal?: AbortSignal
 }
+
+type ActivationTaskOutcome =
+  | { kind: "handled"; activation: ClaimedActivation }
+  | { kind: "retry_scheduled"; activation: ClaimedActivation }
+  | { kind: "failed"; activation: ClaimedActivation; error: unknown }
+
+type ActivationTask = {
+  promise: Promise<ActivationTaskOutcome>
+}
+
+type ActivationTaskSettled = {
+  kind: "activation_task_settled"
+  task: ActivationTask
+  outcome: ActivationTaskOutcome
+}
+
+type DispatchHeartbeat = {
+  failure: Promise<never>
+  stop(): void
+}
+
+type DispatchHeartbeatFailure = {
+  kind: "dispatch_heartbeat_failed"
+  error: unknown
+}
+
+type DrainTaskEvent = ActivationTaskSettled | DispatchHeartbeatFailure
 
 export class DurableRuntime {
   private readonly workflows = new Map<string, AnyWorkflow>()
@@ -84,6 +114,7 @@ export class DurableRuntime {
   private readonly workerId: string
   private readonly shardCount: number
   private readonly dispatchShardIds: number[]
+  private readonly maxConcurrentActivations: number
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
@@ -97,6 +128,10 @@ export class DurableRuntime {
     this.workerId = options.workerId ?? `worker-${randomUUID()}`
     this.shardCount = options.shardCount ?? 1
     this.dispatchShardIds = normalizeDispatchShardIds(options.dispatchShardIds, this.shardCount)
+    this.maxConcurrentActivations = positiveInteger(
+      options.maxConcurrentActivations ?? 4,
+      "maxConcurrentActivations",
+    )
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
     this.activationLeaseMs = options.activationLeaseMs ?? 30_000
     this.leaseHeartbeatIntervalMs =
@@ -202,14 +237,26 @@ export class DurableRuntime {
 
   async drain(options: DrainOptions = {}): Promise<DrainResult> {
     const startedAt = Date.now()
-    const maxActivations = options.maxActivations ?? 100
+    const maxActivations = positiveInteger(options.maxActivations ?? 100, "maxActivations")
+    const maxConcurrentActivations = positiveInteger(
+      options.maxConcurrentActivations ?? this.maxConcurrentActivations,
+      "maxConcurrentActivations",
+    )
     let activations = 0
+    let claimedActivations = 0
     let nextWakeAt: string | undefined
-    this.log("debug", "runtime.drain.start", { workerId: this.workerId, maxActivations })
+    this.log("debug", "runtime.drain.start", {
+      workerId: this.workerId,
+      maxActivations,
+      maxConcurrentActivations,
+    })
     const shardIds = await this.claimDispatchShards()
 
     if (shardIds.length === 0) {
-      this.log("debug", "runtime.drain.no_shards", { workerId: this.workerId })
+      this.log("debug", "runtime.drain.no_shards", {
+        workerId: this.workerId,
+        maxConcurrentActivations,
+      })
       this.count("durable.runtime.drain", { workerId: this.workerId, status: "no_shards" })
       this.histogram("durable.runtime.drain.duration_ms", Date.now() - startedAt, {
         workerId: this.workerId,
@@ -218,82 +265,191 @@ export class DurableRuntime {
       return { activations }
     }
 
-    try {
-      while (activations < maxActivations) {
-        await this.heartbeatDispatchShards(shardIds)
-        const claim = await this.provider.claimReadyActivation({
+    const drainController = new AbortController()
+    const onExternalAbort = () => {
+      if (!drainController.signal.aborted) {
+        drainController.abort(abortError())
+      }
+    }
+    options.signal?.addEventListener("abort", onExternalAbort, { once: true })
+    if (options.signal?.aborted) {
+      drainController.abort(abortError())
+    }
+
+    const tasks = new Set<ActivationTask>()
+    const startActivation = (activation: ClaimedActivation) => {
+      claimedActivations += 1
+      const task: ActivationTask = {
+        promise: this.runClaimedActivation(activation, drainController.signal).catch(
+          (error: unknown): ActivationTaskOutcome => ({ kind: "failed", activation, error }),
+        ),
+      }
+      tasks.add(task)
+      this.gauge("durable.runtime.activation.in_flight", tasks.size, {
+        workerId: this.workerId,
+      })
+      this.histogram("durable.runtime.activation.concurrent_slots", tasks.size, {
+        workerId: this.workerId,
+      })
+    }
+
+    let firstError: unknown
+    let claimMissed = false
+    let dispatchHeartbeat: DispatchHeartbeat | undefined
+    let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
+
+    const abortDrain = (error: unknown) => {
+      firstError ??= error
+      if (!drainController.signal.aborted) {
+        drainController.abort(error)
+      }
+    }
+
+    const waitForNextTask = async (): Promise<DrainTaskEvent> => {
+      const waitables: Array<Promise<DrainTaskEvent>> = [...tasks].map((task) =>
+        task.promise.then((outcome) => ({
+          kind: "activation_task_settled" as const,
+          task,
+          outcome,
+        })),
+      )
+      if (!firstError && dispatchFailure) {
+        waitables.push(dispatchFailure)
+      }
+      return Promise.race(waitables)
+    }
+
+    const handleOutcome = (event: DrainTaskEvent) => {
+      if (event.kind === "dispatch_heartbeat_failed") {
+        dispatchFailure = undefined
+        this.log("warn", "runtime.dispatch_heartbeat.failure", {
           workerId: this.workerId,
           shardIds,
-          workflows: this.workflowVersions(),
-          now: this.now(),
-          leaseMs: this.activationLeaseMs,
+          ...errorFields(event.error),
         })
+        this.count("durable.runtime.dispatch_heartbeat", {
+          workerId: this.workerId,
+          status: "failed",
+        })
+        abortDrain(event.error)
+        return
+      }
 
-        if (!claim.activation) {
-          nextWakeAt = claim.nextWakeAt
-          this.log("debug", "runtime.activation.claim_miss", {
+      tasks.delete(event.task)
+      this.gauge("durable.runtime.activation.in_flight", tasks.size, {
+        workerId: this.workerId,
+      })
+      const outcome = event.outcome
+      if (outcome.kind === "failed") {
+        abortDrain(outcome.error)
+        return
+      }
+
+      activations += 1
+    }
+
+    try {
+      await this.heartbeatDispatchShards(shardIds)
+      dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
+      dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
+        kind: "dispatch_heartbeat_failed",
+        error,
+      }))
+
+      while (claimedActivations < maxActivations || tasks.size > 0) {
+        while (
+          !firstError &&
+          !claimMissed &&
+          claimedActivations < maxActivations &&
+          tasks.size < maxConcurrentActivations
+        ) {
+          if (drainController.signal.aborted) {
+            abortDrain(drainController.signal.reason ?? abortError())
+            break
+          }
+
+          const claim = await this.provider.claimReadyActivation({
             workerId: this.workerId,
-            nextWakeAt,
+            shardIds,
+            workflows: this.workflowVersions(),
+            now: this.now(),
+            leaseMs: this.activationLeaseMs,
           })
-          this.count("durable.runtime.activation.claim", {
+
+          if (!claim.activation) {
+            nextWakeAt = claim.nextWakeAt
+            claimMissed = true
+            this.log("debug", "runtime.activation.claim_miss", {
+              workerId: this.workerId,
+              nextWakeAt,
+              inFlight: tasks.size,
+              maxConcurrentActivations,
+            })
+            this.count("durable.runtime.activation.claim", {
+              workerId: this.workerId,
+              status: "miss",
+            })
+            break
+          }
+
+          this.log("debug", "runtime.activation.claimed", {
             workerId: this.workerId,
-            status: "miss",
+            workflowName: claim.activation.workflowName,
+            workflowId: claim.activation.workflowId,
+            runId: claim.activation.runId,
+            activationId: claim.activation.activationId,
+            activationKind: claim.activation.kind,
+            eventKind: activationEventKind(claim.activation),
+            sequence: claim.activation.sequence,
+            activeSlots: tasks.size + 1,
+            maxConcurrentActivations,
           })
+          this.count(
+            "durable.runtime.activation.claim",
+            this.activationTags(claim.activation, "claimed"),
+          )
+          startActivation(claim.activation)
+        }
+
+        if (tasks.size === 0) {
           break
         }
 
-        this.log("debug", "runtime.activation.claimed", {
-          workerId: this.workerId,
-          workflowName: claim.activation.workflowName,
-          workflowId: claim.activation.workflowId,
-          runId: claim.activation.runId,
-          activationId: claim.activation.activationId,
-          activationKind: claim.activation.kind,
-          eventKind: activationEventKind(claim.activation),
-          sequence: claim.activation.sequence,
-        })
-        this.count("durable.runtime.activation.claim", this.activationTags(claim.activation, "claimed"))
-        try {
-          await this.withLeaseHeartbeats(shardIds, claim.activation, options.signal, (signal) =>
-            this.runActivation(claim.activation!, signal),
-          )
-        } catch (error) {
-          await this.releaseActivationQuietly(claim.activation.activationId)
-          if (isActivityRetryScheduledError(error)) {
-            this.log("info", "runtime.activation.retry_scheduled", {
-              workerId: this.workerId,
-              workflowName: claim.activation.workflowName,
-              workflowId: claim.activation.workflowId,
-              runId: claim.activation.runId,
-              activationId: claim.activation.activationId,
-              nextAttemptAt: error.nextAttemptAt,
-            })
-            this.count(
-              "durable.runtime.activation",
-              this.activationTags(claim.activation, "retry_scheduled"),
-            )
-          } else {
-            this.log("error", "runtime.activation.failed", {
-              workerId: this.workerId,
-              workflowName: claim.activation.workflowName,
-              workflowId: claim.activation.workflowId,
-              runId: claim.activation.runId,
-              activationId: claim.activation.activationId,
-              ...errorFields(error),
-            })
-            this.count("durable.runtime.activation", this.activationTags(claim.activation, "failed"))
-            throw error
+        if (
+          firstError ||
+          claimMissed ||
+          claimedActivations >= maxActivations ||
+          tasks.size >= maxConcurrentActivations
+        ) {
+          const outcome = await waitForNextTask()
+          handleOutcome(outcome)
+          claimMissed = false
+          if (claimedActivations >= maxActivations) {
+            nextWakeAt = undefined
           }
         }
-        activations += 1
       }
+
+      if (firstError) {
+        throw firstError
+      }
+    } catch (error) {
+      abortDrain(error)
+      while (tasks.size > 0) {
+        handleOutcome(await waitForNextTask())
+      }
+      throw firstError
     } finally {
+      dispatchHeartbeat?.stop()
+      options.signal?.removeEventListener("abort", onExternalAbort)
       await this.releaseDispatchShards(shardIds)
-      const resultTags = { workerId: this.workerId, status: "complete" }
+      const resultTags = { workerId: this.workerId, status: firstError ? "failed" : "complete" }
       this.log("debug", "runtime.drain.end", {
         workerId: this.workerId,
         activations,
+        claimedActivations,
         nextWakeAt,
+        maxConcurrentActivations,
         durationMs: Date.now() - startedAt,
       })
       this.count("durable.runtime.drain", resultTags)
@@ -305,12 +461,23 @@ export class DurableRuntime {
   }
 
   async runWorker(options: RunWorkerOptions = {}): Promise<{ activations: number }> {
+    const maxActivationsPerDrain =
+      options.maxActivationsPerDrain === undefined
+        ? undefined
+        : positiveInteger(options.maxActivationsPerDrain, "maxActivationsPerDrain")
+    const maxConcurrentActivations =
+      options.maxConcurrentActivations === undefined
+        ? undefined
+        : positiveInteger(options.maxConcurrentActivations, "maxConcurrentActivations")
     const minPollIntervalMs = options.minPollIntervalMs ?? 10
     const maxPollIntervalMs = options.maxPollIntervalMs ?? 1_000
     const jitterRatio = options.jitterRatio ?? 0.1
     const sleep = options.sleep ?? sleepMs
     let activations = 0
-    this.log("info", "runtime.worker.start", { workerId: this.workerId })
+    this.log("info", "runtime.worker.start", {
+      workerId: this.workerId,
+      maxConcurrentActivations: maxConcurrentActivations ?? this.maxConcurrentActivations,
+    })
     this.count("durable.runtime.worker", { workerId: this.workerId, status: "start" })
 
     try {
@@ -318,7 +485,8 @@ export class DurableRuntime {
         let result: DrainResult
         try {
           result = await this.drain({
-            maxActivations: options.maxActivationsPerDrain,
+            maxActivations: maxActivationsPerDrain,
+            maxConcurrentActivations,
             signal: options.signal,
           })
         } catch (error) {
@@ -934,8 +1102,71 @@ export class DurableRuntime {
     }
   }
 
-  private async withLeaseHeartbeats<T>(
-    shardIds: number[],
+  private async runClaimedActivation(
+    activation: ClaimedActivation,
+    signal: AbortSignal,
+  ): Promise<ActivationTaskOutcome> {
+    try {
+      await this.withActivationHeartbeat(activation, signal, (activationSignal) =>
+        this.runActivation(activation, activationSignal),
+      )
+      return { kind: "handled", activation }
+    } catch (error) {
+      await this.releaseActivationQuietly(activation.activationId)
+      if (isActivityRetryScheduledError(error)) {
+        this.log("info", "runtime.activation.retry_scheduled", {
+          workerId: this.workerId,
+          workflowName: activation.workflowName,
+          workflowId: activation.workflowId,
+          runId: activation.runId,
+          activationId: activation.activationId,
+          nextAttemptAt: error.nextAttemptAt,
+        })
+        this.count(
+          "durable.runtime.activation",
+          this.activationTags(activation, "retry_scheduled"),
+        )
+        return { kind: "retry_scheduled", activation }
+      }
+
+      this.log("error", "runtime.activation.failed", {
+        workerId: this.workerId,
+        workflowName: activation.workflowName,
+        workflowId: activation.workflowId,
+        runId: activation.runId,
+        activationId: activation.activationId,
+        ...errorFields(error),
+      })
+      this.count("durable.runtime.activation", this.activationTags(activation, "failed"))
+      return { kind: "failed", activation, error }
+    }
+  }
+
+  private startDispatchShardHeartbeat(shardIds: number[]): DispatchHeartbeat {
+    let rejectHeartbeat: (error: unknown) => void = () => undefined
+    let failed = false
+    const failure = new Promise<never>((_resolve, reject) => {
+      rejectHeartbeat = reject
+    })
+    const timer = setInterval(() => {
+      void this.heartbeatDispatchShards(shardIds).catch((error) => {
+        if (!failed) {
+          failed = true
+          rejectHeartbeat(error)
+        }
+      })
+    }, this.leaseHeartbeatIntervalMs)
+    timer.unref?.()
+
+    return {
+      failure,
+      stop: () => {
+        clearInterval(timer)
+      },
+    }
+  }
+
+  private async withActivationHeartbeat<T>(
     activation: ClaimedActivation,
     externalSignal: AbortSignal | undefined,
     fn: (signal: AbortSignal) => Promise<T>,
@@ -955,30 +1186,29 @@ export class DurableRuntime {
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true })
 
     const timer = setInterval(() => {
-      void Promise.all([
-        this.heartbeatDispatchShards(shardIds),
-        this.provider.heartbeatActivation({
+      void this.provider
+        .heartbeatActivation({
           activationId: activation.activationId,
           workerId: this.workerId,
           now: this.now(),
           leaseMs: this.activationLeaseMs,
-        }),
-      ]).catch((error) => {
-        this.log("warn", "runtime.lease_heartbeat.failure", {
-          workerId: this.workerId,
-          workflowName: activation.workflowName,
-          workflowId: activation.workflowId,
-          runId: activation.runId,
-          activationId: activation.activationId,
-          ...errorFields(error),
         })
-        this.count("durable.runtime.lease_heartbeat", {
-          workerId: this.workerId,
-          workflowName: activation.workflowName,
-          status: "failed",
+        .catch((error) => {
+          this.log("warn", "runtime.lease_heartbeat.failure", {
+            workerId: this.workerId,
+            workflowName: activation.workflowName,
+            workflowId: activation.workflowId,
+            runId: activation.runId,
+            activationId: activation.activationId,
+            ...errorFields(error),
+          })
+          this.count("durable.runtime.lease_heartbeat", {
+            workerId: this.workerId,
+            workflowName: activation.workflowName,
+            status: "failed",
+          })
+          failActivation(error)
         })
-        failActivation(error)
-      })
     }, this.leaseHeartbeatIntervalMs)
     timer.unref?.()
 
@@ -1350,6 +1580,13 @@ function normalizeDispatchShardIds(
     }
   }
   return uniqueShardIds
+}
+
+function positiveInteger(value: number, name: string): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`)
+  }
+  return value
 }
 
 function activationEventKind(activation: ClaimedActivation): string | undefined {

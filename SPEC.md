@@ -926,6 +926,16 @@ Workers lease dispatch shards and poll only the shards they own. Shard leases ar
 
 TypeScript workers may optionally be configured with a fixed subset of dispatch shard IDs. This is useful for production deployments that assign shard ranges outside the runtime and for tests that need to prove multiple workers are actually committing activations from the same durable store.
 
+Worker identity and local execution concurrency are separate concerns. `workerId`
+is the durable lease owner recorded on shard leases, activation leases, and effect
+attempt ownership. Activation concurrency is a local worker setting that controls
+how many claimed activations that worker may execute at once.
+
+Activities currently execute inside activation slots. A long-running activity
+therefore occupies one activation slot until it completes, fails, retries, or is
+aborted. A later dedicated activity executor may add a separate activity
+concurrency limit without changing the durable worker identity model.
+
 ```ts
 type DispatchShardLease = {
   shardId: string

@@ -20,6 +20,7 @@ type BenchmarkOptions = {
   workflows: number
   workers: number
   shards: number
+  activationConcurrency: number
   batch: number
   maxRounds: number
   keepDb: boolean
@@ -57,6 +58,7 @@ const defaultOptions: BenchmarkOptions = {
   workflows: 250,
   workers: 4,
   shards: 4,
+  activationConcurrency: 4,
   batch: 32,
   maxRounds: 10_000,
   keepDb: false,
@@ -67,7 +69,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards...\n\n`,
+      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}...\n\n`,
     )
   }
   const result = await runSqliteBenchmark(options)
@@ -207,6 +209,7 @@ async function runSqliteBenchmark(options: BenchmarkOptions): Promise<BenchmarkR
       workerId: `bench-worker-${workerIndex}`,
       shardCount: options.shards,
       dispatchShardIds: dispatchShardIdsForWorker(workerIndex, options.workers, options.shards),
+      maxConcurrentActivations: options.activationConcurrency,
       dispatchLeaseMs: 30_000,
       activationLeaseMs: 30_000,
     })
@@ -344,6 +347,8 @@ function parseArgs(args: string[]): BenchmarkOptions {
       options.workers = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--shards") {
       options.shards = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--activation-concurrency") {
+      options.activationConcurrency = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--batch") {
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
@@ -376,6 +381,8 @@ Options:
   --workflows <n>   Parent workflow count. Default: ${defaultOptions.workflows}
   --workers <n>     Logical in-process worker count. Default: ${defaultOptions.workers}
   --shards <n>      Dispatch shard count. Default: ${defaultOptions.shards}
+  --activation-concurrency <n>
+                    Max concurrent activations per worker. Default: ${defaultOptions.activationConcurrency}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
   --keep-db         Keep the temporary SQLite database and print its path.
@@ -393,6 +400,7 @@ function printResult(result: BenchmarkResult): void {
   workers: ${result.options.workers} logical in-process workers
   committed workers: ${result.committedWorkers}
   shards: ${result.options.shards}
+  activation concurrency: ${result.options.activationConcurrency} per worker
   batch: ${result.options.batch}
   rounds: ${result.rounds}
   elapsed: ${formatMs(result.elapsedMs)}

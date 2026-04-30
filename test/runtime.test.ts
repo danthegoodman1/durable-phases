@@ -79,6 +79,16 @@ async function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void>
   }
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+  return { promise, resolve, reject }
+}
+
 type LogEntry = {
   level: keyof DurableLogger
   event: string
@@ -696,7 +706,13 @@ describe("durable workflow PoC", () => {
       "provider.effect.complete",
       "provider.checkpoint.commit",
     ])
+    expect(observed.logs.find((entry) => entry.event === "runtime.drain.start")?.fields).toMatchObject({
+      maxConcurrentActivations: 4,
+    })
     expect(observed.metricEntries.some((entry) => entry.name === "durable.runtime.activity")).toBe(true)
+    expect(
+      observed.metricEntries.some((entry) => entry.name === "durable.runtime.activation.in_flight"),
+    ).toBe(true)
     expect(observed.metricEntries.some((entry) => entry.name === "durable.provider.checkpoint")).toBe(true)
     expectNoHighCardinalityMetricTags(observed.metricEntries)
   })
@@ -959,6 +975,30 @@ describe("durable workflow PoC", () => {
           dispatchShardIds: [2],
         }),
     ).toThrow("dispatchShardIds must be integers between 0 and 1")
+  })
+
+  it("validates activation concurrency and activation limits", async () => {
+    const provider = testProvider(await storePath())
+    expect(() => new DurableRuntime(provider, { maxConcurrentActivations: 0 })).toThrow(
+      "maxConcurrentActivations must be a positive integer",
+    )
+    expect(() => new DurableRuntime(provider, { maxConcurrentActivations: 1.5 })).toThrow(
+      "maxConcurrentActivations must be a positive integer",
+    )
+
+    const runtime = new DurableRuntime(provider)
+    await expect(runtime.drain({ maxActivations: 0 })).rejects.toThrow(
+      "maxActivations must be a positive integer",
+    )
+    await expect(runtime.drain({ maxConcurrentActivations: 0 })).rejects.toThrow(
+      "maxConcurrentActivations must be a positive integer",
+    )
+    await expect(runtime.runWorker({ maxActivationsPerDrain: 0 })).rejects.toThrow(
+      "maxActivationsPerDrain must be a positive integer",
+    )
+    await expect(runtime.runWorker({ maxConcurrentActivations: 0 })).rejects.toThrow(
+      "maxConcurrentActivations must be a positive integer",
+    )
   })
 
   const soakIt = process.env.DURABLE_SOAK === "1" ? it : it.skip
@@ -3336,6 +3376,366 @@ describe("durable workflow PoC", () => {
     })
     expect(signalSleeps[0]).toBe(50)
     expect(await signalProvider.loadInstance(ref)).toMatchObject({ status: "completed" })
+  })
+
+  it("runs multiple ready activations concurrently by default", async () => {
+    const started: number[] = []
+    let inFlight = 0
+    let maxInFlight = 0
+    let releaseImmediately = false
+    const releases = new Map<number, () => void>()
+    const ConcurrentWorkflow = defineWorkflow({
+      name: "default_activation_concurrency",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            started.push(common.index)
+            inFlight += 1
+            maxInFlight = Math.max(maxInFlight, inFlight)
+            if (!releaseImmediately) {
+              await new Promise<void>((resolve) => {
+                releases.set(common.index, resolve)
+              })
+            }
+            inFlight -= 1
+            return complete({ index: common.index })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ConcurrentWorkflow],
+      workerId: "default-concurrency-worker",
+    })
+    const refs = await Promise.all(
+      Array.from({ length: 4 }, (_value, index) =>
+        runtime.start(ConcurrentWorkflow, { index }, { workflowId: `default-concurrency-${index}` }),
+      ),
+    )
+
+    const draining = runtime.drain({ maxActivations: 4 })
+    await waitFor(() => started.length >= 2)
+    expect(maxInFlight).toBeGreaterThanOrEqual(2)
+    releaseImmediately = true
+    for (const release of releases.values()) {
+      release()
+    }
+    await expect(draining).resolves.toEqual({ activations: 4 })
+    await expect(Promise.all(refs.map((ref) => provider.loadInstance(ref)))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "completed", output: { index: 0 } }),
+        expect.objectContaining({ status: "completed", output: { index: 1 } }),
+        expect.objectContaining({ status: "completed", output: { index: 2 } }),
+        expect.objectContaining({ status: "completed", output: { index: 3 } }),
+      ]),
+    )
+  })
+
+  it("enforces drain and runWorker activation concurrency overrides", async () => {
+    const started: number[] = []
+    let inFlight = 0
+    let maxInFlight = 0
+    let releaseImmediately = false
+    const releases = new Map<number, () => void>()
+    const LimitedWorkflow = defineWorkflow({
+      name: "limited_activation_concurrency",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            started.push(common.index)
+            inFlight += 1
+            maxInFlight = Math.max(maxInFlight, inFlight)
+            if (!releaseImmediately) {
+              await new Promise<void>((resolve) => {
+                releases.set(common.index, resolve)
+              })
+            }
+            inFlight -= 1
+            return complete({ index: common.index })
+          },
+        }),
+      },
+    })
+
+    const drainProvider = testProvider(await storePath())
+    const drainRuntime = new DurableRuntime(drainProvider, {
+      workflows: [LimitedWorkflow],
+      workerId: "drain-concurrency-worker",
+      maxConcurrentActivations: 8,
+    })
+    await Promise.all(
+      Array.from({ length: 6 }, (_value, index) =>
+        drainRuntime.start(LimitedWorkflow, { index }, { workflowId: `drain-limit-${index}` }),
+      ),
+    )
+    const draining = drainRuntime.drain({
+      maxActivations: 6,
+      maxConcurrentActivations: 2,
+    })
+    await waitFor(() => started.length === 2)
+    expect(maxInFlight).toBe(2)
+    releaseImmediately = true
+    for (const release of releases.values()) {
+      release()
+    }
+    await expect(draining).resolves.toEqual({ activations: 6 })
+    expect(maxInFlight).toBeLessThanOrEqual(2)
+
+    started.length = 0
+    inFlight = 0
+    maxInFlight = 0
+    releaseImmediately = false
+    releases.clear()
+    const workerProvider = testProvider(await storePath())
+    const workerRuntime = new DurableRuntime(workerProvider, {
+      workflows: [LimitedWorkflow],
+      workerId: "worker-concurrency-worker",
+      maxConcurrentActivations: 1,
+    })
+    await Promise.all(
+      Array.from({ length: 4 }, (_value, index) =>
+        workerRuntime.start(LimitedWorkflow, { index }, { workflowId: `worker-limit-${index}` }),
+      ),
+    )
+    const abort = new AbortController()
+    const worker = workerRuntime.runWorker({
+      signal: abort.signal,
+      maxActivationsPerDrain: 4,
+      maxConcurrentActivations: 3,
+      minPollIntervalMs: 1,
+      maxPollIntervalMs: 1,
+      jitterRatio: 0,
+      sleep: async () => {
+        abort.abort()
+      },
+    })
+    await waitFor(() => started.length === 3)
+    expect(maxInFlight).toBe(3)
+    releaseImmediately = true
+    for (const release of releases.values()) {
+      release()
+    }
+    await expect(worker).resolves.toEqual({ activations: 4 })
+    expect(maxInFlight).toBeLessThanOrEqual(3)
+  })
+
+  it("does not let a long activity block another activation in the same worker", async () => {
+    const slowStarted = deferred()
+    const releaseSlow = deferred()
+    let fastCompleted = false
+    const ActivityConcurrencyWorkflow = defineWorkflow({
+      name: "activity_slot_concurrency",
+      version: 1,
+      input: z.object({ kind: z.enum(["slow", "fast"]) }),
+      output: z.object({ kind: z.string() }),
+      common: z.object({ kind: z.enum(["slow", "fast"]) }),
+      initial(input) {
+        return start({ common: { kind: input.kind }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            if (common.kind === "slow") {
+              await ctx.activity("slow", async () => {
+                slowStarted.resolve()
+                await releaseSlow.promise
+                return "slow"
+              })
+            } else {
+              await ctx.activity("fast", async () => {
+                fastCompleted = true
+                return "fast"
+              })
+            }
+            return complete({ kind: common.kind })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ActivityConcurrencyWorkflow],
+      workerId: "activity-slot-worker",
+      maxConcurrentActivations: 2,
+    })
+    const slowRef = await runtime.start(ActivityConcurrencyWorkflow, { kind: "slow" }, { workflowId: "a-slow" })
+    const fastRef = await runtime.start(ActivityConcurrencyWorkflow, { kind: "fast" }, { workflowId: "b-fast" })
+    const draining = runtime.drain({ maxActivations: 2 })
+
+    await slowStarted.promise
+    await waitFor(() => fastCompleted)
+    expect(await provider.loadInstance(fastRef)).toMatchObject({ status: "completed" })
+    expect(await provider.loadInstance(slowRef)).toMatchObject({ status: "running" })
+    releaseSlow.resolve()
+    await expect(draining).resolves.toEqual({ activations: 2 })
+    expect(await provider.loadInstance(slowRef)).toMatchObject({ status: "completed" })
+  })
+
+  it("does not execute competing events for one workflow sequence concurrently", async () => {
+    const clock = manualClock()
+    let inFlight = 0
+    let maxInFlight = 0
+    const CompetingWorkflow = defineWorkflow({
+      name: "competing_event_runtime",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ winner: z.string() }),
+      initial() {
+        return start({ phase: "waiting", data: { wakeAt: "2026-01-01T00:00:00.000Z" } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ wakeAt: z.string() }),
+          on: {
+            finish: signal(z.object({}), async () => {
+              inFlight += 1
+              maxInFlight = Math.max(maxInFlight, inFlight)
+              await new Promise((resolve) => setTimeout(resolve, 1))
+              inFlight -= 1
+              return complete({ winner: "signal" })
+            }),
+            wake: timer(
+              ({ data }) => data.wakeAt,
+              async () => {
+                inFlight += 1
+                maxInFlight = Math.max(maxInFlight, inFlight)
+                await new Promise((resolve) => setTimeout(resolve, 1))
+                inFlight -= 1
+                return complete({ winner: "timer" })
+              },
+            ),
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [CompetingWorkflow],
+      workerId: "competing-event-worker",
+      maxConcurrentActivations: 4,
+    })
+    const ref = await runtime.start(CompetingWorkflow, {}, { workflowId: "competing-event-runtime" })
+    await runtime.signal(CompetingWorkflow, ref, "finish", {})
+
+    await expect(runtime.drain({ maxActivations: 2 })).resolves.toEqual({ activations: 1 })
+    expect(maxInFlight).toBe(1)
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "completed" })
+  })
+
+  it("keeps retry scheduling local and aborts sibling activations on handler errors", async () => {
+    const retryCalls: string[] = []
+    const RetryAndSiblingWorkflow = defineWorkflow({
+      name: "concurrent_retry_sibling",
+      version: 1,
+      input: z.object({ kind: z.enum(["retry", "ok"]) }),
+      output: z.object({ kind: z.string() }),
+      common: z.object({ kind: z.enum(["retry", "ok"]) }),
+      initial(input) {
+        return start({ common: { kind: input.kind }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            if (common.kind === "retry") {
+              await ctx.activity(
+                "retry",
+                () => {
+                  retryCalls.push("retry")
+                  throw new Error("retry me")
+                },
+                { retry: { maxAttempts: 2, initialIntervalMs: 1 } },
+              )
+            }
+            return complete({ kind: common.kind })
+          },
+        }),
+      },
+    })
+
+    const retryProvider = testProvider(await storePath())
+    const retryRuntime = new DurableRuntime(retryProvider, {
+      workflows: [RetryAndSiblingWorkflow],
+      workerId: "retry-sibling-worker",
+      maxConcurrentActivations: 2,
+    })
+    const retryRef = await retryRuntime.start(RetryAndSiblingWorkflow, { kind: "retry" }, { workflowId: "a-retry" })
+    const okRef = await retryRuntime.start(RetryAndSiblingWorkflow, { kind: "ok" }, { workflowId: "b-ok" })
+    await expect(retryRuntime.drain({ maxActivations: 2 })).resolves.toEqual({ activations: 2 })
+    expect(retryCalls).toEqual(["retry"])
+    expect(await retryProvider.loadInstance(okRef)).toMatchObject({ status: "completed" })
+    expect(await retryProvider.loadInstance(retryRef)).toMatchObject({
+      status: "running",
+      sequence: 0,
+    })
+
+    const siblingStarted = deferred()
+    let siblingAborted = false
+    const ErrorWorkflow = defineWorkflow({
+      name: "concurrent_error_abort",
+      version: 1,
+      input: z.object({ kind: z.enum(["bad", "sibling"]) }),
+      output: z.object({ kind: z.string() }),
+      common: z.object({ kind: z.enum(["bad", "sibling"]) }),
+      initial(input) {
+        return start({ common: { kind: input.kind }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            if (common.kind === "bad") {
+              await siblingStarted.promise
+              throw new Error("boom")
+            }
+            await ctx.activity("cooperative", async ({ signal: activitySignal }) => {
+              siblingStarted.resolve()
+              await new Promise((_resolve, reject) => {
+                activitySignal.addEventListener(
+                  "abort",
+                  () => {
+                    siblingAborted = true
+                    reject(activitySignal.reason ?? new Error("aborted"))
+                  },
+                  { once: true },
+                )
+              })
+            })
+            return complete({ kind: common.kind })
+          },
+        }),
+      },
+    })
+
+    const errorProvider = testProvider(await storePath())
+    const errorRuntime = new DurableRuntime(errorProvider, {
+      workflows: [ErrorWorkflow],
+      workerId: "error-abort-worker",
+      maxConcurrentActivations: 2,
+    })
+    const badRef = await errorRuntime.start(ErrorWorkflow, { kind: "bad" }, { workflowId: "a-bad" })
+    const siblingRef = await errorRuntime.start(ErrorWorkflow, { kind: "sibling" }, { workflowId: "b-sibling" })
+    await expect(errorRuntime.drain({ maxActivations: 2 })).rejects.toThrow("boom")
+    expect(siblingAborted).toBe(true)
+    expect(await errorProvider.loadInstance(badRef)).toMatchObject({ status: "running", sequence: 0 })
+    expect(await errorProvider.loadInstance(siblingRef)).toMatchObject({ status: "running", sequence: 0 })
   })
 
   it("heartbeats long activations and releases dispatch shards after drain", async () => {
