@@ -5,9 +5,12 @@ import type {
   ClaimedActivation,
   ClaimedActivationWithInstance,
   ConflictPolicy,
+  CheckpointEffectMutation,
   CommitCheckpointResult,
+  CommitActivationInput,
   DurabilityProvider,
   DurableWait,
+  EffectRecord,
   PersistedInstance,
   SignalRecord,
 } from "./interface.js"
@@ -56,6 +59,7 @@ export type DurableRuntimeOptions = DurableObservability & {
   dispatchShardIds?: number[]
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
+  activationCommitBatchSize?: number
   dispatchLeaseMs?: number
   activationLeaseMs?: number
   leaseHeartbeatIntervalMs?: number
@@ -72,6 +76,7 @@ export type RunWorkerOptions = {
   maxActivationsPerDrain?: number
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
+  activationCommitBatchSize?: number
   minPollIntervalMs?: number
   maxPollIntervalMs?: number
   jitterRatio?: number
@@ -83,6 +88,7 @@ export type DrainOptions = {
   maxActivations?: number
   maxConcurrentActivations?: number
   activationPrefetchLimit?: number
+  activationCommitBatchSize?: number
   signal?: AbortSignal
 }
 
@@ -123,6 +129,80 @@ type QueuedActivationHeartbeatFailure = {
 
 type DrainTaskEvent = ActivationTaskSettled | DispatchHeartbeatFailure | QueuedActivationHeartbeatFailure
 
+type ActivationEffectLedger = {
+  initial: Map<string, EffectRecord>
+  mutations: Map<string, CheckpointEffectMutation>
+}
+
+type PendingCommit = {
+  input: CommitActivationInput
+  resolve(result: CommitCheckpointResult): void
+  reject(error: unknown): void
+}
+
+class ActivationCommitBatcher {
+  private pending: PendingCommit[] = []
+  private scheduled = false
+  private flushing = false
+
+  constructor(
+    private readonly provider: DurabilityProvider,
+    private readonly batchSize: number,
+  ) {}
+
+  commit(input: CommitActivationInput): Promise<CommitCheckpointResult> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ input, resolve, reject })
+      if (this.pending.length >= this.batchSize) {
+        void this.flush()
+        return
+      }
+      this.schedule()
+    })
+  }
+
+  private schedule(): void {
+    if (this.scheduled) {
+      return
+    }
+    this.scheduled = true
+    setImmediate(() => {
+      this.scheduled = false
+      void this.flush()
+    })
+  }
+
+  private async flush(): Promise<void> {
+    if (this.flushing || this.pending.length === 0) {
+      return
+    }
+    this.scheduled = false
+    this.flushing = true
+    const batch = this.pending.splice(0, this.batchSize)
+    try {
+      const output = await this.provider.commitActivations(batch.map((item) => item.input))
+      const byActivation = new Map(output.results.map((result) => [result.activationId, result]))
+      batch.forEach((item, index) => {
+        const result = byActivation.get(item.input.activationId) ?? output.results[index]
+        if (!result) {
+          item.reject(new Error(`Missing commit result for activation ${item.input.activationId}`))
+          return
+        }
+        item.resolve(result)
+      })
+    } catch (error) {
+      for (const item of batch) {
+        item.reject(error)
+      }
+    } finally {
+      this.flushing = false
+      if (this.pending.length > 0) {
+        this.schedule()
+      }
+    }
+  }
+}
+
 export class DurableRuntime {
   private readonly workflows = new Map<string, AnyWorkflow>()
   private readonly clock: () => Date
@@ -131,6 +211,7 @@ export class DurableRuntime {
   private readonly dispatchShardIds: number[]
   private readonly maxConcurrentActivations: number
   private readonly activationPrefetchLimit: number
+  private readonly activationCommitBatchSize: number
   private readonly dispatchLeaseMs: number
   private readonly activationLeaseMs: number
   private readonly leaseHeartbeatIntervalMs: number
@@ -154,6 +235,10 @@ export class DurableRuntime {
     this.activationPrefetchLimit = positiveInteger(
       options.activationPrefetchLimit ?? 32,
       "activationPrefetchLimit",
+    )
+    this.activationCommitBatchSize = positiveInteger(
+      options.activationCommitBatchSize ?? 32,
+      "activationCommitBatchSize",
     )
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
     this.activationLeaseMs = options.activationLeaseMs ?? 30_000
@@ -303,6 +388,10 @@ export class DurableRuntime {
       options.activationPrefetchLimit ?? this.activationPrefetchLimit,
       "activationPrefetchLimit",
     )
+    const activationCommitBatchSize = positiveInteger(
+      options.activationCommitBatchSize ?? this.activationCommitBatchSize,
+      "activationCommitBatchSize",
+    )
     let activations = 0
     let totalClaimed = 0
     let nextWakeAt: string | undefined
@@ -311,6 +400,7 @@ export class DurableRuntime {
       maxActivations,
       maxConcurrentActivations,
       activationPrefetchLimit,
+      activationCommitBatchSize,
     })
 
     if (shardIds.length === 0) {
@@ -318,6 +408,7 @@ export class DurableRuntime {
         workerId: this.workerId,
         maxConcurrentActivations,
         activationPrefetchLimit,
+        activationCommitBatchSize,
       })
       this.count("durable.runtime.drain", { workerId: this.workerId, status: "no_shards" })
       this.histogram("durable.runtime.drain.duration_ms", Date.now() - startedAt, {
@@ -340,6 +431,7 @@ export class DurableRuntime {
 
     const tasks = new Set<ActivationTask>()
     const queuedClaims: ClaimedActivationWithInstance[] = []
+    const commitBatcher = new ActivationCommitBatcher(this.provider, activationCommitBatchSize)
     const queuedHeartbeat = this.startQueuedActivationHeartbeat(() =>
       queuedClaims.map((claim) => claim.activation.activationId),
     )
@@ -366,11 +458,15 @@ export class DurableRuntime {
     }
 
     const startActivation = (claim: ClaimedActivationWithInstance) => {
-      const { activation, instance } = claim
+      const { activation, instance, effects } = claim
       const task: ActivationTask = {
-        promise: this.runClaimedActivation(activation, instance, drainController.signal).catch(
-          (error: unknown): ActivationTaskOutcome => ({ kind: "failed", activation, error }),
-        ),
+        promise: this.runClaimedActivation(
+          activation,
+          instance,
+          effects,
+          commitBatcher,
+          drainController.signal,
+        ).catch((error: unknown): ActivationTaskOutcome => ({ kind: "failed", activation, error })),
       }
       tasks.add(task)
       this.gauge("durable.runtime.activation.in_flight", tasks.size, {
@@ -612,6 +708,10 @@ export class DurableRuntime {
       options.activationPrefetchLimit === undefined
         ? undefined
         : positiveInteger(options.activationPrefetchLimit, "activationPrefetchLimit")
+    const activationCommitBatchSize =
+      options.activationCommitBatchSize === undefined
+        ? undefined
+        : positiveInteger(options.activationCommitBatchSize, "activationCommitBatchSize")
     const minPollIntervalMs = options.minPollIntervalMs ?? 10
     const maxPollIntervalMs = options.maxPollIntervalMs ?? 1_000
     const jitterRatio = options.jitterRatio ?? 0.1
@@ -624,6 +724,7 @@ export class DurableRuntime {
       workerId: this.workerId,
       maxConcurrentActivations: maxConcurrentActivations ?? this.maxConcurrentActivations,
       activationPrefetchLimit: activationPrefetchLimit ?? this.activationPrefetchLimit,
+      activationCommitBatchSize: activationCommitBatchSize ?? this.activationCommitBatchSize,
     })
     this.count("durable.runtime.worker", { workerId: this.workerId, status: "start" })
 
@@ -657,6 +758,7 @@ export class DurableRuntime {
             maxActivations: maxActivationsPerDrain,
             maxConcurrentActivations,
             activationPrefetchLimit,
+            activationCommitBatchSize,
             signal: options.signal,
           }, dispatchFailure)
         } catch (error) {
@@ -783,6 +885,8 @@ export class DurableRuntime {
   private async runActivation(
     activation: ClaimedActivation,
     latest: ActivationInstanceSnapshot,
+    effects: EffectRecord[],
+    commitBatcher: ActivationCommitBatcher,
     signal: AbortSignal,
   ): Promise<void> {
     this.log("debug", "runtime.activation.started", () => ({
@@ -839,6 +943,7 @@ export class DurableRuntime {
     }
 
     if (activation.kind === "migration") {
+      const effectLedger = this.activationEffectLedger(effects)
       const next = await this.migrateSnapshot(workflow, latest)
       const commitTime = this.now()
       const waits = this.materializeWaits(
@@ -846,7 +951,9 @@ export class DurableRuntime {
         { workflowId: latest.workflowId, runId: latest.runId, updatedAt: commitTime },
         next,
       )
-      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime)
+      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
+        effects: [...effectLedger.mutations.values()],
+      }, commitBatcher)
       return
     }
 
@@ -862,12 +969,14 @@ export class DurableRuntime {
     }
 
     const data = trustedJsonCopy(phaseSnapshot.data)
+    const effectLedger = this.activationEffectLedger(effects)
     const ctx = this.contextFor(
       workflow,
       latest,
       activation.activationId,
       activation.activationTime,
       signal,
+      effectLedger,
     )
     let transition: TransitionCommand
     let consumeSignalId: string | undefined
@@ -923,7 +1032,8 @@ export class DurableRuntime {
     await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
       consumeSignalId,
       consumeChildRecordId,
-    })
+      effects: [...effectLedger.mutations.values()],
+    }, commitBatcher)
   }
 
   private async commitOrDiscard(
@@ -933,9 +1043,14 @@ export class DurableRuntime {
     next: InstanceStatus<any>,
     waits: DurableWait[],
     now: string,
-    options: { consumeSignalId?: string; consumeChildRecordId?: string } = {},
+    options: {
+      consumeSignalId?: string
+      consumeChildRecordId?: string
+      effects?: CheckpointEffectMutation[]
+    } = {},
+    commitBatcher?: ActivationCommitBatcher,
   ): Promise<CommitCheckpointResult> {
-    const result = await this.provider.commitCheckpoint({
+    const input: CommitActivationInput = {
       workflowId: latest.workflowId,
       runId: latest.runId,
       expectedSequence: latest.sequence,
@@ -947,7 +1062,13 @@ export class DurableRuntime {
       now,
       consumeSignalId: options.consumeSignalId,
       consumeChildRecordId: options.consumeChildRecordId,
-    })
+      effects: options.effects,
+    }
+    const result =
+      commitBatcher
+        ? await commitBatcher.commit(input)
+        : (await this.provider.commitActivations([input])).results[0] ??
+          { ok: false, sequence: latest.sequence, reason: "missing_commit_result" }
 
     if (!result.ok) {
       this.log("warn", "runtime.activation.commit_conflict", () => ({
@@ -988,12 +1109,273 @@ export class DurableRuntime {
     return result
   }
 
+  private activationEffectLedger(effects: EffectRecord[]): ActivationEffectLedger {
+    return {
+      initial: new Map(effects.map((effect) => [effect.key, effect])),
+      mutations: new Map(),
+    }
+  }
+
+  private async runCheckpointActivity<T>(
+    workflow: AnyWorkflow,
+    instance: ActivationInstanceSnapshot,
+    activationId: string,
+    activationSignal: AbortSignal,
+    ledger: ActivationEffectLedger,
+    key: string,
+    fn: (ctx: ActivityContext) => Promise<T> | T,
+    options?: ActivityOptions,
+  ): Promise<T> {
+    const existing = ledger.mutations.get(key) ?? ledger.initial.get(key)
+    if (existing?.status === "completed") {
+      this.log("debug", "runtime.activity.memoized", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        workflowId: instance.workflowId,
+        runId: instance.runId,
+        activationId,
+        key,
+        durability: "checkpoint",
+      }))
+      this.count("durable.runtime.activity", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        status: "memoized",
+      }))
+      return clone(existing.result) as T
+    }
+
+    if (existing?.status === "failed") {
+      const storedError = existing.error ?? { message: "Activity failed" }
+      const error = errorFromSerialized(storedError)
+      this.log("warn", "runtime.activity.failed", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        workflowId: instance.workflowId,
+        runId: instance.runId,
+        activationId,
+        key,
+        error: storedError,
+        durability: "checkpoint",
+      }))
+      this.count("durable.runtime.activity", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        status: "failed",
+      }))
+      throw error
+    }
+
+    if (existing?.status === "retry_scheduled" && existing.nextAttemptAt > this.now()) {
+      throw new ActivityRetryScheduledError(existing.nextAttemptAt)
+    }
+    if (existing?.status === "pending" && existing.nextAttemptAt && existing.nextAttemptAt > this.now()) {
+      throw new ActivityRetryScheduledError(existing.nextAttemptAt)
+    }
+
+    const normalized = normalizeLocalActivityOptions(options)
+    const firstAttemptStartedAt = effectFirstAttemptStartedAt(existing) ?? this.now()
+    const attempt =
+      existing?.status === "retry_scheduled"
+        ? existing.nextAttempt
+        : existing?.attempt ?? 1
+    const idempotencyKey =
+      existing?.idempotencyKey ?? `${instance.workflowId}/${instance.runId}/${activationId}/${key}`
+    let heartbeatDetails =
+      existing && "heartbeatDetails" in existing ? clone(existing.heartbeatDetails) : undefined
+
+    this.log("debug", "runtime.activity.reserved", () => ({
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      workflowId: instance.workflowId,
+      runId: instance.runId,
+      activationId,
+      key,
+      attempt,
+      durability: "checkpoint",
+    }))
+    this.count("durable.runtime.activity", () => ({
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      status: "reserved",
+    }))
+
+    const activityContext: ActivityContext = {
+      heartbeat: async (details?: JsonValue): Promise<void> => {
+        if (activationSignal.aborted) {
+          throw abortError()
+        }
+        heartbeatDetails = details === undefined ? undefined : toJson(details)
+        this.log("debug", "runtime.activity.heartbeat", () => ({
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId,
+          key,
+          durability: "checkpoint",
+        }))
+        this.count("durable.runtime.activity", () => ({
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          status: "heartbeat",
+        }))
+      },
+      heartbeatDetails,
+      idempotencyKey,
+      attempt,
+      signal: activationSignal,
+    }
+
+    let result: T
+    try {
+      if (activationSignal.aborted) {
+        throw abortError()
+      }
+      result = await fn(activityContext)
+    } catch (error) {
+      if (activationSignal.aborted) {
+        throw error
+      }
+      const serialized = serializeError(error)
+      const retry = localRetryDecision(
+        {
+          attempt,
+          firstAttemptStartedAt,
+          maxAttempts: normalized.maxAttempts,
+          maxElapsedMs: normalized.maxElapsedMs,
+          initialIntervalMs: normalized.initialIntervalMs,
+          maxIntervalMs: normalized.maxIntervalMs,
+          backoffCoefficient: normalized.backoffCoefficient,
+          nonRetryableErrorNames: normalized.nonRetryableErrorNames,
+        },
+        serialized,
+        this.now(),
+        !isNonRetryableActivityError(error),
+      )
+      const mutation: CheckpointEffectMutation =
+        retry.status === "retry_scheduled"
+          ? {
+              key,
+              status: "retry_scheduled",
+              error: serialized,
+              nextAttemptAt: retry.nextAttemptAt,
+              nextAttempt: retry.nextAttempt,
+              heartbeatDetails,
+              attempt,
+              idempotencyKey,
+              firstAttemptStartedAt,
+              maxAttempts: normalized.maxAttempts,
+              maxElapsedMs: normalized.maxElapsedMs,
+              initialIntervalMs: normalized.initialIntervalMs,
+              maxIntervalMs: normalized.maxIntervalMs,
+              backoffCoefficient: normalized.backoffCoefficient,
+              nonRetryableErrorNames: normalized.nonRetryableErrorNames,
+            }
+          : {
+              key,
+              status: "failed",
+              error: serialized,
+              retryable: false,
+              heartbeatDetails,
+              attempt,
+              idempotencyKey,
+              firstAttemptStartedAt,
+              maxAttempts: normalized.maxAttempts,
+              maxElapsedMs: normalized.maxElapsedMs,
+              initialIntervalMs: normalized.initialIntervalMs,
+              maxIntervalMs: normalized.maxIntervalMs,
+              backoffCoefficient: normalized.backoffCoefficient,
+              nonRetryableErrorNames: normalized.nonRetryableErrorNames,
+            }
+      ledger.mutations.set(key, mutation)
+      await this.provider.recordActivationFailures([
+        {
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId,
+          workerId: this.workerId,
+          now: this.now(),
+          effects: [mutation],
+          releaseActivation: true,
+        },
+      ])
+      if (retry.status === "retry_scheduled") {
+        this.log("info", "runtime.activity.retry_scheduled", () => ({
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          workflowId: instance.workflowId,
+          runId: instance.runId,
+          activationId,
+          key,
+          nextAttemptAt: retry.nextAttemptAt,
+          durability: "checkpoint",
+        }))
+        this.count("durable.runtime.activity", () => ({
+          workerId: this.workerId,
+          workflowName: workflow.name,
+          status: "retry_scheduled",
+        }))
+        throw new ActivityRetryScheduledError(retry.nextAttemptAt)
+      }
+
+      this.log("error", "runtime.activity.failed", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        workflowId: instance.workflowId,
+        runId: instance.runId,
+        activationId,
+        key,
+        durability: "checkpoint",
+        ...errorFields(error),
+      }))
+      this.count("durable.runtime.activity", () => ({
+        workerId: this.workerId,
+        workflowName: workflow.name,
+        status: "failed",
+      }))
+      throw error
+    }
+
+    ledger.mutations.set(key, {
+      key,
+      status: "completed",
+      result: toJson(result),
+      heartbeatDetails,
+      attempt,
+      idempotencyKey,
+      firstAttemptStartedAt,
+      maxAttempts: normalized.maxAttempts,
+      maxElapsedMs: normalized.maxElapsedMs,
+      initialIntervalMs: normalized.initialIntervalMs,
+      maxIntervalMs: normalized.maxIntervalMs,
+      backoffCoefficient: normalized.backoffCoefficient,
+      nonRetryableErrorNames: normalized.nonRetryableErrorNames,
+    })
+    this.log("debug", "runtime.activity.completed", () => ({
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      workflowId: instance.workflowId,
+      runId: instance.runId,
+      activationId,
+      key,
+      durability: "checkpoint",
+    }))
+    this.count("durable.runtime.activity", () => ({
+      workerId: this.workerId,
+      workflowName: workflow.name,
+      status: "completed",
+    }))
+    return result
+  }
+
   private contextFor(
     workflow: AnyWorkflow,
     instance: ActivationInstanceSnapshot,
     currentActivationId: string,
     activationTime: string,
     activationSignal: AbortSignal,
+    effects: ActivationEffectLedger,
   ): DurableContext {
     return {
       now: () => activationTime,
@@ -1002,6 +1384,19 @@ export class DurableRuntime {
         fn: (ctx: ActivityContext) => Promise<T> | T,
         options?: ActivityOptions,
       ): Promise<T> => {
+        if (activityDurability(options) === "checkpoint") {
+          return this.runCheckpointActivity(
+            workflow,
+            instance,
+            currentActivationId,
+            activationSignal,
+            effects,
+            key,
+            fn,
+            options,
+          )
+        }
+
         const reservation = await this.provider.getOrReserveEffect({
           workflowId: instance.workflowId,
           runId: instance.runId,
@@ -1283,11 +1678,13 @@ export class DurableRuntime {
   private async runClaimedActivation(
     activation: ClaimedActivation,
     instance: ActivationInstanceSnapshot,
+    effects: EffectRecord[],
+    commitBatcher: ActivationCommitBatcher,
     signal: AbortSignal,
   ): Promise<ActivationTaskOutcome> {
     try {
       await this.withActivationHeartbeat(activation, signal, (activationSignal) =>
-        this.runActivation(activation, instance, activationSignal),
+        this.runActivation(activation, instance, effects, commitBatcher, activationSignal),
       )
       return { kind: "handled", activation }
     } catch (error) {
@@ -1975,6 +2372,121 @@ function isActivityRetryScheduledError(error: unknown): error is ActivityRetrySc
 
 function isNonRetryableActivityError(error: unknown): boolean {
   return isNonRetryableError(error) || isAbortError(error)
+}
+
+function activityDurability(options?: ActivityOptions): "checkpoint" | "eager" {
+  if (
+    options?.durability === "eager" ||
+    options?.startToCloseTimeoutMs !== undefined ||
+    options?.heartbeatTimeoutMs !== undefined
+  ) {
+    return "eager"
+  }
+  return "checkpoint"
+}
+
+type LocalActivityOptions = {
+  maxAttempts: number
+  maxElapsedMs: number | null
+  initialIntervalMs: number
+  maxIntervalMs: number
+  backoffCoefficient: number
+  nonRetryableErrorNames: string[]
+}
+
+function normalizeLocalActivityOptions(options?: ActivityOptions): LocalActivityOptions {
+  const retry = options?.retry
+  const maxAttempts = retry?.maxAttempts ?? 3
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error("activity retry.maxAttempts must be a positive integer")
+  }
+  const initialIntervalMs = retry?.initialIntervalMs ?? 1_000
+  const maxIntervalMs = retry?.maxIntervalMs ?? 30_000
+  const backoffCoefficient = retry?.backoffCoefficient ?? 2
+  const maxElapsedMs = retry?.maxElapsedMs ?? null
+  if (!Number.isInteger(initialIntervalMs) || initialIntervalMs < 0) {
+    throw new Error("activity retry.initialIntervalMs must be a non-negative integer")
+  }
+  if (maxIntervalMs !== null && (!Number.isInteger(maxIntervalMs) || maxIntervalMs < 0)) {
+    throw new Error("activity retry.maxIntervalMs must be a non-negative integer when provided")
+  }
+  if (maxElapsedMs !== null && (!Number.isInteger(maxElapsedMs) || maxElapsedMs <= 0)) {
+    throw new Error("activity retry.maxElapsedMs must be a positive integer when provided")
+  }
+  if (typeof backoffCoefficient !== "number" || backoffCoefficient < 1) {
+    throw new Error("activity retry.backoffCoefficient must be at least 1")
+  }
+  return {
+    maxAttempts,
+    maxElapsedMs,
+    initialIntervalMs,
+    maxIntervalMs: maxIntervalMs ?? 30_000,
+    backoffCoefficient,
+    nonRetryableErrorNames: retry?.nonRetryableErrorNames ?? [],
+  }
+}
+
+function localRetryDecision(
+  effect: {
+    attempt: number
+    firstAttemptStartedAt: string
+    maxAttempts: number
+    maxElapsedMs: number | null
+    initialIntervalMs: number
+    maxIntervalMs: number
+    backoffCoefficient: number
+    nonRetryableErrorNames: string[]
+  },
+  error: { name?: string; message: string },
+  now: string,
+  retryable: boolean,
+): { status: "failed" } | { status: "retry_scheduled"; nextAttemptAt: string; nextAttempt: number } {
+  if (!retryable || (error.name && effect.nonRetryableErrorNames.includes(error.name))) {
+    return { status: "failed" }
+  }
+  if (effect.attempt >= effect.maxAttempts) {
+    return { status: "failed" }
+  }
+  const rawDelay =
+    effect.initialIntervalMs * effect.backoffCoefficient ** Math.max(0, effect.attempt - 1)
+  const delayMs = Math.min(effect.maxIntervalMs, Math.max(0, Math.round(rawDelay)))
+  const nextAttemptAt = addMs(now, delayMs)
+  if (effect.maxElapsedMs !== null) {
+    const maxElapsedAt = addMs(effect.firstAttemptStartedAt, effect.maxElapsedMs)
+    if (nextAttemptAt > maxElapsedAt) {
+      return { status: "failed" }
+    }
+  }
+  return {
+    status: "retry_scheduled",
+    nextAttemptAt,
+    nextAttempt: effect.attempt + 1,
+  }
+}
+
+function effectFirstAttemptStartedAt(
+  effect: EffectRecord | CheckpointEffectMutation | undefined,
+): string | undefined {
+  if (!effect) {
+    return undefined
+  }
+  if ("firstAttemptStartedAt" in effect) {
+    return effect.firstAttemptStartedAt
+  }
+  return undefined
+}
+
+function errorFromSerialized(error: { message: string; name?: string; stack?: string }): Error {
+  const value = new Error(error.message)
+  value.name = error.name ?? "Error"
+  if (error.stack) {
+    value.stack = error.stack
+  }
+  return value
+}
+
+function addMs(isoValue: string, ms: number): string {
+  return new Date(new Date(isoValue).getTime() + ms).toISOString()
 }
 
 function callWaitHandler(

@@ -681,7 +681,7 @@ describe("durable workflow PoC", () => {
               const value = await ctx.activity("record", () => {
                 calls.push(event.value)
                 return event.value
-              })
+              }, { durability: "eager" })
               return complete({ value })
             }),
           },
@@ -1358,7 +1358,7 @@ describe("durable workflow PoC", () => {
             const result = await ctx.activity("side_effect_once", () => {
               calls.activity += 1
               return { ok: true }
-            })
+            }, { durability: "eager" })
 
             if (calls.shouldThrow) {
               calls.shouldThrow = false
@@ -1477,6 +1477,77 @@ describe("durable workflow PoC", () => {
     expect(await provider.loadInstance(ref)).toMatchObject({
       status: "completed",
       output: { ok: true, value: "old:new" },
+    })
+  })
+
+  it("keeps default local activity results checkpoint-durable and re-executes after pre-commit failure", async () => {
+    const path = await storePath()
+    let calls = 0
+    let shouldThrow = true
+    const CheckpointActivityWorkflow = defineWorkflow({
+      name: "checkpoint_activity_default",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ first: z.number(), second: z.number() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const first = await ctx.activity("local_once", () => {
+              calls += 1
+              return calls
+            })
+            const second = await ctx.activity("local_once", () => {
+              calls += 1
+              return calls
+            })
+            if (shouldThrow) {
+              shouldThrow = false
+              throw new Error("crash before checkpoint")
+            }
+            return complete({ first, second })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [CheckpointActivityWorkflow],
+      workerId: "checkpoint-activity-worker-a",
+    })
+    const ref = await runtime.start(
+      CheckpointActivityWorkflow,
+      {},
+      { workflowId: "checkpoint-activity-default" },
+    )
+
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("crash before checkpoint")
+    expect(calls).toBe(1)
+    await expect(provider.loadInstance(ref, { includeEffects: true })).resolves.toMatchObject({
+      sequence: 0,
+      effects: [],
+    })
+
+    const secondRuntime = new DurableRuntime(testProvider(path), {
+      workflows: [CheckpointActivityWorkflow],
+      workerId: "checkpoint-activity-worker-b",
+    })
+    await secondRuntime.drain({ maxActivations: 1 })
+
+    expect(calls).toBe(2)
+    await expect(provider.loadInstance(ref, { includeEffects: true })).resolves.toMatchObject({
+      status: "completed",
+      output: { first: 2, second: 2 },
+      effects: [
+        expect.objectContaining({
+          key: "local_once",
+          status: "completed",
+          result: 2,
+        }),
+      ],
     })
   })
 
@@ -1861,7 +1932,7 @@ describe("durable workflow PoC", () => {
                 })
               }
               return "after-shutdown"
-            })
+            }, { durability: "eager" })
             return complete({ value })
           },
         }),
@@ -3132,7 +3203,7 @@ describe("durable workflow PoC", () => {
             const result = await ctx.activity("side_effect_once", () => {
               calls.activity += 1
               return { ok: true }
-            })
+            }, { durability: "eager" })
 
             if (calls.shouldThrow) {
               calls.shouldThrow = false

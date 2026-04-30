@@ -418,7 +418,7 @@ type DurableContext = {
 
   activity<T>(
     key: string,
-    fn: () => Promise<T>,
+    fn: ((ctx: ActivityContext) => Promise<T> | T) | (() => Promise<T> | T),
     options?: ActivityOptions
   ): Promise<T>
 
@@ -483,11 +483,31 @@ Activity options:
 
 ```ts
 type ActivityOptions = {
-  startToCloseTimeout?: Duration
-  heartbeatTimeout?: Duration
+  durability?: "checkpoint" | "eager"
+  startToCloseTimeoutMs?: number | null
+  heartbeatTimeoutMs?: number | null
   retry?: RetryPolicy
 }
 ```
+
+Inline TypeScript activities default to checkpoint durability when they do not
+use start-to-close or heartbeat timeouts:
+
+```text
+durability = "checkpoint"
+```
+
+Checkpoint-durable local activity results, failures, and retry scheduling are
+buffered during the handler activation and committed atomically with the
+workflow checkpoint. This reduces durable round trips for short local effects.
+The tradeoff is explicit: if the worker crashes after the external side effect
+but before the checkpoint commit, the activity may re-execute with the same
+idempotency key.
+
+Activities that configure `startToCloseTimeoutMs`, `heartbeatTimeoutMs`, or
+`durability: "eager"` use eager durability. Eager activities reserve, heartbeat,
+complete, fail, and retry through independent provider calls so timeout fencing
+and recovery do not wait for a workflow checkpoint.
 
 Long-running activities may heartbeat through the runtime:
 
@@ -500,7 +520,7 @@ await ctx.activity(
     }
   },
   {
-    heartbeatTimeout: minutes(1),
+    heartbeatTimeoutMs: minutes(1),
   }
 )
 ```
@@ -817,7 +837,9 @@ type DurabilityProvider = {
   completeEffect(input: CompleteEffectInput): Promise<void>
   failEffect(input: FailEffectInput): Promise<FailEffectResult>
 
+  commitActivations(input: CommitActivationInput[]): Promise<CommitActivationsResult>
   commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
+  recordActivationFailures(input: RecordActivationFailureInput[]): Promise<void>
 }
 ```
 
@@ -960,6 +982,12 @@ activation concurrency still controls how many handlers run at the same time.
 Workers must heartbeat both queued and running activation leases and release
 queued claims on shutdown, abort, or fatal handler error.
 
+Activation completions may be batched by the runtime before provider commit.
+`activationCommitBatchSize` controls the maximum number of completed activations
+submitted to `commitActivations(...)` together. Provider fencing remains
+authoritative, so a conflict for one activation must discard only that
+activation's completion while allowing siblings in the same batch to commit.
+
 Activities currently execute inside activation slots. A long-running activity
 therefore occupies one activation slot until it completes, fails, retries, or is
 aborted. A later dedicated activity executor may add a separate activity
@@ -986,14 +1014,19 @@ The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
 conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
 pending/ready paths, statement and lock timeouts, and an advisory transaction
-lock for concurrent schema initialization. Provider startup must not rebuild or
-rewrite live ready indexes; readiness is maintained transactionally by instance
-creation, signal append, child completion/cancel, and checkpoint commits.
+lock for concurrent schema initialization. Its ready and activation-lease state
+is stored in a single `activation_tasks` table so Postgres can claim work with a
+set-oriented row-locking update rather than coordinating a separate ready index
+and activation-claim table. Provider startup must not rebuild or rewrite live
+ready indexes; readiness is maintained transactionally by instance creation,
+signal append, child completion/cancel, failure retry recording, and checkpoint
+commits.
 
 ### Activation claiming
 
 `claimReadyActivations(...)` returns up to `limit` ready handler activations plus
-their current lean instance snapshots. `claimReadyActivation(...)` is a
+their current lean instance snapshots and activation-scoped effect ledgers.
+`claimReadyActivation(...)` is a
 compatibility wrapper over batch limit `1`.
 
 Ready activations come from:
@@ -1016,8 +1049,10 @@ In a sharded provider, claim calls should verify that the caller owns the dispat
 The instance snapshot returned with a claim is for activation execution, not
 debug introspection. It includes identity, version, current sequence, status,
 common state, phase/output/error, waits, parent link, and timestamps. It does
-not need to include effect ledger records. Full `loadInstance(...)` reads may
-include provider-specific debug details such as effects.
+not include effect ledger records inside the snapshot itself; the claim result
+carries the activation's current effect ledger separately. Full
+`loadInstance(...)` reads may include provider-specific debug details such as
+effects when explicitly requested.
 
 ```ts
 type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
@@ -1027,6 +1062,7 @@ type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
 type ClaimedActivationWithInstance = {
   activation: ClaimedActivation
   instance: ActivationInstanceSnapshot
+  effects: EffectRecord[]
 }
 
 type ClaimReadyActivationsResult = {
@@ -1103,7 +1139,9 @@ Activities are still at-least-once at the external boundary. If the external sys
 
 ### Checkpoint commit
 
-`commitCheckpoint(...)` is the primary atomic operation.
+`commitActivations(...)` is the runtime's primary checkpoint commit operation.
+It batches one or more activation completions and returns one result per
+activation. `commitCheckpoint(...)` is a single-activation compatibility wrapper.
 
 ```ts
 type CommitCheckpointInput = {
@@ -1111,12 +1149,16 @@ type CommitCheckpointInput = {
   runId: string
   expectedSequence: number
   activationId: string
+  workerId: string
+  workflowVersion: number
 
   next: InstanceStatus<JsonObject>
   waits: DurableWait[]
-  children: ChildRecord[]
+  now: string
 
   consumeSignalId?: string
+  consumeChildRecordId?: string
+  effects?: CheckpointEffectMutation[]
 }
 ```
 
@@ -1126,9 +1168,11 @@ It must atomically:
 verify instance is still at expectedSequence
 verify activation lease is held or still valid
 consume the selected signal, if any
+consume the selected child completion, if any
+persist checkpoint-durable effect mutations, if any
 write the new instance snapshot or terminal state
 replace the current wait set
-persist child handle updates
+persist child completion delivery and parent-close updates
 increment sequence
 mark the activation complete
 make the completed activation's effects compactable
@@ -1137,7 +1181,15 @@ enqueue or wake the next activation if the next phase is run-immediate
 
 If `expectedSequence` does not match, the commit fails without partial writes. The runtime must discard the handler result, reload the instance, and retry from the winning durable state.
 
-Signal consumption must be committed with the checkpoint. If the checkpoint fails, the signal remains unconsumed.
+Signal and child consumption must be committed with the checkpoint. If the
+checkpoint fails, the signal or child completion remains unconsumed and
+checkpoint-durable effect mutations from that completion must not be written.
+
+`recordActivationFailures(...)` records activation-scoped checkpoint activity
+failures that do not advance workflow sequence, such as retry-scheduled local
+activity failures. It must verify the caller still owns the live activation
+lease. When requested, it releases the activation lease so another worker can
+reclaim the same activation after the retry wake time.
 
 ### Provider invariants
 

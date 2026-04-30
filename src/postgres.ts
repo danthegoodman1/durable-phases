@@ -12,6 +12,9 @@ import type {
   ClaimReadyActivationsResult,
   ClaimReadyActivationInput,
   ClaimReadyActivationResult,
+  CheckpointEffectMutation,
+  CommitActivationInput,
+  CommitActivationsResult,
   CommitCheckpointInput,
   CommitCheckpointResult,
   CompleteEffectInput,
@@ -31,6 +34,7 @@ import type {
   LoadInstanceOptions,
   PersistedInstance,
   ReadyEvent,
+  RecordActivationFailureInput,
   ReleaseActivationsInput,
   ReleaseActivationInput,
   ReleaseDispatchShardInput,
@@ -150,7 +154,7 @@ type ActivationClaimRow = {
   workflow_id: string
   run_id: string
   sequence: number
-  kind: "migration" | "run" | "event"
+  kind: "migration" | "run" | "event" | "signal" | "timer" | "child"
   wait_name: string | null
   event_json: unknown
   wait_json: unknown
@@ -162,6 +166,21 @@ type ActivationClaimRow = {
 
 type ActivationClaimUpsertRow = ActivationClaimRow & {
   inserted: boolean
+}
+
+type CommitClaimRow = InstanceRow & {
+  claim_activation_id: string | null
+  claim_workflow_id: string | null
+  claim_run_id: string | null
+  claim_sequence: number | null
+  claim_kind: ActivationClaimRow["kind"] | null
+  claim_wait_name: string | null
+  claim_event_json: unknown
+  claim_wait_json: unknown
+  claim_owner_id: string | null
+  claim_lease_until: Date | string | null
+  claim_activation_time: Date | string | null
+  claim_completed_by_sequence: number | null
 }
 
 type DispatchShardRow = {
@@ -358,7 +377,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         ],
       )
 
-      await this.replaceReadyEventsForState(client, {
+      await this.insertReadyEventsForState(client, {
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
         workflowId: input.workflowId,
@@ -427,7 +446,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   > {
     const rows = await this.rows<ActivationClaimRow>(
       this.pool,
-      `SELECT * FROM ${this.table("activation_claims")} ORDER BY workflow_id, run_id, sequence, activation_id`,
+      `SELECT * FROM ${this.table("activation_tasks")} ORDER BY workflow_id, run_id, sequence, activation_id`,
     )
     return rows.map((claim) => ({
       activationId: claim.activation_id,
@@ -650,7 +669,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         claims.push({
           activation: stripCandidateMetadata(candidate),
           instance: this.activationInstanceSnapshot(candidate.instance),
+          effects: [],
         })
+      }
+
+      const effectsByActivation = await this.effectsForActivations(
+        client,
+        claims.map((claim) => claim.activation.activationId),
+      )
+      for (const claim of claims) {
+        claim.effects = effectsByActivation.get(claim.activation.activationId) ?? []
       }
 
       if (claims.length >= limit) {
@@ -686,7 +714,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         ? { activation: null, nextWakeAt: result.nextWakeAt }
         : { activation: null }
     }
-    return { activation: first.activation, instance: first.instance }
+    return { activation: first.activation, instance: first.instance, effects: first.effects }
   }
 
   async heartbeatActivations(input: HeartbeatActivationsInput): Promise<void> {
@@ -698,7 +726,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       await this.expireActivityTimeouts(client, input.now, { activationIds })
       return client.query(
         `
-        UPDATE ${this.table("activation_claims")}
+        UPDATE ${this.table("activation_tasks")}
         SET lease_until = $1::timestamptz
         WHERE activation_id = ANY($2::text[]) AND owner_id = $3 AND completed_by_sequence IS NULL
           AND lease_until >= $4::timestamptz
@@ -743,7 +771,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     }
     await this.pool.query(
       `
-      UPDATE ${this.table("activation_claims")}
+      UPDATE ${this.table("activation_tasks")}
       SET owner_id = NULL, lease_until = NULL
       WHERE activation_id = ANY($1::text[]) AND owner_id = $2 AND completed_by_sequence IS NULL
       `,
@@ -789,7 +817,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           $10, $11::timestamptz, $12, $13::timestamptz, $14, $15, $16, $17, $18,
           $9::timestamptz, NULL, $19::jsonb
         WHERE EXISTS (
-          SELECT 1 FROM ${this.table("activation_claims")} a
+          SELECT 1 FROM ${this.table("activation_tasks")} a
           WHERE a.activation_id = $4
             AND a.workflow_id = $2
             AND a.run_id = $3
@@ -975,7 +1003,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         WHERE workflow_id = $2 AND run_id = $3 AND activation_id = $4 AND effect_id = $5
           AND attempt_id = $6 AND status = 'pending'
           AND EXISTS (
-            SELECT 1 FROM ${this.table("activation_claims")} a
+            SELECT 1 FROM ${this.table("activation_tasks")} a
             WHERE a.activation_id = $4
               AND a.workflow_id = $2
               AND a.run_id = $3
@@ -1210,7 +1238,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           parentClosePolicy,
         ],
       )
-      await this.replaceReadyEventsForState(client, {
+      await this.insertReadyEventsForState(client, {
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
         workflowId: input.workflowId,
@@ -1293,8 +1321,28 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
+  async commitActivations(inputs: CommitActivationInput[]): Promise<CommitActivationsResult> {
+    if (inputs.length === 0) {
+      return { results: [] }
+    }
     return this.transaction(async (client) => {
+      const results: Array<CommitCheckpointResult & { activationId: string }> = []
+      for (const input of inputs) {
+        const result = await this.commitCheckpointInTransaction(client, input)
+        results.push({ ...result, activationId: input.activationId })
+      }
+      return { results }
+    })
+  }
+
+  async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
+    return this.transaction((client) => this.commitCheckpointInTransaction(client, input))
+  }
+
+  private async commitCheckpointInTransaction(
+    client: PoolClient,
+    input: CommitCheckpointInput,
+  ): Promise<CommitCheckpointResult> {
       const conflict = (reason: string, sequence: number): CommitCheckpointResult => {
         this.log("warn", "provider.checkpoint.conflict", {
           workflowId: input.workflowId,
@@ -1313,7 +1361,39 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         return { ok: false, sequence }
       }
 
-      const instance = await this.instanceRow(client, input, true)
+      const joined = await this.one<CommitClaimRow>(
+        client,
+        `
+        SELECT
+          i.*,
+          a.activation_id AS claim_activation_id,
+          a.workflow_id AS claim_workflow_id,
+          a.run_id AS claim_run_id,
+          a.sequence AS claim_sequence,
+          a.kind AS claim_kind,
+          a.wait_name AS claim_wait_name,
+          a.event_json AS claim_event_json,
+          a.wait_json AS claim_wait_json,
+          a.owner_id AS claim_owner_id,
+          a.lease_until AS claim_lease_until,
+          a.activation_time AS claim_activation_time,
+          a.completed_by_sequence AS claim_completed_by_sequence
+        FROM ${this.table("instances")} i
+        JOIN ${this.table("activation_tasks")} a
+          ON a.workflow_id = i.workflow_id
+         AND a.run_id = i.run_id
+         AND a.activation_id = $3
+         AND NOT EXISTS (
+           SELECT 1 FROM ${this.table("activity_deadlines")} d
+           WHERE d.activation_id = $3 AND d.deadline_at <= $4::timestamptz
+         )
+        WHERE i.workflow_id = $1 AND i.run_id = $2
+        LIMIT 1
+        FOR UPDATE OF i, a
+        `,
+        [input.workflowId, input.runId, input.activationId, input.now],
+      )
+      const instance = joined ?? (await this.instanceRow(client, input, true))
       if (!instance || instance.status !== "running") {
         return conflict("not_running", instance?.sequence ?? -1)
       }
@@ -1321,19 +1401,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         return conflict("stale_sequence", instance.sequence)
       }
 
-      const claim = await this.one<ActivationClaimRow>(
-        client,
-        `
-        SELECT * FROM ${this.table("activation_claims")}
-        WHERE activation_id = $1
-          AND NOT EXISTS (
-            SELECT 1 FROM ${this.table("activity_deadlines")} d
-            WHERE d.activation_id = $1 AND d.deadline_at <= $2::timestamptz
-          )
-        FOR UPDATE
-        `,
-        [input.activationId, input.now],
-      )
+      const claim = joined ? activationClaimFromCommitRow(joined) : null
       if (
         !claim ||
         claim.workflow_id !== input.workflowId ||
@@ -1385,6 +1453,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       }
 
       const nextSequence = instance.sequence + 1
+      await this.writeCheckpointEffectMutations(client, input)
       await this.writeNextInstance(client, input, nextSequence)
       if (signalToConsume) {
         await client.query(
@@ -1401,21 +1470,25 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
       await this.updateParentChildRecord(client, instance, input, nextSequence)
       await this.applyParentClosePolicy(client, instance, input, nextSequence)
-      await this.replaceReadyEventsForState(client, {
-        workflowName: instance.workflow_name,
-        workflowVersion: input.workflowVersion,
-        workflowId: input.workflowId,
-        runId: input.runId,
-        partitionShard: instance.partition_shard,
-        sequence: nextSequence,
-        status: input.next.status,
-        waits: input.waits,
-        updatedAt: input.now,
-      })
+      if (input.next.status === "running") {
+        await this.replaceReadyEventsForState(client, {
+          workflowName: instance.workflow_name,
+          workflowVersion: input.workflowVersion,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          partitionShard: instance.partition_shard,
+          sequence: nextSequence,
+          status: input.next.status,
+          waits: input.waits,
+          updatedAt: input.now,
+        })
+      } else if (claim.kind !== "run") {
+        await this.deletePendingReadyEventsForInstance(client, input.workflowId, input.runId)
+      }
 
       await client.query(
         `
-        UPDATE ${this.table("activation_claims")}
+        UPDATE ${this.table("activation_tasks")}
         SET completed_by_sequence = $1, completed_at = $2::timestamptz,
           lease_until = $2::timestamptz, owner_id = $3
         WHERE activation_id = $4
@@ -1438,6 +1511,33 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         status: "success",
       })
       return { ok: true, sequence: nextSequence }
+  }
+
+  async recordActivationFailures(inputs: RecordActivationFailureInput[]): Promise<void> {
+    if (inputs.length === 0) {
+      return
+    }
+    await this.transaction(async (client) => {
+      for (const input of inputs) {
+        await this.assertLiveActivationLease(client, input)
+        await this.writeCheckpointEffectMutations(client, {
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          now: input.now,
+          effects: input.effects,
+        })
+        if (input.releaseActivation) {
+          await client.query(
+            `
+            UPDATE ${this.table("activation_tasks")}
+            SET owner_id = NULL, lease_until = NULL
+            WHERE activation_id = $1 AND owner_id = $2 AND completed_by_sequence IS NULL
+            `,
+            [input.activationId, input.workerId],
+          )
+        }
+      }
     })
   }
 
@@ -1507,23 +1607,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         UNIQUE(parent_workflow_id, parent_run_id, activation_id, key)
       );
 
-      CREATE TABLE IF NOT EXISTS ${this.table("activation_claims")} (
-        activation_id TEXT PRIMARY KEY,
-        workflow_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('migration', 'run', 'event')),
-        wait_name TEXT,
-        event_json JSONB,
-        wait_json JSONB,
-        owner_id TEXT,
-        lease_until TIMESTAMPTZ,
-        activation_time TIMESTAMPTZ,
-        completed_by_sequence INTEGER,
-        completed_at TIMESTAMPTZ,
-        FOREIGN KEY (workflow_id, run_id) REFERENCES ${this.table("instances")}(workflow_id, run_id) ON DELETE CASCADE
-      );
-
       CREATE TABLE IF NOT EXISTS ${this.table("effects")} (
         effect_id TEXT PRIMARY KEY,
         workflow_id TEXT NOT NULL,
@@ -1575,21 +1658,26 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         lease_until TIMESTAMPTZ
       );
 
-      CREATE TABLE IF NOT EXISTS ${this.table("ready_events")} (
-        ready_event_id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS ${this.table("activation_tasks")} (
+        activation_id TEXT PRIMARY KEY,
+        ready_event_id TEXT UNIQUE,
         workflow_id TEXT NOT NULL,
         run_id TEXT NOT NULL,
         workflow_name TEXT NOT NULL,
         workflow_version INTEGER NOT NULL,
         partition_shard INTEGER NOT NULL,
         sequence INTEGER NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('migration', 'run', 'signal', 'timer', 'child')),
+        kind TEXT NOT NULL CHECK (kind IN ('migration', 'run', 'event', 'signal', 'timer', 'child')),
         wait_name TEXT,
-        activation_id TEXT,
         ready_at TIMESTAMPTZ NOT NULL,
         sort_key TEXT NOT NULL,
         wait_json JSONB,
         event_json JSONB,
+        owner_id TEXT,
+        lease_until TIMESTAMPTZ,
+        activation_time TIMESTAMPTZ,
+        completed_by_sequence INTEGER,
+        completed_at TIMESTAMPTZ,
         FOREIGN KEY (workflow_id, run_id) REFERENCES ${this.table("instances")}(workflow_id, run_id) ON DELETE CASCADE
       );
     `)
@@ -1622,17 +1710,17 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         ON ${this.table("activity_deadlines")}(partition_shard, deadline_at);
       CREATE INDEX IF NOT EXISTS ${this.index("activity_deadlines_activation_due")}
         ON ${this.table("activity_deadlines")}(activation_id, deadline_at);
-      CREATE INDEX IF NOT EXISTS ${this.index("activation_claims_owner_lease")}
-        ON ${this.table("activation_claims")}(owner_id, lease_until)
+      CREATE INDEX IF NOT EXISTS ${this.index("activation_tasks_owner_lease")}
+        ON ${this.table("activation_tasks")}(owner_id, lease_until)
         WHERE completed_by_sequence IS NULL;
-      CREATE INDEX IF NOT EXISTS ${this.index("activation_claims_instance_sequence")}
-        ON ${this.table("activation_claims")}(workflow_id, run_id, sequence, activation_id)
+      CREATE INDEX IF NOT EXISTS ${this.index("activation_tasks_instance_sequence")}
+        ON ${this.table("activation_tasks")}(workflow_id, run_id, sequence, activation_id)
         WHERE completed_by_sequence IS NULL;
-      CREATE INDEX IF NOT EXISTS ${this.index("ready_events_claim")}
-        ON ${this.table("ready_events")}(partition_shard, ready_at, sort_key)
+      CREATE INDEX IF NOT EXISTS ${this.index("activation_tasks_claim")}
+        ON ${this.table("activation_tasks")}(partition_shard, ready_at, sort_key)
         WHERE kind <> 'migration';
-      CREATE INDEX IF NOT EXISTS ${this.index("ready_events_instance")}
-        ON ${this.table("ready_events")}(workflow_id, run_id, sequence);
+      CREATE INDEX IF NOT EXISTS ${this.index("activation_tasks_instance")}
+        ON ${this.table("activation_tasks")}(workflow_id, run_id, sequence);
     `)
       await client.query("COMMIT")
     } catch (error) {
@@ -1751,6 +1839,32 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return instance
   }
 
+  private async effectsForActivations(
+    client: Queryable,
+    activationIds: string[],
+  ): Promise<Map<string, EffectRecord[]>> {
+    const uniqueIds = [...new Set(activationIds)]
+    const byActivation = new Map<string, EffectRecord[]>()
+    if (uniqueIds.length === 0) {
+      return byActivation
+    }
+    const rows = await this.rows<EffectRow>(
+      client,
+      `
+      SELECT * FROM ${this.table("effects")}
+      WHERE activation_id = ANY($1::text[])
+      ORDER BY activation_id, key
+      `,
+      [uniqueIds],
+    )
+    for (const row of rows) {
+      const list = byActivation.get(row.activation_id) ?? []
+      list.push(rowToEffectRecord(row))
+      byActivation.set(row.activation_id, list)
+    }
+    return byActivation
+  }
+
   private async effectRow(
     client: Queryable,
     input: { workflowId: string; runId: string; activationId: string; effectId?: string; key?: string },
@@ -1795,14 +1909,37 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     client: PoolClient,
     state: ReadyEventInstanceState,
   ): Promise<void> {
-    await client.query(
-      `DELETE FROM ${this.table("ready_events")} WHERE workflow_id = $1 AND run_id = $2`,
-      [state.workflowId, state.runId],
-    )
+    await this.deletePendingReadyEventsForInstance(client, state.workflowId, state.runId)
+    if (state.status !== "running") {
+      return
+    }
+    await this.insertReadyEventsForState(client, state)
+  }
+
+  private async insertReadyEventsForState(
+    client: PoolClient,
+    state: ReadyEventInstanceState,
+  ): Promise<void> {
     if (state.status !== "running") {
       return
     }
     await this.insertReadyEvents(client, await this.buildReadyEventsForState(client, state, state.waits))
+  }
+
+  private async deletePendingReadyEventsForInstance(
+    client: PoolClient,
+    workflowId: string,
+    runId: string,
+  ): Promise<void> {
+    await client.query(
+      `
+      DELETE FROM ${this.table("activation_tasks")}
+      WHERE workflow_id = $1 AND run_id = $2
+        AND owner_id IS NULL
+        AND completed_by_sequence IS NULL
+      `,
+      [workflowId, runId],
+    )
   }
 
   private async replaceSignalReadyEventsForState(
@@ -1811,8 +1948,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   ): Promise<void> {
     await client.query(
       `
-      DELETE FROM ${this.table("ready_events")}
+      DELETE FROM ${this.table("activation_tasks")}
       WHERE workflow_id = $1 AND run_id = $2 AND sequence = $3 AND kind = 'signal'
+        AND owner_id IS NULL
+        AND completed_by_sequence IS NULL
       `,
       [state.workflowId, state.runId, state.sequence],
     )
@@ -2040,28 +2179,32 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           event_json jsonb
         )
       )
-      INSERT INTO ${this.table("ready_events")} (
-        ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
-        partition_shard, sequence, kind, wait_name, activation_id, ready_at,
+      INSERT INTO ${this.table("activation_tasks")} (
+        activation_id, ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
+        partition_shard, sequence, kind, wait_name, ready_at,
         sort_key, wait_json, event_json
       )
       SELECT
-        ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
-        partition_shard, sequence, kind, wait_name, activation_id, ready_at,
+        activation_id, ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
+        partition_shard, sequence, kind, wait_name, ready_at,
         sort_key, wait_json, event_json
       FROM input
       ON CONFLICT (ready_event_id) DO UPDATE SET
+        activation_id = EXCLUDED.activation_id,
         workflow_name = EXCLUDED.workflow_name,
         workflow_version = EXCLUDED.workflow_version,
         partition_shard = EXCLUDED.partition_shard,
         sequence = EXCLUDED.sequence,
         kind = EXCLUDED.kind,
         wait_name = EXCLUDED.wait_name,
-        activation_id = EXCLUDED.activation_id,
         ready_at = EXCLUDED.ready_at,
         sort_key = EXCLUDED.sort_key,
         wait_json = EXCLUDED.wait_json,
-        event_json = EXCLUDED.event_json
+        event_json = EXCLUDED.event_json,
+        owner_id = NULL,
+        lease_until = NULL,
+        activation_time = NULL
+      WHERE ${this.table("activation_tasks")}.completed_by_sequence IS NULL
       `,
       [
         encodeJson(
@@ -2117,16 +2260,18 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         AND i.partition_shard = ANY($1::int[])
         AND (${version.sql})
         AND NOT EXISTS (
-          SELECT 1 FROM ${this.table("activation_claims")} competing
+          SELECT 1 FROM ${this.table("activation_tasks")} competing
           WHERE competing.workflow_id = i.workflow_id
             AND competing.run_id = i.run_id
             AND competing.sequence = i.sequence
             AND competing.kind <> 'migration'
             AND competing.completed_by_sequence IS NULL
+            AND competing.owner_id IS NOT NULL
+            AND competing.lease_until > $2::timestamptz
           LIMIT 1
         )
         AND NOT EXISTS (
-          SELECT 1 FROM ${this.table("activation_claims")} same_migration
+          SELECT 1 FROM ${this.table("activation_tasks")} same_migration
           WHERE same_migration.workflow_id = i.workflow_id
             AND same_migration.run_id = i.run_id
             AND same_migration.sequence = i.sequence
@@ -2199,16 +2344,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         i.parent_child_record_id AS instance_parent_child_record_id,
         i.created_at AS instance_created_at,
         i.updated_at AS instance_updated_at
-      FROM ${this.table("ready_events")} re
+      FROM ${this.table("activation_tasks")} re
       JOIN ${this.table("instances")} i ON i.workflow_id = re.workflow_id AND i.run_id = re.run_id
       WHERE re.partition_shard = ANY($1::int[])
         AND re.ready_at <= $2::timestamptz
-        AND re.kind <> 'migration'
+        AND re.kind IN ('run', 'signal', 'timer', 'child')
         AND (${version.sql})
         AND i.status = 'running'
         AND i.sequence = re.sequence
         AND NOT EXISTS (
-          SELECT 1 FROM ${this.table("activation_claims")} same_activation
+          SELECT 1 FROM ${this.table("activation_tasks")} same_activation
           WHERE same_activation.activation_id = re.activation_id
             AND same_activation.completed_by_sequence IS NULL
             AND same_activation.owner_id IS NOT NULL
@@ -2216,12 +2361,14 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           LIMIT 1
         )
         AND NOT EXISTS (
-          SELECT 1 FROM ${this.table("activation_claims")} competing
+          SELECT 1 FROM ${this.table("activation_tasks")} competing
           WHERE competing.workflow_id = re.workflow_id
             AND competing.run_id = re.run_id
             AND competing.sequence = re.sequence
             AND competing.activation_id <> re.activation_id
             AND competing.completed_by_sequence IS NULL
+            AND competing.owner_id IS NOT NULL
+            AND competing.lease_until > $3::timestamptz
           LIMIT 1
         )
         AND NOT EXISTS (
@@ -2258,7 +2405,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     const row = await this.one<{ ready_at: Date | string | null }>(
       client,
       `
-      SELECT ready_at FROM ${this.table("ready_events")}
+      SELECT ready_at FROM ${this.table("activation_tasks")}
       WHERE partition_shard = ANY($1::int[])
         AND kind IN ('run', 'timer')
         AND ready_at > $2::timestamptz
@@ -2276,7 +2423,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       SELECT MIN(d.deadline_at) AS deadline
       FROM ${this.table("activity_deadlines")} d
       JOIN ${this.table("instances")} i ON i.workflow_id = d.workflow_id AND i.run_id = d.run_id
-      JOIN ${this.table("activation_claims")} a ON a.activation_id = d.activation_id
+      JOIN ${this.table("activation_tasks")} a ON a.activation_id = d.activation_id
       WHERE d.partition_shard = ANY($1::int[])
         AND d.deadline_at > $2::timestamptz
         AND i.status = 'running'
@@ -2322,6 +2469,20 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       return new Set()
     }
     const leaseUntil = addMs(now, leaseMs)
+    const existingClaimRows = await this.rows<Pick<ActivationClaimRow, "activation_id" | "owner_id" | "lease_until">>(
+      client,
+      `
+      SELECT activation_id, owner_id, lease_until
+      FROM ${this.table("activation_tasks")}
+      WHERE activation_id = ANY($1::text[])
+      `,
+      [candidates.map((candidate) => candidate.activationId)],
+    )
+    const reclaimedActivationIds = new Set(
+      existingClaimRows
+        .filter((row) => row.owner_id !== null && (!row.lease_until || iso(row.lease_until) <= now))
+        .map((row) => row.activation_id),
+    )
     const rows = await this.rows<ActivationClaimUpsertRow>(
       client,
       `
@@ -2329,35 +2490,43 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         SELECT *
         FROM jsonb_to_recordset($1::jsonb) AS c(
           activation_id text,
+          ready_event_id text,
           workflow_id text,
           run_id text,
+          workflow_name text,
+          workflow_version integer,
+          partition_shard integer,
           sequence integer,
           kind text,
           wait_name text,
           event_json jsonb,
           wait_json jsonb,
-          activation_time timestamptz
+          ready_at timestamptz,
+          sort_key text
         )
       )
-      INSERT INTO ${this.table("activation_claims")} (
-        activation_id, workflow_id, run_id, sequence, kind, wait_name,
-        event_json, wait_json, owner_id, lease_until, activation_time
+      INSERT INTO ${this.table("activation_tasks")} (
+        activation_id, ready_event_id, workflow_id, run_id, workflow_name,
+        workflow_version, partition_shard, sequence, kind, wait_name,
+        event_json, wait_json, ready_at, sort_key, owner_id, lease_until, activation_time
       )
       SELECT
-        activation_id, workflow_id, run_id, sequence, kind, wait_name,
-        event_json, wait_json, $2, $3::timestamptz, activation_time
+        activation_id, ready_event_id, workflow_id, run_id, workflow_name,
+        workflow_version, partition_shard, sequence, kind, wait_name,
+        event_json, wait_json, ready_at, sort_key, $2, $3::timestamptz, ready_at
       FROM candidate
       ON CONFLICT (activation_id) DO UPDATE SET
         owner_id = EXCLUDED.owner_id,
         lease_until = EXCLUDED.lease_until,
         event_json = EXCLUDED.event_json,
         wait_json = EXCLUDED.wait_json,
-        activation_time = COALESCE(${this.table("activation_claims")}.activation_time, EXCLUDED.activation_time)
-      WHERE ${this.table("activation_claims")}.completed_by_sequence IS NULL
+        kind = EXCLUDED.kind,
+        activation_time = COALESCE(${this.table("activation_tasks")}.activation_time, EXCLUDED.activation_time)
+      WHERE ${this.table("activation_tasks")}.completed_by_sequence IS NULL
         AND (
-          ${this.table("activation_claims")}.owner_id IS NULL
-          OR ${this.table("activation_claims")}.lease_until IS NULL
-          OR ${this.table("activation_claims")}.lease_until <= $4::timestamptz
+          ${this.table("activation_tasks")}.owner_id IS NULL
+          OR ${this.table("activation_tasks")}.lease_until IS NULL
+          OR ${this.table("activation_tasks")}.lease_until <= $4::timestamptz
         )
       RETURNING *, (xmax = 0) AS inserted
       `,
@@ -2365,14 +2534,19 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         encodeJson(
           candidates.map((candidate) => ({
             activation_id: candidate.activationId,
+            ready_event_id: candidate.activationId,
             workflow_id: candidate.workflowId,
             run_id: candidate.runId,
+            workflow_name: candidate.workflowName,
+            workflow_version: candidate.instance.workflow_version,
+            partition_shard: candidate.instance.partition_shard,
             sequence: candidate.sequence,
-            kind: candidate.kind,
+            kind: candidate.kind === "event" ? candidate.eventKind : candidate.kind,
             wait_name: candidate.kind === "event" ? (candidate.waitName ?? null) : null,
             event_json: candidate.kind === "event" ? (candidate.eventJson ?? null) : null,
             wait_json: candidate.kind === "event" ? (candidate.waitJson ?? null) : null,
-            activation_time: candidate.activationTime,
+            ready_at: candidate.activationTime,
+            sort_key: candidate.sort.join("\u0000"),
           })),
         ),
         workerId,
@@ -2389,7 +2563,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       }
       candidate.leaseUntil = leaseUntil
       claimed.add(row.activation_id)
-      const reclaimed = !row.inserted
+      const reclaimed = reclaimedActivationIds.has(row.activation_id)
       if (reclaimed) {
         await this.resetPendingEffectsForActivationReclaim(client, candidate.activationId)
       }
@@ -2425,7 +2599,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     const row = await this.one<ActivationClaimUpsertRow>(
       client,
       `
-      INSERT INTO ${this.table("activation_claims")} (
+      INSERT INTO ${this.table("activation_tasks")} (
         activation_id, workflow_id, run_id, sequence, kind, wait_name,
         event_json, wait_json, owner_id, lease_until, activation_time
       ) VALUES (
@@ -2436,12 +2610,12 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         lease_until = EXCLUDED.lease_until,
         event_json = EXCLUDED.event_json,
         wait_json = EXCLUDED.wait_json,
-        activation_time = COALESCE(${this.table("activation_claims")}.activation_time, EXCLUDED.activation_time)
-      WHERE ${this.table("activation_claims")}.completed_by_sequence IS NULL
+        activation_time = COALESCE(${this.table("activation_tasks")}.activation_time, EXCLUDED.activation_time)
+      WHERE ${this.table("activation_tasks")}.completed_by_sequence IS NULL
         AND (
-          ${this.table("activation_claims")}.owner_id IS NULL
-          OR ${this.table("activation_claims")}.lease_until IS NULL
-          OR ${this.table("activation_claims")}.lease_until <= $12::timestamptz
+          ${this.table("activation_tasks")}.owner_id IS NULL
+          OR ${this.table("activation_tasks")}.lease_until IS NULL
+          OR ${this.table("activation_tasks")}.lease_until <= $12::timestamptz
         )
       RETURNING *, (xmax = 0) AS inserted
       `,
@@ -2501,7 +2675,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     const claim = await this.one<ActivationClaimRow>(
       client,
       `
-      SELECT * FROM ${this.table("activation_claims")}
+      SELECT * FROM ${this.table("activation_tasks")}
       WHERE activation_id = $1
         AND NOT EXISTS (
           SELECT 1 FROM ${this.table("activity_deadlines")} d
@@ -2660,7 +2834,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `
       SELECT d.effect_id, d.activation_id
       FROM ${this.table("activity_deadlines")} d
-      JOIN ${this.table("activation_claims")} a ON a.activation_id = d.activation_id
+      JOIN ${this.table("activation_tasks")} a ON a.activation_id = d.activation_id
       WHERE d.deadline_at <= $1::timestamptz
         AND a.completed_by_sequence IS NULL
         AND (${filters.join(" OR ")})
@@ -2741,7 +2915,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     }
     await client.query(
       `
-      UPDATE ${this.table("activation_claims")}
+      UPDATE ${this.table("activation_tasks")}
       SET owner_id = NULL, lease_until = NULL
       WHERE activation_id = $1 AND completed_by_sequence IS NULL
       `,
@@ -2778,6 +2952,124 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     for (const effect of effects) {
       await this.fencePendingEffectAttempt(client, effect)
     }
+  }
+
+  private async writeCheckpointEffectMutations(
+    client: PoolClient,
+    input: {
+      workflowId: string
+      runId: string
+      activationId: string
+      now: string
+      effects?: CheckpointEffectMutation[]
+    },
+  ): Promise<void> {
+    const effects = input.effects ?? []
+    if (effects.length === 0) {
+      return
+    }
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS e(
+          effect_id text,
+          workflow_id text,
+          run_id text,
+          activation_id text,
+          key text,
+          idempotency_key text,
+          status text,
+          attempt integer,
+          max_attempts integer,
+          max_elapsed_ms integer,
+          initial_interval_ms integer,
+          max_interval_ms integer,
+          backoff_coefficient double precision,
+          first_attempt_started_at timestamptz,
+          next_attempt_at timestamptz,
+          last_failure_json jsonb,
+          non_retryable_error_names_json jsonb,
+          result_json jsonb,
+          error_json jsonb,
+          heartbeat_details_json jsonb
+        )
+      )
+      INSERT INTO ${this.table("effects")} (
+        effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
+        attempt, attempt_id, attempt_owner_id, attempt_started_at,
+        start_to_close_timeout_ms, start_to_close_deadline,
+        heartbeat_timeout_ms, heartbeat_deadline, max_attempts,
+        max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
+        first_attempt_started_at, next_attempt_at, last_failure_json,
+        non_retryable_error_names_json, result_json, error_json, heartbeat_details_json
+      )
+      SELECT
+        effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
+        attempt, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, max_attempts,
+        max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
+        first_attempt_started_at, next_attempt_at, last_failure_json,
+        non_retryable_error_names_json, result_json, error_json, heartbeat_details_json
+      FROM input
+      ON CONFLICT (workflow_id, run_id, activation_id, key) DO UPDATE SET
+        status = EXCLUDED.status,
+        attempt = EXCLUDED.attempt,
+        attempt_id = NULL,
+        attempt_owner_id = NULL,
+        attempt_started_at = NULL,
+        start_to_close_deadline = NULL,
+        heartbeat_deadline = NULL,
+        max_attempts = EXCLUDED.max_attempts,
+        max_elapsed_ms = EXCLUDED.max_elapsed_ms,
+        initial_interval_ms = EXCLUDED.initial_interval_ms,
+        max_interval_ms = EXCLUDED.max_interval_ms,
+        backoff_coefficient = EXCLUDED.backoff_coefficient,
+        first_attempt_started_at = EXCLUDED.first_attempt_started_at,
+        next_attempt_at = EXCLUDED.next_attempt_at,
+        last_failure_json = EXCLUDED.last_failure_json,
+        non_retryable_error_names_json = EXCLUDED.non_retryable_error_names_json,
+        result_json = EXCLUDED.result_json,
+        error_json = EXCLUDED.error_json,
+        heartbeat_details_json = EXCLUDED.heartbeat_details_json
+      WHERE ${this.table("effects")}.status <> 'completed'
+      `,
+      [
+        encodeJson(
+          effects.map((effect) => {
+            const status = effect.status === "retry_scheduled" ? "pending" : effect.status
+            return {
+              effect_id: `effect-${randomUUID()}`,
+              workflow_id: input.workflowId,
+              run_id: input.runId,
+              activation_id: input.activationId,
+              key: effect.key,
+              idempotency_key:
+                effect.idempotencyKey ??
+                `${input.workflowId}/${input.runId}/${input.activationId}/${effect.key}`,
+              status,
+              attempt:
+                effect.status === "retry_scheduled"
+                  ? effect.nextAttempt
+                  : effect.attempt ?? 1,
+              max_attempts: effect.maxAttempts ?? 3,
+              max_elapsed_ms: effect.maxElapsedMs ?? null,
+              initial_interval_ms: effect.initialIntervalMs ?? 1_000,
+              max_interval_ms: effect.maxIntervalMs ?? 30_000,
+              backoff_coefficient: effect.backoffCoefficient ?? 2,
+              first_attempt_started_at: effect.firstAttemptStartedAt ?? input.now,
+              next_attempt_at:
+                effect.status === "retry_scheduled" ? effect.nextAttemptAt : null,
+              last_failure_json: effect.status === "completed" ? null : effect.error,
+              non_retryable_error_names_json: effect.nonRetryableErrorNames ?? [],
+              result_json: effect.status === "completed" ? effect.result : null,
+              error_json: effect.status === "completed" ? null : effect.error,
+              heartbeat_details_json: effect.heartbeatDetails ?? null,
+            }
+          }),
+        ),
+      ],
+    )
   }
 
   private async writeNextInstance(
@@ -3029,7 +3321,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       )
       await client.query(
         `
-        UPDATE ${this.table("activation_claims")}
+        UPDATE ${this.table("activation_tasks")}
         SET owner_id = NULL, lease_until = NULL
         WHERE workflow_id = $1 AND run_id = $2 AND completed_by_sequence IS NULL
         `,
@@ -3340,6 +3632,32 @@ function instanceRowFromReadyEventJoinedRow(row: ReadyEventJoinedRow): InstanceR
   }
 }
 
+function activationClaimFromCommitRow(row: CommitClaimRow): ActivationClaimRow | null {
+  if (
+    !row.claim_activation_id ||
+    !row.claim_workflow_id ||
+    !row.claim_run_id ||
+    row.claim_sequence === null ||
+    !row.claim_kind
+  ) {
+    return null
+  }
+  return {
+    activation_id: row.claim_activation_id,
+    workflow_id: row.claim_workflow_id,
+    run_id: row.claim_run_id,
+    sequence: row.claim_sequence,
+    kind: row.claim_kind,
+    wait_name: row.claim_wait_name,
+    event_json: row.claim_event_json,
+    wait_json: row.claim_wait_json,
+    owner_id: row.claim_owner_id,
+    lease_until: row.claim_lease_until,
+    activation_time: row.claim_activation_time,
+    completed_by_sequence: row.claim_completed_by_sequence,
+  }
+}
+
 function readyEventStateFromInstanceRow(row: InstanceRow): ReadyEventInstanceState {
   return {
     workflowName: row.workflow_name,
@@ -3385,7 +3703,7 @@ function earliestIso(...values: Array<string | undefined>): string | undefined {
 }
 
 function claimMatchesCommit(claim: ActivationClaimRow, input: CommitCheckpointInput): boolean {
-  if (claim.kind !== "event") {
+  if (claim.kind === "run" || claim.kind === "migration") {
     return !input.consumeSignalId && !input.consumeChildRecordId
   }
   const event = decodeJson<ReadyEvent | null>(claim.event_json, null)
@@ -3502,10 +3820,7 @@ type NormalizedEffectOptions = {
 
 function normalizeEffectOptions(input: ReserveEffectInput): NormalizedEffectOptions {
   const retry = input.options?.retry
-  const hasTimeout =
-    input.options?.startToCloseTimeoutMs !== undefined ||
-    input.options?.heartbeatTimeoutMs !== undefined
-  const maxAttempts = retry?.maxAttempts ?? input.maxAttempts ?? (hasTimeout ? 3 : 1)
+  const maxAttempts = retry?.maxAttempts ?? input.maxAttempts ?? 3
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
     throw new Error("activity retry.maxAttempts must be a positive integer")
   }

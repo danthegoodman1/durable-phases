@@ -226,6 +226,7 @@ export function describeDurabilityProviderConformance(
           common: { index: 0 },
           phase: { name: "run", data: { index: 0 } },
         })
+        expect(batch.claims[0].effects).toEqual([])
         expect("effects" in batch.claims[0].instance).toBe(false)
       })
     })
@@ -534,11 +535,21 @@ export function describeDurabilityProviderConformance(
             waits: [],
             now: T1,
             consumeSignalId: secondSignal.signalId,
+            effects: [
+              {
+                key: "checkpoint-local",
+                status: "completed",
+                result: { shouldNotPersist: true },
+              },
+            ],
           }),
         ).resolves.toEqual({ ok: false, sequence: 0 })
         await expect(provider.loadInstance(ref)).resolves.toMatchObject({
           sequence: 0,
           status: "running",
+        })
+        await expect(provider.loadInstance(ref, { includeEffects: true })).resolves.toMatchObject({
+          effects: [],
         })
 
         await expect(
@@ -818,8 +829,17 @@ export function describeDurabilityProviderConformance(
           activation: null,
           nextWakeAt: addMs(T0, 500),
         })
-        const reclaimed = requireActivation(await claim(provider, "worker-a", addMs(T0, 500)))
+        const reclaimedResult = await claim(provider, "worker-a", addMs(T0, 500))
+        const reclaimed = requireActivation(reclaimedResult)
         expect(reclaimed.activationId).toBe(activation.activationId)
+        expect(reclaimedResult.effects).toEqual([
+          expect.objectContaining({
+            key: "retry",
+            status: "pending",
+            attempt: 2,
+            heartbeatDetails: { offset: 10 },
+          }),
+        ])
         const second = requireReserved(
           await provider.getOrReserveEffect({
             ...ref,
@@ -1425,7 +1445,7 @@ async function claim(
   })
   const first = result.claims[0]
   return first
-    ? { activation: first.activation, instance: first.instance }
+    ? { activation: first.activation, instance: first.instance, effects: first.effects }
     : result.nextWakeAt
       ? { activation: null, nextWakeAt: result.nextWakeAt }
       : { activation: null }

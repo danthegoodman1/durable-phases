@@ -88,6 +88,7 @@ export type ActivityContext = {
 }
 
 export type ActivityOptions = {
+  durability?: "checkpoint" | "eager"
   startToCloseTimeoutMs?: number | null
   heartbeatTimeoutMs?: number | null
   retry?: ActivityRetryOptions

@@ -14,6 +14,9 @@ import type {
   ClaimReadyActivationsResult,
   ClaimReadyActivationInput,
   ClaimReadyActivationResult,
+  CheckpointEffectMutation,
+  CommitActivationInput,
+  CommitActivationsResult,
   CommitCheckpointInput,
   CommitCheckpointResult,
   CompleteEffectInput,
@@ -33,6 +36,7 @@ import type {
   LoadInstanceOptions,
   PersistedInstance,
   ReadyEvent,
+  RecordActivationFailureInput,
   ReleaseActivationsInput,
   ReleaseActivationInput,
   ReleaseDispatchShardInput,
@@ -863,6 +867,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         claims.push({
           activation: stripCandidateMetadata(candidate),
           instance: this.activationInstanceSnapshot(candidate.instance),
+          effects: this.effectsForActivation(candidate.activationId),
         })
       }
 
@@ -907,6 +912,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return {
       activation: first.activation,
       instance: first.instance,
+      effects: first.effects,
     }
   }
 
@@ -1290,6 +1296,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return output.result
   }
 
+  async commitActivations(inputs: CommitActivationInput[]): Promise<CommitActivationsResult> {
+    const results: Array<CommitCheckpointResult & { activationId: string }> = []
+    for (const input of inputs) {
+      const result = await this.commitCheckpoint(input)
+      results.push({ ...result, activationId: input.activationId })
+    }
+    return { results }
+  }
+
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
     const commit = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
@@ -1377,6 +1392,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
 
       const nextSequence = instance.sequence + 1
+      this.writeCheckpointEffectMutations(input)
       this.writeNextInstance(input, nextSequence)
 
       if (signalToConsume) {
@@ -1430,6 +1446,36 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
 
     return this.withBufferedObservability(() => commit.immediate() as CommitCheckpointResult)
+  }
+
+  async recordActivationFailures(inputs: RecordActivationFailureInput[]): Promise<void> {
+    if (inputs.length === 0) {
+      return
+    }
+    const record = this.db.transaction(() => {
+      for (const input of inputs) {
+        this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+        this.assertLiveActivationLease(input)
+        this.writeCheckpointEffectMutations({
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          now: input.now,
+          effects: input.effects,
+        })
+        if (input.releaseActivation) {
+          this.prepare(
+              `
+              UPDATE activation_claims
+              SET owner_id = NULL, lease_until = NULL
+              WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+            `,
+            )
+            .run(input.activationId, input.workerId)
+        }
+      }
+    })
+    this.withBufferedObservability(() => record.immediate())
   }
 
   private configure(): void {
@@ -1676,6 +1722,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
     }
     return instance
+  }
+
+  private effectsForActivation(activationId: string): EffectRecord[] {
+    return this.prepare("SELECT * FROM effects WHERE activation_id = ? ORDER BY key")
+      .all(activationId)
+      .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
   }
 
   private rebuildAllReadyEvents(): void {
@@ -2644,6 +2696,90 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       throw new Error(`Lost effect attempt: ${input.effectId}`)
     }
     throw new Error(`Effect is already terminal: ${input.effectId}`)
+  }
+
+  private writeCheckpointEffectMutations(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    now: string
+    effects?: CheckpointEffectMutation[]
+  }): void {
+    for (const effect of input.effects ?? []) {
+      const status = effect.status === "retry_scheduled" ? "pending" : effect.status
+      const effectId = `effect-${randomUUID()}`
+      const idempotencyKey =
+        effect.idempotencyKey ?? `${input.workflowId}/${input.runId}/${input.activationId}/${effect.key}`
+      const attempt = effect.status === "retry_scheduled"
+        ? effect.nextAttempt
+        : effect.attempt ?? 1
+      const firstAttemptStartedAt = effect.firstAttemptStartedAt ?? input.now
+      const maxAttempts = effect.maxAttempts ?? 3
+      const initialIntervalMs = effect.initialIntervalMs ?? 1_000
+      const maxIntervalMs = effect.maxIntervalMs ?? 30_000
+      const backoffCoefficient = effect.backoffCoefficient ?? 2
+      this.prepare(
+          `
+          INSERT INTO effects (
+            effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
+            attempt, attempt_id, attempt_owner_id, attempt_started_at,
+            start_to_close_timeout_ms, start_to_close_deadline,
+            heartbeat_timeout_ms, heartbeat_deadline, max_attempts,
+            max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
+            first_attempt_started_at, next_attempt_at, last_failure_json,
+            non_retryable_error_names_json, result_json, error_json, heartbeat_details_json
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
+          )
+          ON CONFLICT(workflow_id, run_id, activation_id, key) DO UPDATE SET
+            status = excluded.status,
+            attempt = excluded.attempt,
+            attempt_id = NULL,
+            attempt_owner_id = NULL,
+            attempt_started_at = NULL,
+            start_to_close_deadline = NULL,
+            heartbeat_deadline = NULL,
+            max_attempts = excluded.max_attempts,
+            max_elapsed_ms = excluded.max_elapsed_ms,
+            initial_interval_ms = excluded.initial_interval_ms,
+            max_interval_ms = excluded.max_interval_ms,
+            backoff_coefficient = excluded.backoff_coefficient,
+            first_attempt_started_at = excluded.first_attempt_started_at,
+            non_retryable_error_names_json = excluded.non_retryable_error_names_json,
+            next_attempt_at = excluded.next_attempt_at,
+            last_failure_json = excluded.last_failure_json,
+            result_json = excluded.result_json,
+            error_json = excluded.error_json,
+            heartbeat_details_json = excluded.heartbeat_details_json
+          WHERE effects.status <> 'completed'
+        `,
+        )
+        .run(
+          effectId,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          effect.key,
+          idempotencyKey,
+          status,
+          attempt,
+          maxAttempts,
+          effect.maxElapsedMs ?? null,
+          initialIntervalMs,
+          maxIntervalMs,
+          backoffCoefficient,
+          firstAttemptStartedAt,
+          effect.status === "retry_scheduled" ? effect.nextAttemptAt : null,
+          effect.status === "completed" ? null : encodeJson(effect.error),
+          encodeJson(effect.nonRetryableErrorNames ?? []),
+          effect.status === "completed" ? encodeJson(effect.result) : null,
+          effect.status === "completed" ? null : encodeJson(effect.error),
+          effect.heartbeatDetails === undefined ? null : encodeJson(effect.heartbeatDetails),
+        )
+    }
   }
 
   private writeNextInstance(input: CommitCheckpointInput, nextSequence: number): void {

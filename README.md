@@ -4,9 +4,13 @@ A small TypeScript prototype of the phase-based durable execution model in
 [`SPEC.md`](SPEC.md). The TypeScript runtime ships with SQLite and Postgres
 durability providers with shard leases, activation leases, atomic checkpoint
 commits, durable ready indexes, durable waits, a signal inbox, child records,
-and activation-scoped effects. `DurableRuntime.drain()` is useful for tests and
-manual pumping; `DurableRuntime.runWorker()` adds bounded polling, wake hints,
-lease heartbeats, and bounded activation concurrency for long-running workers.
+and activation-scoped effects. Short inline TypeScript activities default to
+checkpoint durability, so their results are committed with the workflow
+checkpoint; heartbeat or timeout activities use eager per-attempt durability.
+`DurableRuntime.drain()` is useful for tests and manual pumping;
+`DurableRuntime.runWorker()` adds bounded polling, wake hints, lease heartbeats,
+activation prefetch, batched activation commits, and bounded activation
+concurrency for long-running workers.
 
 ```bash
 npm run demo
@@ -44,8 +48,9 @@ The Compose file defaults to the pinned official image
 `PostgresDurabilityProvider.create(...)` accepts a connection string or shared
 `pg.Pool`, schema name, pool size, statement/lock timeouts, and optional
 observability sinks. The provider uses explicit transactions, row locks,
-`FOR UPDATE SKIP LOCKED`, conflict-aware upserts, partial hot-path indexes, and
-an advisory transaction lock for concurrent schema initialization.
+`FOR UPDATE SKIP LOCKED`, conflict-aware upserts, a unified `activation_tasks`
+table for ready work plus leases, partial hot-path indexes, and an advisory
+transaction lock for concurrent schema initialization.
 
 ## Benchmarks
 
@@ -69,9 +74,9 @@ activity delay:
 
 | Provider | durability mode | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| SQLite | synchronous=full | 478 | 2,392 | 3,828 | 2,680 | 4,289 |
-| SQLite | synchronous=normal | 638 | 3,188 | 5,100 | 3,497 | 5,595 |
-| Postgres | Docker postgres:18.3, pool=24 | 167 | 835 | 1,336 | 1,402 | 2,243 |
+| SQLite | synchronous=full | 513 | 2,564 | 4,102 | 2,935 | 4,696 |
+| SQLite | synchronous=normal | 640 | 3,202 | 5,123 | 3,528 | 5,645 |
+| Postgres | Docker postgres:18.3, pool=24 | 137 | 686 | 1,098 | 1,121 | 1,793 |
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The

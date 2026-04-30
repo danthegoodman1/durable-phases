@@ -247,6 +247,7 @@ export type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
 export type ClaimedActivationWithInstance = {
   activation: ClaimedActivation
   instance: ActivationInstanceSnapshot
+  effects: EffectRecord[]
 }
 
 export type ClaimReadyActivationsResult = {
@@ -258,6 +259,7 @@ export type ClaimReadyActivationResult =
   | {
       activation: ClaimedActivation
       instance: ActivationInstanceSnapshot
+      effects: EffectRecord[]
       nextWakeAt?: undefined
     }
   | {
@@ -369,11 +371,79 @@ export type CommitCheckpointInput = {
   now: string
   consumeSignalId?: string
   consumeChildRecordId?: string
+  effects?: CheckpointEffectMutation[]
 }
 
 export type CommitCheckpointResult = {
   ok: boolean
   sequence: number
+  reason?: string
+}
+
+export type CheckpointEffectMutation =
+  | {
+      key: string
+      status: "completed"
+      result: JsonValue
+      heartbeatDetails?: JsonValue
+      attempt?: number
+      idempotencyKey?: string
+      firstAttemptStartedAt?: string
+      maxAttempts?: number
+      maxElapsedMs?: number | null
+      initialIntervalMs?: number
+      maxIntervalMs?: number
+      backoffCoefficient?: number
+      nonRetryableErrorNames?: string[]
+    }
+  | {
+      key: string
+      status: "failed"
+      error: SerializedError
+      retryable?: boolean
+      heartbeatDetails?: JsonValue
+      attempt?: number
+      idempotencyKey?: string
+      firstAttemptStartedAt?: string
+      maxAttempts?: number
+      maxElapsedMs?: number | null
+      initialIntervalMs?: number
+      maxIntervalMs?: number
+      backoffCoefficient?: number
+      nonRetryableErrorNames?: string[]
+    }
+  | {
+      key: string
+      status: "retry_scheduled"
+      error: SerializedError
+      nextAttemptAt: string
+      nextAttempt: number
+      heartbeatDetails?: JsonValue
+      attempt?: number
+      idempotencyKey?: string
+      firstAttemptStartedAt?: string
+      maxAttempts?: number
+      maxElapsedMs?: number | null
+      initialIntervalMs?: number
+      maxIntervalMs?: number
+      backoffCoefficient?: number
+      nonRetryableErrorNames?: string[]
+    }
+
+export type CommitActivationInput = CommitCheckpointInput
+
+export type CommitActivationsResult = {
+  results: Array<CommitCheckpointResult & { activationId: string }>
+}
+
+export type RecordActivationFailureInput = {
+  workflowId: string
+  runId: string
+  activationId: string
+  workerId: string
+  now: string
+  effects: CheckpointEffectMutation[]
+  releaseActivation?: boolean
 }
 
 export type DurabilityProvider = {
@@ -395,7 +465,9 @@ export type DurabilityProvider = {
   heartbeatEffect(input: HeartbeatEffectInput): Promise<void>
   completeEffect(input: CompleteEffectInput): Promise<void>
   failEffect(input: FailEffectInput): Promise<FailEffectResult>
+  commitActivations(input: CommitActivationInput[]): Promise<CommitActivationsResult>
   commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
+  recordActivationFailures(input: RecordActivationFailureInput[]): Promise<void>
 }
 
 export function workflowPartitionShard(workflowId: string, runId: string, shardCount: number): number {
