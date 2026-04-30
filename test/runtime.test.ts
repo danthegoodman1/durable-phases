@@ -1466,7 +1466,8 @@ describe("durable workflow PoC", () => {
         aborted: false,
       },
     ])
-    const effects = (await provider.loadInstance(ref))?.effects ?? []
+    expect("effects" in (await provider.loadInstance(ref))!).toBe(false)
+    const effects = (await provider.loadInstance(ref, { includeEffects: true }))?.effects ?? []
     expect(effects.find((effect) => effect.key === "with_context")).toMatchObject({
       status: "completed",
       attempt: 1,
@@ -1517,7 +1518,7 @@ describe("durable workflow PoC", () => {
 
     await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
     expect(attempts).toEqual([1])
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "pending",
       attempt: 2,
       maxAttempts: 3,
@@ -1537,7 +1538,7 @@ describe("durable workflow PoC", () => {
     clock.advance(1_000)
     await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
     expect(attempts).toEqual([1, 2])
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "pending",
       attempt: 3,
       nextAttemptAt: "2026-01-01T00:00:03.000Z",
@@ -1600,7 +1601,7 @@ describe("durable workflow PoC", () => {
 
     await runtime.drain({ maxActivations: 1 })
     expect(attempts).toEqual([1])
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       attempt: 2,
       nextAttemptAt: "2026-01-01T00:00:01.000Z",
       maxElapsedMs: 1_500,
@@ -1609,7 +1610,7 @@ describe("durable workflow PoC", () => {
     clock.advance(1_000)
     await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("boom 2")
     expect(attempts).toEqual([1, 2])
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "failed",
       attempt: 2,
       lastFailure: { message: "boom 2", name: "Error" },
@@ -1654,7 +1655,7 @@ describe("durable workflow PoC", () => {
     await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
     await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("still failing 2")
     expect(attempts).toEqual([1, 2])
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "failed",
       attempt: 2,
       nextAttemptAt: undefined,
@@ -1711,7 +1712,7 @@ describe("durable workflow PoC", () => {
     )
     await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("validation failed")
     expect(nonRetryableCalls).toEqual([1])
-    expect((await provider.loadInstance(nonRetryableRef))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(nonRetryableRef, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "failed",
       attempt: 1,
       nextAttemptAt: undefined,
@@ -1730,7 +1731,7 @@ describe("durable workflow PoC", () => {
     )
     await expect(abortRuntime.drain({ maxActivations: 1 })).rejects.toThrow("timed out locally")
     expect(abortCalls).toEqual([1])
-    expect((await abortProvider.loadInstance(abortRef))?.effects[0]).toMatchObject({
+    expect((await abortProvider.loadInstance(abortRef, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "failed",
       attempt: 1,
       nextAttemptAt: undefined,
@@ -1888,7 +1889,7 @@ describe("durable workflow PoC", () => {
 
     abort.abort()
     await expect(running).resolves.toEqual({ activations: 0 })
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       key: "cooperative",
       status: "pending",
     })
@@ -1967,7 +1968,7 @@ describe("durable workflow PoC", () => {
       now: "2026-01-01T00:00:00.500Z",
       details: { bytes: 256 },
     })
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       attempt: 1,
       startToCloseDeadline: "2026-01-01T00:00:01.000Z",
       heartbeatDeadline: "2026-01-01T00:00:05.500Z",
@@ -1982,7 +1983,7 @@ describe("durable workflow PoC", () => {
         leaseMs: 60_000,
       }),
     ).rejects.toThrow("Lost activation lease")
-    const timedOut = (await provider.loadInstance(ref))?.effects[0]
+    const timedOut = (await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]
     expect(timedOut).toMatchObject({
       status: "pending",
       attempt: 2,
@@ -2091,7 +2092,7 @@ describe("durable workflow PoC", () => {
         leaseMs: 60_000,
       }),
     ).rejects.toThrow("Lost activation lease")
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "failed",
       timeoutKind: "heartbeat",
       error: {
@@ -2185,7 +2186,7 @@ describe("durable workflow PoC", () => {
       result: { ok: true },
       now: "2026-01-01T00:01:00.000Z",
     })
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "completed",
       startToCloseDeadline: undefined,
       heartbeatDeadline: undefined,
@@ -2239,7 +2240,7 @@ describe("durable workflow PoC", () => {
         leaseMs: 60_000,
       }),
     ).resolves.toEqual({ activation: null })
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       status: "pending",
       attempt: 1,
       attemptOwnerId: "worker-a",
@@ -2314,7 +2315,7 @@ describe("durable workflow PoC", () => {
         leaseMs: 60_000,
       }),
     ).rejects.toThrow("Lost activation lease")
-    const effects = (await provider.loadInstance(ref))?.effects ?? []
+    const effects = (await provider.loadInstance(ref, { includeEffects: true }))?.effects ?? []
     expect(effects.find((effect) => effect.key === "short")).toMatchObject({
       status: "failed",
       attempt: 1,
@@ -2427,7 +2428,7 @@ describe("durable workflow PoC", () => {
       attempt: 1,
       idempotencyKey: first.idempotencyKey,
     })
-    expect((await provider.loadInstance(ref))?.effects[0]).toMatchObject({
+    expect((await provider.loadInstance(ref, { includeEffects: true }))?.effects?.[0]).toMatchObject({
       heartbeatTimeoutMs: undefined,
       heartbeatDeadline: undefined,
       maxAttempts: 3,
@@ -3810,6 +3811,153 @@ describe("durable workflow PoC", () => {
         expect.objectContaining({ status: "completed", output: { index: 1 } }),
         expect.objectContaining({ status: "completed", output: { index: 2 } }),
         expect.objectContaining({ status: "completed", output: { index: 3 } }),
+      ]),
+    )
+  })
+
+  it("prefetches activation claims ahead of execution slots and heartbeats queued claims", async () => {
+    const clock = manualClock()
+    const started: number[] = []
+    const releaseFirst = deferred()
+    const PrefetchWorkflow = defineWorkflow({
+      name: "activation_prefetch",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            started.push(common.index)
+            if (common.index === 0) {
+              await releaseFirst.promise
+            }
+            return complete({ index: common.index })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [PrefetchWorkflow],
+      workerId: "prefetch-worker",
+      maxConcurrentActivations: 1,
+      activationPrefetchLimit: 3,
+      activationLeaseMs: 10,
+      leaseHeartbeatIntervalMs: 1,
+    })
+    const refs = await Promise.all(
+      Array.from({ length: 3 }, (_value, index) =>
+        runtime.start(PrefetchWorkflow, { index }, { workflowId: `prefetch-${index}` }),
+      ),
+    )
+
+    const draining = runtime.drain({ maxActivations: 3 })
+    await waitFor(() => started.length === 1)
+
+    let ownedClaims = (await provider.listActivationClaims()).filter(
+      (claim) => claim.ownerId === "prefetch-worker",
+    )
+    const deadline = Date.now() + 250
+    while (ownedClaims.length < 3 && Date.now() <= deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      ownedClaims = (await provider.listActivationClaims()).filter(
+        (claim) => claim.ownerId === "prefetch-worker",
+      )
+    }
+    expect(ownedClaims).toHaveLength(3)
+    expect(started).toEqual([0])
+
+    clock.advance(8)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    clock.advance(8)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await expect(
+      provider.heartbeatActivations({
+        activationIds: ownedClaims.map((claim) => claim.activationId),
+        workerId: "prefetch-worker",
+        now: clock.clock().toISOString(),
+        leaseMs: 10,
+      }),
+    ).resolves.toBeUndefined()
+
+    releaseFirst.resolve()
+    await expect(draining).resolves.toEqual({ activations: 3 })
+    await expect(Promise.all(refs.map((ref) => provider.loadInstance(ref)))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "completed", output: { index: 0 } }),
+        expect.objectContaining({ status: "completed", output: { index: 1 } }),
+        expect.objectContaining({ status: "completed", output: { index: 2 } }),
+      ]),
+    )
+  })
+
+  it("releases prefetched queued activations when a running activation fails", async () => {
+    let badAttempts = 0
+    const FailPrefetchWorkflow = defineWorkflow({
+      name: "activation_prefetch_failure",
+      version: 1,
+      input: z.object({ kind: z.enum(["bad", "ok"]) }),
+      output: z.object({ kind: z.string() }),
+      common: z.object({ kind: z.enum(["bad", "ok"]) }),
+      initial(input) {
+        return start({ common: { kind: input.kind }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            if (common.kind === "bad") {
+              badAttempts += 1
+              if (badAttempts === 1) {
+                throw new Error("prefetch failure")
+              }
+            }
+            return complete({ kind: common.kind })
+          },
+        }),
+      },
+    })
+
+    const path = await storePath()
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [FailPrefetchWorkflow],
+      workerId: "prefetch-failure-worker",
+      maxConcurrentActivations: 1,
+      activationPrefetchLimit: 3,
+    })
+    await runtime.start(FailPrefetchWorkflow, { kind: "bad" }, { workflowId: "a-prefetch-bad" })
+    const okRefs = await Promise.all([
+      runtime.start(FailPrefetchWorkflow, { kind: "ok" }, { workflowId: "b-prefetch-ok" }),
+      runtime.start(FailPrefetchWorkflow, { kind: "ok" }, { workflowId: "c-prefetch-ok" }),
+    ])
+
+    await expect(runtime.drain({ maxActivations: 3 })).rejects.toThrow("prefetch failure")
+    const queuedClaims = (await provider.listActivationClaims()).filter((claim) =>
+      okRefs.some((ref) => ref.workflowId === claim.workflowId),
+    )
+    expect(queuedClaims).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ownerId: undefined }),
+        expect.objectContaining({ ownerId: undefined }),
+      ]),
+    )
+
+    const recovery = new DurableRuntime(testProvider(path), {
+      workflows: [FailPrefetchWorkflow],
+      workerId: "prefetch-recovery-worker",
+      maxConcurrentActivations: 2,
+    })
+    await expect(recovery.drain({ maxActivations: 3 })).resolves.toEqual({ activations: 3 })
+    await expect(Promise.all(okRefs.map((ref) => provider.loadInstance(ref)))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "completed" }),
+        expect.objectContaining({ status: "completed" }),
       ]),
     )
   })

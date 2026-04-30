@@ -87,7 +87,11 @@ export type ActivationInstanceSnapshot = {
 }
 
 export type PersistedInstance = ActivationInstanceSnapshot & {
-  effects: EffectRecord[]
+  effects?: EffectRecord[]
+}
+
+export type LoadInstanceOptions = {
+  includeEffects?: boolean
 }
 
 export type ChildRecord = {
@@ -269,8 +273,20 @@ export type HeartbeatActivationInput = {
   leaseMs: number
 }
 
+export type HeartbeatActivationsInput = {
+  activationIds: string[]
+  workerId: string
+  now: string
+  leaseMs: number
+}
+
 export type ReleaseActivationInput = {
   activationId: string
+  workerId: string
+}
+
+export type ReleaseActivationsInput = {
+  activationIds: string[]
   workerId: string
 }
 
@@ -364,14 +380,16 @@ export type DurabilityProvider = {
   createInstance(input: CreateInstanceInput): Promise<InstanceRef>
   createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
   cancelChild(input: CancelChildInput): Promise<void>
-  loadInstance(ref: InstanceRef): Promise<PersistedInstance | null>
+  loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>
   releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void>
   claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult>
   claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
+  heartbeatActivations(input: HeartbeatActivationsInput): Promise<void>
   heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
+  releaseActivations(input: ReleaseActivationsInput): Promise<void>
   releaseActivation(input: ReleaseActivationInput): Promise<void>
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
   heartbeatEffect(input: HeartbeatEffectInput): Promise<void>

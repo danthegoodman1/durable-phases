@@ -297,6 +297,21 @@ export function describeDurabilityProviderConformance(
         const reclaimed = requireActivation(await claim(providerB, "worker-b", T1))
         expect(reclaimed.activationId).toBe(first.activationId)
         expect(reclaimed).toMatchObject({ kind: "run", sequence: 0 })
+        await expect(
+          providerB.heartbeatActivations({
+            activationIds: [reclaimed.activationId],
+            workerId: "worker-b",
+            now: T1,
+            leaseMs: LONG_LEASE_MS,
+          }),
+        ).resolves.toBeUndefined()
+        await providerB.releaseActivations({
+          activationIds: [reclaimed.activationId],
+          workerId: "worker-b",
+        })
+        await expect(claim(providerB, "worker-b", T1)).resolves.toMatchObject({
+          activation: expect.objectContaining({ activationId: reclaimed.activationId }),
+        })
       })
     })
 
@@ -682,6 +697,16 @@ export function describeDurabilityProviderConformance(
           attemptId: reservation.attemptId,
           result: { ok: true },
           now: T0,
+        })
+        expect("effects" in (await provider.loadInstance(ref))!).toBe(false)
+        await expect(provider.loadInstance(ref, { includeEffects: true })).resolves.toMatchObject({
+          effects: [
+            expect.objectContaining({
+              key: "work",
+              status: "completed",
+              heartbeatDetails: { progress: 1 },
+            }),
+          ],
         })
         await expect(
           provider.getOrReserveEffect({

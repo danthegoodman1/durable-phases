@@ -22,6 +22,7 @@ export type BenchmarkOptions = {
   workers: number
   shards: number
   activationConcurrency: number
+  activationPrefetchLimit: number
   activityDelayMs: number
   sqliteSynchronous: "full" | "normal"
   batch: number
@@ -58,6 +59,7 @@ const defaultOptions: BenchmarkOptions = {
   workers: 4,
   shards: 4,
   activationConcurrency: 4,
+  activationPrefetchLimit: 32,
   activityDelayMs: 0,
   sqliteSynchronous: "full",
   batch: 32,
@@ -70,7 +72,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, SQLite synchronous ${options.sqliteSynchronous}...\n\n`,
+      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, SQLite synchronous ${options.sqliteSynchronous}...\n\n`,
     )
   }
   const result = await runSqliteBenchmark(options)
@@ -103,6 +105,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       shardCount: options.shards,
       dispatchShardIds: dispatchShardIdsForWorker(workerIndex, options.workers, options.shards),
       maxConcurrentActivations: options.activationConcurrency,
+      activationPrefetchLimit: options.activationPrefetchLimit,
       dispatchLeaseMs: 30_000,
       activationLeaseMs: 30_000,
     })
@@ -138,7 +141,12 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
 
     for (; rounds < options.maxRounds; rounds += 1) {
       const drainResults = await Promise.all(
-        runtimes.map((runtime) => runtime.drain({ maxActivations: options.batch })),
+        runtimes.map((runtime) =>
+          runtime.drain({
+            maxActivations: options.batch,
+            activationPrefetchLimit: options.activationPrefetchLimit,
+          }),
+        ),
       )
       activations += drainResults.reduce((total, result) => total + result.activations, 0)
       if (activations >= expectedActivations) {
@@ -243,6 +251,8 @@ function parseArgs(args: string[]): BenchmarkOptions {
       options.shards = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--activation-concurrency") {
       options.activationConcurrency = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--activation-prefetch-limit") {
+      options.activationPrefetchLimit = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--activity-delay-ms") {
       options.activityDelayMs = parseNonNegativeInteger(nextValue(), flag)
     } else if (flag === "--sqlite-synchronous") {
@@ -297,6 +307,8 @@ Options:
   --shards <n>      Dispatch shard count. Default: ${defaultOptions.shards}
   --activation-concurrency <n>
                     Max concurrent activations per worker. Default: ${defaultOptions.activationConcurrency}
+  --activation-prefetch-limit <n>
+                    Claimed activations to keep leased ahead of execution. Default: ${defaultOptions.activationPrefetchLimit}
   --activity-delay-ms <n>
                     Async delay inside each activity. Default: ${defaultOptions.activityDelayMs}
   --sqlite-synchronous <full|normal>
@@ -316,6 +328,7 @@ function printResult(result: BenchmarkResult): void {
   committed workers: ${result.committedWorkers}
   shards: ${result.options.shards}
   activation concurrency: ${result.options.activationConcurrency} per worker
+  activation prefetch limit: ${result.options.activationPrefetchLimit}
   activity delay: ${formatMs(result.options.activityDelayMs)}
   SQLite synchronous: ${result.options.sqliteSynchronous}
   batch: ${result.options.batch}

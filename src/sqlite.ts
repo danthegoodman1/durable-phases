@@ -26,11 +26,14 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  HeartbeatActivationsInput,
   HeartbeatActivationInput,
   HeartbeatDispatchShardInput,
   HeartbeatEffectInput,
+  LoadInstanceOptions,
   PersistedInstance,
   ReadyEvent,
+  ReleaseActivationsInput,
   ReleaseActivationInput,
   ReleaseDispatchShardInput,
   ReserveEffectInput,
@@ -611,15 +614,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  async loadInstance(ref: InstanceRef): Promise<PersistedInstance | null> {
+  async loadInstance(ref: InstanceRef, options: LoadInstanceOptions = {}): Promise<PersistedInstance | null> {
     const row = this.instanceRow(ref)
-    return row ? this.persistedInstance(row) : null
+    return row ? this.persistedInstance(row, options) : null
   }
 
-  async listInstances(): Promise<PersistedInstance[]> {
+  async listInstances(options: LoadInstanceOptions = {}): Promise<PersistedInstance[]> {
     return this.prepare("SELECT * FROM instances ORDER BY workflow_id, run_id")
       .all()
-      .map((row) => this.persistedInstance(requireRow<InstanceRow>(row)))
+      .map((row) => this.persistedInstance(requireRow<InstanceRow>(row), options))
   }
 
   async listSignals(): Promise<SignalRecord[]> {
@@ -907,34 +910,40 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
   }
 
-  async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
+  async heartbeatActivations(input: HeartbeatActivationsInput): Promise<void> {
+    const activationIds = [...new Set(input.activationIds)]
+    if (activationIds.length === 0) {
+      return
+    }
     const heartbeat = this.db.transaction(() => {
-      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      for (const activationId of activationIds) {
+        this.expireActivityTimeouts(input.now, { activationId })
+      }
       return this.prepare(
           `
           UPDATE activation_claims
           SET lease_until = ?
-          WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+          WHERE activation_id IN (${activationIds.map(() => "?").join(", ")}) AND owner_id = ? AND completed_by_sequence IS NULL
             AND lease_until >= ?
         `,
         )
-        .run(addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now)
+        .run(addMs(input.now, input.leaseMs), ...activationIds, input.workerId, input.now)
     })
     const result = this.withBufferedObservability(() => heartbeat.immediate() as SqliteRunResult)
-    if (result.changes === 0) {
+    if (result.changes !== activationIds.length) {
       this.log("warn", "provider.activation.heartbeat_failed", {
         workerId: input.workerId,
-        activationId: input.activationId,
+        activationIds,
       })
       this.count("durable.provider.activation.heartbeat", {
         workerId: input.workerId,
         status: "failed",
       })
-      throw new Error(`Lost activation lease: ${input.activationId}`)
+      throw new Error(`Lost activation lease: ${activationIds.join(", ")}`)
     }
     this.log("debug", "provider.activation.heartbeat", {
       workerId: input.workerId,
-      activationId: input.activationId,
+      activationIds,
     })
     this.count("durable.provider.activation.heartbeat", {
       workerId: input.workerId,
@@ -942,22 +951,42 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  async releaseActivation(input: ReleaseActivationInput): Promise<void> {
+  async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
+    await this.heartbeatActivations({
+      activationIds: [input.activationId],
+      workerId: input.workerId,
+      now: input.now,
+      leaseMs: input.leaseMs,
+    })
+  }
+
+  async releaseActivations(input: ReleaseActivationsInput): Promise<void> {
+    const activationIds = [...new Set(input.activationIds)]
+    if (activationIds.length === 0) {
+      return
+    }
     this.prepare(
         `
         UPDATE activation_claims
         SET owner_id = NULL, lease_until = NULL
-        WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+        WHERE activation_id IN (${activationIds.map(() => "?").join(", ")}) AND owner_id = ? AND completed_by_sequence IS NULL
       `,
       )
-      .run(input.activationId, input.workerId)
+      .run(...activationIds, input.workerId)
     this.log("debug", "provider.activation.release", {
       workerId: input.workerId,
-      activationId: input.activationId,
+      activationIds,
     })
     this.count("durable.provider.activation.release", {
       workerId: input.workerId,
       status: "released",
+    })
+  }
+
+  async releaseActivation(input: ReleaseActivationInput): Promise<void> {
+    await this.releaseActivations({
+      activationIds: [input.activationId],
+      workerId: input.workerId,
     })
   }
 
@@ -1639,15 +1668,14 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     }
   }
 
-  private persistedInstance(row: InstanceRow): PersistedInstance {
-    const effects = this.prepare("SELECT * FROM effects WHERE workflow_id = ? AND run_id = ? ORDER BY effect_id")
-      .all(row.workflow_id, row.run_id)
-      .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
-
-    return {
-      ...this.activationInstanceSnapshot(row),
-      effects,
+  private persistedInstance(row: InstanceRow, options: LoadInstanceOptions = {}): PersistedInstance {
+    const instance: PersistedInstance = this.activationInstanceSnapshot(row)
+    if (options.includeEffects) {
+      instance.effects = this.prepare("SELECT * FROM effects WHERE workflow_id = ? AND run_id = ? ORDER BY effect_id")
+        .all(row.workflow_id, row.run_id)
+        .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
     }
+    return instance
   }
 
   private rebuildAllReadyEvents(): void {

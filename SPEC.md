@@ -797,7 +797,7 @@ Conceptually:
 ```ts
 type DurabilityProvider = {
   createInstance(input: CreateInstanceInput): Promise<CreateInstanceResult>
-  loadInstance(ref: InstanceRef): Promise<PersistedInstance | null>
+  loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
 
@@ -807,7 +807,9 @@ type DurabilityProvider = {
 
   claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult>
   claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
+  heartbeatActivations(input: HeartbeatActivationsInput): Promise<void>
   heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
+  releaseActivations(input: ReleaseActivationsInput): Promise<void>
   releaseActivation(input: ReleaseActivationInput): Promise<void>
 
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
@@ -872,7 +874,15 @@ If the requested workflow id already exists, the provider applies the requested 
 
 ### Snapshot reads
 
-`loadInstance(...)` returns the latest committed instance snapshot visible to the caller.
+`loadInstance(...)` returns the latest committed instance snapshot visible to
+the caller. By default this is a lean snapshot and does not include the effect
+ledger. Debug and conformance callers that need effects request them explicitly:
+
+```ts
+type LoadInstanceOptions = {
+  includeEffects?: boolean
+}
+```
 
 The read must be consistent for one committed sequence. It may run concurrently with a claimed activation for the same instance and must not expose partial effect records, pending transition output, or uncommitted checkpoint writes.
 
@@ -944,6 +954,12 @@ is the durable lease owner recorded on shard leases, activation leases, and effe
 attempt ownership. Activation concurrency is a local worker setting that controls
 how many claimed activations that worker may execute at once.
 
+TypeScript workers also have an activation prefetch limit. Prefetching controls
+how many claimed activation leases the worker may hold ahead of execution, while
+activation concurrency still controls how many handlers run at the same time.
+Workers must heartbeat both queued and running activation leases and release
+queued claims on shutdown, abort, or fatal handler error.
+
 Activities currently execute inside activation slots. A long-running activity
 therefore occupies one activation slot until it completes, fails, retries, or is
 aborted. A later dedicated activity executor may add a separate activity
@@ -992,6 +1008,8 @@ run phases that should execute immediately
 When more than one wait is ready for an instance, the provider and runtime must select the winner using the canonical wait ordering rules.
 
 Claims are leased. If a worker crashes, another worker may claim the activation after the lease expires.
+Providers should expose batch heartbeat/release helpers so a worker can manage
+prefetched activation leases without issuing one provider call per queued claim.
 
 In a sharded provider, claim calls should verify that the caller owns the dispatch shard for the requested work, or otherwise use an equivalent mechanism that prevents all workers from scanning all shards.
 

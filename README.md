@@ -55,7 +55,8 @@ production guarantee.
 
 ```bash
 npm run benchmark -- --activation-concurrency 4 --sqlite-synchronous full
-npm run benchmark:postgres -- --activation-concurrency 4 --json
+npm run benchmark:postgres -- --activation-concurrency 4 --activation-prefetch-limit 32 --json
+npm run benchmark:postgres -- --profile-queries --json
 ```
 
 The benchmark now reports setup, processing, and verification time separately.
@@ -63,13 +64,14 @@ Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
 
 Measured on this workspace with 250 workflows, 4 workers, 4 shards, batch 32,
-activation concurrency 4, and zero artificial activity delay:
+activation concurrency 4, activation prefetch limit 32, and zero artificial
+activity delay:
 
 | Provider | durability mode | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| SQLite | synchronous=full | 263 | 1,313 | 2,100 | 1,419 | 2,271 |
-| SQLite | synchronous=normal | 339 | 1,695 | 2,712 | 1,788 | 2,861 |
-| Postgres | Docker postgres:18.3, pool=24 | 112 | 562 | 899 | 786 | 1,257 |
+| SQLite | synchronous=full | 478 | 2,392 | 3,828 | 2,680 | 4,289 |
+| SQLite | synchronous=normal | 638 | 3,188 | 5,100 | 3,497 | 5,595 |
+| Postgres | Docker postgres:18.3, pool=24 | 167 | 835 | 1,336 | 1,402 | 2,243 |
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The

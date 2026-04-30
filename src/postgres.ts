@@ -24,11 +24,14 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  HeartbeatActivationsInput,
   HeartbeatActivationInput,
   HeartbeatDispatchShardInput,
   HeartbeatEffectInput,
+  LoadInstanceOptions,
   PersistedInstance,
   ReadyEvent,
+  ReleaseActivationsInput,
   ReleaseActivationInput,
   ReleaseDispatchShardInput,
   ReserveEffectInput,
@@ -167,6 +170,11 @@ type DispatchShardRow = {
   lease_until: Date | string | null
 }
 
+type ActivityDeadlineRow = {
+  effect_id: string
+  activation_id: string
+}
+
 type ReadyEventRow = {
   ready_event_id: string
   workflow_id: string
@@ -233,6 +241,23 @@ type ReadyEventInstanceState = {
   status: InstanceRow["status"]
   waits: DurableWait[]
   updatedAt: string
+}
+
+type ReadyEventInsert = {
+  readyEventId: string
+  workflowId: string
+  runId: string
+  workflowName: string
+  workflowVersion: number
+  partitionShard: number
+  sequence: number
+  kind: ReadyEventRow["kind"]
+  waitName: string | null
+  activationId: string | null
+  readyAt: string
+  sortKey: string
+  wait: DurableWait | null
+  event: ReadyEvent | null
 }
 
 export class PostgresDurabilityProvider implements DurabilityProvider {
@@ -360,17 +385,17 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  async loadInstance(ref: InstanceRef): Promise<PersistedInstance | null> {
+  async loadInstance(ref: InstanceRef, options: LoadInstanceOptions = {}): Promise<PersistedInstance | null> {
     const row = await this.instanceRow(this.pool, ref)
-    return row ? await this.persistedInstance(this.pool, row) : null
+    return row ? await this.persistedInstance(this.pool, row, options) : null
   }
 
-  async listInstances(): Promise<PersistedInstance[]> {
+  async listInstances(options: LoadInstanceOptions = {}): Promise<PersistedInstance[]> {
     const rows = await this.rows<InstanceRow>(
       this.pool,
       `SELECT * FROM ${this.table("instances")} ORDER BY workflow_id, run_id`,
     )
-    return Promise.all(rows.map((row) => this.persistedInstance(this.pool, row)))
+    return Promise.all(rows.map((row) => this.persistedInstance(this.pool, row, options)))
   }
 
   async listSignals(): Promise<SignalRecord[]> {
@@ -595,22 +620,33 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       )
       const claims: ClaimedActivationWithInstance[] = []
       const claimedSequences = new Set<string>()
-
+      const claimableCandidates: ReadyCandidate[] = []
       for (const candidate of candidates) {
-        if (claims.length >= limit) {
+        if (claimableCandidates.length >= limit) {
           break
         }
         const sequenceKey = `${candidate.workflowId}\0${candidate.runId}\0${candidate.sequence}`
         if (claimedSequences.has(sequenceKey)) {
           continue
         }
-        if (!(await this.tryWriteActivationClaim(client, candidate, input.workerId, input.now, input.leaseMs))) {
+        claimedSequences.add(sequenceKey)
+        claimableCandidates.push(candidate)
+      }
+
+      const claimedActivationIds = await this.writeActivationClaims(
+        client,
+        claimableCandidates,
+        input.workerId,
+        input.now,
+        input.leaseMs,
+      )
+      for (const candidate of claimableCandidates) {
+        if (!claimedActivationIds.has(candidate.activationId)) {
           continue
         }
         if (candidate.instance.status !== "running" || candidate.instance.sequence !== candidate.sequence) {
           continue
         }
-        claimedSequences.add(sequenceKey)
         claims.push({
           activation: stripCandidateMetadata(candidate),
           instance: this.activationInstanceSnapshot(candidate.instance),
@@ -653,33 +689,37 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return { activation: first.activation, instance: first.instance }
   }
 
-  async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
+  async heartbeatActivations(input: HeartbeatActivationsInput): Promise<void> {
+    const activationIds = [...new Set(input.activationIds)]
+    if (activationIds.length === 0) {
+      return
+    }
     const result = await this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
+      await this.expireActivityTimeouts(client, input.now, { activationIds })
       return client.query(
         `
         UPDATE ${this.table("activation_claims")}
         SET lease_until = $1::timestamptz
-        WHERE activation_id = $2 AND owner_id = $3 AND completed_by_sequence IS NULL
+        WHERE activation_id = ANY($2::text[]) AND owner_id = $3 AND completed_by_sequence IS NULL
           AND lease_until >= $4::timestamptz
         `,
-        [addMs(input.now, input.leaseMs), input.activationId, input.workerId, input.now],
+        [addMs(input.now, input.leaseMs), activationIds, input.workerId, input.now],
       )
     })
-    if (result.rowCount === 0) {
+    if (result.rowCount !== activationIds.length) {
       this.log("warn", "provider.activation.heartbeat_failed", {
         workerId: input.workerId,
-        activationId: input.activationId,
+        activationIds,
       })
       this.count("durable.provider.activation.heartbeat", {
         workerId: input.workerId,
         status: "failed",
       })
-      throw new Error(`Lost activation lease: ${input.activationId}`)
+      throw new Error(`Lost activation lease: ${activationIds.join(", ")}`)
     }
     this.log("debug", "provider.activation.heartbeat", {
       workerId: input.workerId,
-      activationId: input.activationId,
+      activationIds,
     })
     this.count("durable.provider.activation.heartbeat", {
       workerId: input.workerId,
@@ -687,18 +727,31 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  async releaseActivation(input: ReleaseActivationInput): Promise<void> {
+  async heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
+    await this.heartbeatActivations({
+      activationIds: [input.activationId],
+      workerId: input.workerId,
+      now: input.now,
+      leaseMs: input.leaseMs,
+    })
+  }
+
+  async releaseActivations(input: ReleaseActivationsInput): Promise<void> {
+    const activationIds = [...new Set(input.activationIds)]
+    if (activationIds.length === 0) {
+      return
+    }
     await this.pool.query(
       `
       UPDATE ${this.table("activation_claims")}
       SET owner_id = NULL, lease_until = NULL
-      WHERE activation_id = $1 AND owner_id = $2 AND completed_by_sequence IS NULL
+      WHERE activation_id = ANY($1::text[]) AND owner_id = $2 AND completed_by_sequence IS NULL
       `,
-      [input.activationId, input.workerId],
+      [activationIds, input.workerId],
     )
     this.log("debug", "provider.activation.release", {
       workerId: input.workerId,
-      activationId: input.activationId,
+      activationIds,
     })
     this.count("durable.provider.activation.release", {
       workerId: input.workerId,
@@ -706,9 +759,15 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     })
   }
 
+  async releaseActivation(input: ReleaseActivationInput): Promise<void> {
+    await this.releaseActivations({
+      activationIds: [input.activationId],
+      workerId: input.workerId,
+    })
+  }
+
   async getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
     return this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
       const options = normalizeEffectOptions(input)
       const effectId = `effect-${randomUUID()}`
       const attemptId = `attempt-${randomUUID()}`
@@ -737,6 +796,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
             AND a.owner_id = $8
             AND a.completed_by_sequence IS NULL
             AND a.lease_until >= $9::timestamptz
+            AND NOT EXISTS (
+              SELECT 1 FROM ${this.table("activity_deadlines")} d
+              WHERE d.activation_id = $4 AND d.deadline_at <= $9::timestamptz
+            )
         )
         ON CONFLICT (workflow_id, run_id, activation_id, key) DO NOTHING
         RETURNING *
@@ -764,6 +827,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         ],
       )
       if (inserted) {
+        await this.syncActivityDeadline(client, inserted)
         this.log("debug", "provider.effect.reserve", {
           workerId: input.workerId,
           workflowId: input.workflowId,
@@ -851,19 +915,24 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async heartbeatEffect(input: HeartbeatEffectInput): Promise<void> {
     const result = await this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
       await this.assertLiveActivationLease(client, input)
       const effect = await this.effectRow(client, input)
       const heartbeatDeadline = effect?.heartbeat_timeout_ms
         ? addMs(input.now, effect.heartbeat_timeout_ms)
         : null
-      return client.query(
+      const row = await this.one<EffectRow>(
+        client,
         `
         UPDATE ${this.table("effects")}
         SET heartbeat_at = $1::timestamptz, heartbeat_details_json = $2::jsonb,
           heartbeat_deadline = $3::timestamptz
         WHERE workflow_id = $4 AND run_id = $5 AND activation_id = $6 AND effect_id = $7
           AND attempt_id = $8 AND status = 'pending'
+          AND NOT EXISTS (
+            SELECT 1 FROM ${this.table("activity_deadlines")} d
+            WHERE d.effect_id = $7 AND d.deadline_at <= $1::timestamptz
+          )
+        RETURNING *
         `,
         [
           input.now,
@@ -876,8 +945,12 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input.attemptId,
         ],
       )
+      if (row) {
+        await this.syncActivityDeadline(client, row)
+      }
+      return row
     })
-    if (result.rowCount === 0) {
+    if (!result) {
       await this.throwEffectMutationError(input)
     }
     this.log("debug", "provider.effect.heartbeat", {
@@ -893,8 +966,8 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async completeEffect(input: CompleteEffectInput): Promise<void> {
     const result = await this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
-      return client.query(
+      const row = await this.one<Pick<EffectRow, "start_to_close_timeout_ms" | "heartbeat_timeout_ms">>(
+        client,
         `
         UPDATE ${this.table("effects")}
         SET status = 'completed', result_json = $1::jsonb, error_json = NULL,
@@ -909,7 +982,12 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
               AND a.owner_id = $7
               AND a.completed_by_sequence IS NULL
               AND a.lease_until >= $8::timestamptz
+              AND NOT EXISTS (
+                SELECT 1 FROM ${this.table("activity_deadlines")} d
+                WHERE d.effect_id = $5 AND d.deadline_at <= $8::timestamptz
+              )
           )
+        RETURNING start_to_close_timeout_ms, heartbeat_timeout_ms
         `,
         [
           encodeJson(input.result),
@@ -922,8 +1000,12 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input.now,
         ],
       )
+      if (row && (row.start_to_close_timeout_ms !== null || row.heartbeat_timeout_ms !== null)) {
+        await this.deleteActivityDeadline(client, input.effectId)
+      }
+      return row
     })
-    if (result.rowCount === 0) {
+    if (!result) {
       await this.throwEffectMutationError(input)
     }
     this.log("debug", "provider.effect.complete", {
@@ -939,7 +1021,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async failEffect(input: FailEffectInput): Promise<FailEffectResult> {
     const output = await this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
       await this.assertLiveActivationLease(client, input)
       const effect = await this.effectRow(client, input)
       if (!effect || effect.status !== "pending" || effect.attempt_id !== input.attemptId) {
@@ -965,6 +1046,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
             input.attemptId,
           ],
         )
+        if (result.rowCount && result.rowCount > 0) {
+          await this.deleteActivityDeadline(client, input.effectId)
+        }
         this.log("info", "provider.effect.retry", {
           workerId: input.workerId,
           workflowId: input.workflowId,
@@ -999,6 +1083,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input.attemptId,
         ],
       )
+      if (result.rowCount && result.rowCount > 0) {
+        await this.deleteActivityDeadline(client, input.effectId)
+      }
       this.log("warn", "provider.effect.fail", {
         workerId: input.workerId,
         workflowId: input.workflowId,
@@ -1208,7 +1295,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
     return this.transaction(async (client) => {
-      await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
       const conflict = (reason: string, sequence: number): CommitCheckpointResult => {
         this.log("warn", "provider.checkpoint.conflict", {
           workflowId: input.workflowId,
@@ -1237,8 +1323,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
       const claim = await this.one<ActivationClaimRow>(
         client,
-        `SELECT * FROM ${this.table("activation_claims")} WHERE activation_id = $1 FOR UPDATE`,
-        [input.activationId],
+        `
+        SELECT * FROM ${this.table("activation_claims")}
+        WHERE activation_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM ${this.table("activity_deadlines")} d
+            WHERE d.activation_id = $1 AND d.deadline_at <= $2::timestamptz
+          )
+        FOR UPDATE
+        `,
+        [input.activationId, input.now],
       )
       if (
         !claim ||
@@ -1465,6 +1559,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         FOREIGN KEY (workflow_id, run_id) REFERENCES ${this.table("instances")}(workflow_id, run_id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS ${this.table("activity_deadlines")} (
+        effect_id TEXT PRIMARY KEY REFERENCES ${this.table("effects")}(effect_id) ON DELETE CASCADE,
+        workflow_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        activation_id TEXT NOT NULL,
+        partition_shard INTEGER NOT NULL,
+        deadline_at TIMESTAMPTZ NOT NULL,
+        timeout_kind TEXT NOT NULL CHECK (timeout_kind IN ('heartbeat', 'start_to_close'))
+      );
+
       CREATE TABLE IF NOT EXISTS ${this.table("dispatch_shards")} (
         shard_id INTEGER PRIMARY KEY,
         owner_id TEXT,
@@ -1514,6 +1618,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       CREATE INDEX IF NOT EXISTS ${this.index("effects_next_attempt")}
         ON ${this.table("effects")}(next_attempt_at)
         WHERE status = 'pending' AND next_attempt_at IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS ${this.index("activity_deadlines_shard_due")}
+        ON ${this.table("activity_deadlines")}(partition_shard, deadline_at);
+      CREATE INDEX IF NOT EXISTS ${this.index("activity_deadlines_activation_due")}
+        ON ${this.table("activity_deadlines")}(activation_id, deadline_at);
       CREATE INDEX IF NOT EXISTS ${this.index("activation_claims_owner_lease")}
         ON ${this.table("activation_claims")}(owner_id, lease_until)
         WHERE completed_by_sequence IS NULL;
@@ -1622,20 +1730,25 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     }
   }
 
-  private async persistedInstance(client: Queryable, row: InstanceRow): Promise<PersistedInstance> {
-    const effects = await this.rows<EffectRow>(
-      client,
-      `
-      SELECT * FROM ${this.table("effects")}
-      WHERE workflow_id = $1 AND run_id = $2
-      ORDER BY effect_id
-      `,
-      [row.workflow_id, row.run_id],
-    )
-    return {
-      ...this.activationInstanceSnapshot(row),
-      effects: effects.map(rowToEffectRecord),
+  private async persistedInstance(
+    client: Queryable,
+    row: InstanceRow,
+    options: LoadInstanceOptions = {},
+  ): Promise<PersistedInstance> {
+    const instance: PersistedInstance = this.activationInstanceSnapshot(row)
+    if (options.includeEffects) {
+      const effects = await this.rows<EffectRow>(
+        client,
+        `
+        SELECT * FROM ${this.table("effects")}
+        WHERE workflow_id = $1 AND run_id = $2
+        ORDER BY effect_id
+        `,
+        [row.workflow_id, row.run_id],
+      )
+      instance.effects = effects.map(rowToEffectRecord)
     }
+    return instance
   }
 
   private async effectRow(
@@ -1689,9 +1802,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (state.status !== "running") {
       return
     }
-    for (const wait of state.waits) {
-      await this.insertReadyEventForWait(client, state, wait)
-    }
+    await this.insertReadyEvents(client, await this.buildReadyEventsForState(client, state, state.waits))
   }
 
   private async replaceSignalReadyEventsForState(
@@ -1708,27 +1819,180 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (state.status !== "running") {
       return
     }
-    for (const wait of state.waits) {
-      if (wait.kind === "signal") {
-        await this.insertReadyEventForWait(client, state, wait)
-      }
-    }
+    const signalWaits = state.waits.filter((wait): wait is Extract<DurableWait, { kind: "signal" }> =>
+      wait.kind === "signal",
+    )
+    await this.insertReadyEvents(client, await this.buildReadyEventsForState(client, state, signalWaits))
   }
 
-  private async insertReadyEventForWait(
+  private async buildReadyEventsForState(
     client: PoolClient,
     state: ReadyEventInstanceState,
-    wait: DurableWait,
-  ): Promise<void> {
-    if (wait.kind === "run") {
+    waits: DurableWait[],
+  ): Promise<ReadyEventInsert[]> {
+    const inserts: ReadyEventInsert[] = []
+    const signalTypes = [...new Set(waits.flatMap((wait) => wait.kind === "signal" ? [wait.type] : []))]
+    const signalRows = signalTypes.length === 0
+      ? []
+      : await this.rows<SignalRow>(
+          client,
+          `
+          SELECT DISTINCT ON (type) *
+          FROM ${this.table("signals")}
+          WHERE workflow_id = $1 AND run_id = $2 AND type = ANY($3::text[])
+            AND consumed_by_sequence IS NULL
+          ORDER BY type, received_at, signal_id
+          `,
+          [state.workflowId, state.runId, signalTypes],
+        )
+    const signalByType = new Map(signalRows.map((row) => [row.type, row]))
+    const childRefs = waits
+      .filter((wait): wait is Extract<DurableWait, { kind: "child" }> => wait.kind === "child")
+      .map((wait) => ({ workflow_id: wait.workflowId, run_id: wait.runId }))
+    const childRows = childRefs.length === 0
+      ? []
+      : await this.rows<ChildRow>(
+          client,
+          `
+          WITH wanted AS (
+            SELECT * FROM jsonb_to_recordset($1::jsonb) AS w(workflow_id text, run_id text)
+          )
+          SELECT DISTINCT ON (c.workflow_id, c.run_id) c.*
+          FROM ${this.table("children")} c
+          JOIN wanted w ON w.workflow_id = c.workflow_id AND w.run_id = c.run_id
+          WHERE c.status IN ('completed', 'failed')
+            AND c.delivered_by_sequence IS NULL
+          ORDER BY c.workflow_id, c.run_id, c.completed_at, c.child_record_id
+          `,
+          [encodeJson(childRefs)],
+        )
+    const childByRef = new Map(childRows.map((row) => [`${row.workflow_id}\0${row.run_id}`, row]))
+
+    for (const wait of waits) {
+      if (wait.kind === "run") {
+        const activationId = activationIdFromParts(
+          state.workflowId,
+          state.runId,
+          state.sequence,
+          "run",
+          wait.name,
+        )
+        inserts.push({
+          readyEventId: activationId,
+          workflowId: state.workflowId,
+          runId: state.runId,
+          workflowName: state.workflowName,
+          workflowVersion: state.workflowVersion,
+          partitionShard: state.partitionShard,
+          sequence: state.sequence,
+          kind: "run",
+          waitName: wait.name,
+          activationId,
+          readyAt: wait.readyAt,
+          sortKey: sortKey(wait.readyAt, "run", wait.name, state.workflowId, state.runId),
+          wait,
+          event: null,
+        })
+        continue
+      }
+
+      if (wait.kind === "signal") {
+        const signalRow = signalByType.get(wait.type)
+        if (!signalRow) {
+          continue
+        }
+        const activationId = activationIdFromParts(
+          state.workflowId,
+          state.runId,
+          state.sequence,
+          "signal",
+          signalRow.signal_id,
+        )
+        const event: ReadyEvent = {
+          kind: "signal",
+          signalId: signalRow.signal_id,
+          payload: decodeJson<JsonValue>(signalRow.payload_json, null),
+          occurredAt: iso(signalRow.received_at),
+          consumeSignalId: signalRow.signal_id,
+        }
+        inserts.push({
+          readyEventId: `${activationId}/${wait.name}`,
+          workflowId: state.workflowId,
+          runId: state.runId,
+          workflowName: state.workflowName,
+          workflowVersion: state.workflowVersion,
+          partitionShard: state.partitionShard,
+          sequence: state.sequence,
+          kind: "signal",
+          waitName: wait.name,
+          activationId,
+          readyAt: iso(signalRow.received_at),
+          sortKey: sortKey(iso(signalRow.received_at), "signal", wait.name, signalRow.signal_id),
+          wait,
+          event,
+        })
+        continue
+      }
+
+      if (wait.kind === "timer") {
+        const activationId = activationIdFromParts(
+          state.workflowId,
+          state.runId,
+          state.sequence,
+          "timer",
+          `${wait.name}:${wait.fireAt}`,
+        )
+        const event: ReadyEvent = {
+          kind: "timer",
+          firedAt: wait.fireAt,
+          occurredAt: wait.fireAt,
+        }
+        inserts.push({
+          readyEventId: activationId,
+          workflowId: state.workflowId,
+          runId: state.runId,
+          workflowName: state.workflowName,
+          workflowVersion: state.workflowVersion,
+          partitionShard: state.partitionShard,
+          sequence: state.sequence,
+          kind: "timer",
+          waitName: wait.name,
+          activationId,
+          readyAt: wait.fireAt,
+          sortKey: sortKey(wait.fireAt, "timer", wait.name, `${wait.name}:${wait.fireAt}`),
+          wait,
+          event,
+        })
+        continue
+      }
+
+      const childRow = childByRef.get(`${wait.workflowId}\0${wait.runId}`)
+      if (!childRow) {
+        continue
+      }
+      const occurredAt = childRow.completed_at ? iso(childRow.completed_at) : state.updatedAt
       const activationId = activationIdFromParts(
         state.workflowId,
         state.runId,
         state.sequence,
-        "run",
-        wait.name,
+        "child",
+        childRow.child_record_id,
       )
-      await this.insertReadyEvent(client, {
+      const event: ReadyEvent = {
+        kind: "child",
+        childRecordId: childRow.child_record_id,
+        occurredAt,
+        event:
+          childRow.status === "completed"
+            ? { ok: true, output: decodeJson<JsonValue>(childRow.output_json, null) }
+            : {
+                ok: false,
+                error: decodeJson<SerializedError>(childRow.error_json, {
+                  message: "Child failed",
+                }),
+              },
+      }
+      inserts.push({
         readyEventId: activationId,
         workflowId: state.workflowId,
         runId: state.runId,
@@ -1736,178 +2000,56 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         workflowVersion: state.workflowVersion,
         partitionShard: state.partitionShard,
         sequence: state.sequence,
-        kind: "run",
+        kind: "child",
         waitName: wait.name,
         activationId,
-        readyAt: wait.readyAt,
-        sortKey: sortKey(wait.readyAt, "run", wait.name, state.workflowId, state.runId),
-        wait,
-        event: null,
-      })
-      return
-    }
-
-    if (wait.kind === "signal") {
-      const signalRow = await this.one<SignalRow>(
-        client,
-        `
-        SELECT * FROM ${this.table("signals")}
-        WHERE workflow_id = $1 AND run_id = $2 AND type = $3 AND consumed_by_sequence IS NULL
-        ORDER BY received_at, type, signal_id
-        LIMIT 1
-        `,
-        [state.workflowId, state.runId, wait.type],
-      )
-      if (!signalRow) {
-        return
-      }
-      const activationId = activationIdFromParts(
-        state.workflowId,
-        state.runId,
-        state.sequence,
-        "signal",
-        signalRow.signal_id,
-      )
-      const event: ReadyEvent = {
-        kind: "signal",
-        signalId: signalRow.signal_id,
-        payload: decodeJson<JsonValue>(signalRow.payload_json, null),
-        occurredAt: iso(signalRow.received_at),
-        consumeSignalId: signalRow.signal_id,
-      }
-      await this.insertReadyEvent(client, {
-        readyEventId: `${activationId}/${wait.name}`,
-        workflowId: state.workflowId,
-        runId: state.runId,
-        workflowName: state.workflowName,
-        workflowVersion: state.workflowVersion,
-        partitionShard: state.partitionShard,
-        sequence: state.sequence,
-        kind: "signal",
-        waitName: wait.name,
-        activationId,
-        readyAt: iso(signalRow.received_at),
-        sortKey: sortKey(iso(signalRow.received_at), "signal", wait.name, signalRow.signal_id),
+        readyAt: occurredAt,
+        sortKey: sortKey(occurredAt, "child", wait.name, childRow.child_record_id),
         wait,
         event,
       })
-      return
     }
-
-    if (wait.kind === "timer") {
-      const activationId = activationIdFromParts(
-        state.workflowId,
-        state.runId,
-        state.sequence,
-        "timer",
-        `${wait.name}:${wait.fireAt}`,
-      )
-      const event: ReadyEvent = {
-        kind: "timer",
-        firedAt: wait.fireAt,
-        occurredAt: wait.fireAt,
-      }
-      await this.insertReadyEvent(client, {
-        readyEventId: activationId,
-        workflowId: state.workflowId,
-        runId: state.runId,
-        workflowName: state.workflowName,
-        workflowVersion: state.workflowVersion,
-        partitionShard: state.partitionShard,
-        sequence: state.sequence,
-        kind: "timer",
-        waitName: wait.name,
-        activationId,
-        readyAt: wait.fireAt,
-        sortKey: sortKey(wait.fireAt, "timer", wait.name, `${wait.name}:${wait.fireAt}`),
-        wait,
-        event,
-      })
-      return
-    }
-
-    const childRow = await this.one<ChildRow>(
-      client,
-      `
-      SELECT * FROM ${this.table("children")}
-      WHERE workflow_id = $1 AND run_id = $2 AND status IN ('completed', 'failed')
-        AND delivered_by_sequence IS NULL
-      ORDER BY completed_at, child_record_id
-      LIMIT 1
-      `,
-      [wait.workflowId, wait.runId],
-    )
-    if (!childRow) {
-      return
-    }
-    const occurredAt = childRow.completed_at ? iso(childRow.completed_at) : state.updatedAt
-    const activationId = activationIdFromParts(
-      state.workflowId,
-      state.runId,
-      state.sequence,
-      "child",
-      childRow.child_record_id,
-    )
-    const event: ReadyEvent = {
-      kind: "child",
-      childRecordId: childRow.child_record_id,
-      occurredAt,
-      event:
-        childRow.status === "completed"
-          ? { ok: true, output: decodeJson<JsonValue>(childRow.output_json, null) }
-          : {
-              ok: false,
-              error: decodeJson<SerializedError>(childRow.error_json, {
-                message: "Child failed",
-              }),
-            },
-    }
-    await this.insertReadyEvent(client, {
-      readyEventId: activationId,
-      workflowId: state.workflowId,
-      runId: state.runId,
-      workflowName: state.workflowName,
-      workflowVersion: state.workflowVersion,
-      partitionShard: state.partitionShard,
-      sequence: state.sequence,
-      kind: "child",
-      waitName: wait.name,
-      activationId,
-      readyAt: occurredAt,
-      sortKey: sortKey(occurredAt, "child", wait.name, childRow.child_record_id),
-      wait,
-      event,
-    })
+    return inserts
   }
 
-  private async insertReadyEvent(
+  private async insertReadyEvents(
     client: PoolClient,
-    input: {
-      readyEventId: string
-      workflowId: string
-      runId: string
-      workflowName: string
-      workflowVersion: number
-      partitionShard: number
-      sequence: number
-      kind: ReadyEventRow["kind"]
-      waitName: string | null
-      activationId: string | null
-      readyAt: string
-      sortKey: string
-      wait: DurableWait | null
-      event: ReadyEvent | null
-    },
+    inputs: ReadyEventInsert[],
   ): Promise<void> {
+    if (inputs.length === 0) {
+      return
+    }
     await client.query(
       `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS r(
+          ready_event_id text,
+          workflow_id text,
+          run_id text,
+          workflow_name text,
+          workflow_version integer,
+          partition_shard integer,
+          sequence integer,
+          kind text,
+          wait_name text,
+          activation_id text,
+          ready_at timestamptz,
+          sort_key text,
+          wait_json jsonb,
+          event_json jsonb
+        )
+      )
       INSERT INTO ${this.table("ready_events")} (
         ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
         partition_shard, sequence, kind, wait_name, activation_id, ready_at,
         sort_key, wait_json, event_json
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12, $13::jsonb, $14::jsonb
       )
+      SELECT
+        ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
+        partition_shard, sequence, kind, wait_name, activation_id, ready_at,
+        sort_key, wait_json, event_json
+      FROM input
       ON CONFLICT (ready_event_id) DO UPDATE SET
         workflow_name = EXCLUDED.workflow_name,
         workflow_version = EXCLUDED.workflow_version,
@@ -1922,20 +2064,24 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         event_json = EXCLUDED.event_json
       `,
       [
-        input.readyEventId,
-        input.workflowId,
-        input.runId,
-        input.workflowName,
-        input.workflowVersion,
-        input.partitionShard,
-        input.sequence,
-        input.kind,
-        input.waitName,
-        input.activationId,
-        input.readyAt,
-        input.sortKey,
-        input.wait ? encodeJson(input.wait) : null,
-        input.event ? encodeJson(input.event) : null,
+        encodeJson(
+          inputs.map((input) => ({
+            ready_event_id: input.readyEventId,
+            workflow_id: input.workflowId,
+            run_id: input.runId,
+            workflow_name: input.workflowName,
+            workflow_version: input.workflowVersion,
+            partition_shard: input.partitionShard,
+            sequence: input.sequence,
+            kind: input.kind,
+            wait_name: input.waitName,
+            activation_id: input.activationId,
+            ready_at: input.readyAt,
+            sort_key: input.sortKey,
+            wait_json: input.wait,
+            event_json: input.event,
+          })),
+        ),
       ],
     )
   }
@@ -2122,45 +2268,22 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `,
       [shardIds, now, ...current.params],
     )
-    const effectVersion = workflowVersionClause("i", workflowEntries, 3)
     const retryVersion = workflowVersionClause("i", workflowEntries, 3)
+    const deadlineVersion = workflowVersionClause("i", workflowEntries, 3)
     const effectDeadline = await this.one<{ deadline: Date | string | null }>(
       client,
       `
-      SELECT MIN(deadline) AS deadline FROM (
-        SELECT e.start_to_close_deadline AS deadline
-        FROM ${this.table("effects")} e
-        JOIN ${this.table("instances")} i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
-        JOIN ${this.table("activation_claims")} a ON a.activation_id = e.activation_id
-        WHERE i.partition_shard = ANY($1::int[])
-          AND i.status = 'running'
-          AND e.status = 'pending'
-          AND e.start_to_close_deadline IS NOT NULL
-          AND e.start_to_close_deadline > $2::timestamptz
-          AND a.completed_by_sequence IS NULL
-          AND (${effectVersion.sql})
-        UNION ALL
-        SELECT e.heartbeat_deadline AS deadline
-        FROM ${this.table("effects")} e
-        JOIN ${this.table("instances")} i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
-        JOIN ${this.table("activation_claims")} a ON a.activation_id = e.activation_id
-        WHERE i.partition_shard = ANY($${effectVersion.nextIndex}::int[])
-          AND i.status = 'running'
-          AND e.status = 'pending'
-          AND e.heartbeat_deadline IS NOT NULL
-          AND e.heartbeat_deadline > $${effectVersion.nextIndex + 1}::timestamptz
-          AND a.completed_by_sequence IS NULL
-          AND (${workflowVersionClause("i", workflowEntries, effectVersion.nextIndex + 2).sql})
-      ) deadlines
+      SELECT MIN(d.deadline_at) AS deadline
+      FROM ${this.table("activity_deadlines")} d
+      JOIN ${this.table("instances")} i ON i.workflow_id = d.workflow_id AND i.run_id = d.run_id
+      JOIN ${this.table("activation_claims")} a ON a.activation_id = d.activation_id
+      WHERE d.partition_shard = ANY($1::int[])
+        AND d.deadline_at > $2::timestamptz
+        AND i.status = 'running'
+        AND a.completed_by_sequence IS NULL
+        AND (${deadlineVersion.sql})
       `,
-      [
-        shardIds,
-        now,
-        ...effectVersion.params,
-        shardIds,
-        now,
-        ...workflowVersionClause("i", workflowEntries, effectVersion.nextIndex + 2).params,
-      ],
+      [shardIds, now, ...deadlineVersion.params],
     )
     const retryWake = await this.one<{ ready_at: Date | string | null }>(
       client,
@@ -2186,6 +2309,109 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       effectDeadline?.deadline ? iso(effectDeadline.deadline) : undefined,
       retryWake?.ready_at ? iso(retryWake.ready_at) : undefined,
     )
+  }
+
+  private async writeActivationClaims(
+    client: PoolClient,
+    candidates: ReadyCandidate[],
+    workerId: string,
+    now: string,
+    leaseMs: number,
+  ): Promise<Set<string>> {
+    if (candidates.length === 0) {
+      return new Set()
+    }
+    const leaseUntil = addMs(now, leaseMs)
+    const rows = await this.rows<ActivationClaimUpsertRow>(
+      client,
+      `
+      WITH candidate AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS c(
+          activation_id text,
+          workflow_id text,
+          run_id text,
+          sequence integer,
+          kind text,
+          wait_name text,
+          event_json jsonb,
+          wait_json jsonb,
+          activation_time timestamptz
+        )
+      )
+      INSERT INTO ${this.table("activation_claims")} (
+        activation_id, workflow_id, run_id, sequence, kind, wait_name,
+        event_json, wait_json, owner_id, lease_until, activation_time
+      )
+      SELECT
+        activation_id, workflow_id, run_id, sequence, kind, wait_name,
+        event_json, wait_json, $2, $3::timestamptz, activation_time
+      FROM candidate
+      ON CONFLICT (activation_id) DO UPDATE SET
+        owner_id = EXCLUDED.owner_id,
+        lease_until = EXCLUDED.lease_until,
+        event_json = EXCLUDED.event_json,
+        wait_json = EXCLUDED.wait_json,
+        activation_time = COALESCE(${this.table("activation_claims")}.activation_time, EXCLUDED.activation_time)
+      WHERE ${this.table("activation_claims")}.completed_by_sequence IS NULL
+        AND (
+          ${this.table("activation_claims")}.owner_id IS NULL
+          OR ${this.table("activation_claims")}.lease_until IS NULL
+          OR ${this.table("activation_claims")}.lease_until <= $4::timestamptz
+        )
+      RETURNING *, (xmax = 0) AS inserted
+      `,
+      [
+        encodeJson(
+          candidates.map((candidate) => ({
+            activation_id: candidate.activationId,
+            workflow_id: candidate.workflowId,
+            run_id: candidate.runId,
+            sequence: candidate.sequence,
+            kind: candidate.kind,
+            wait_name: candidate.kind === "event" ? (candidate.waitName ?? null) : null,
+            event_json: candidate.kind === "event" ? (candidate.eventJson ?? null) : null,
+            wait_json: candidate.kind === "event" ? (candidate.waitJson ?? null) : null,
+            activation_time: candidate.activationTime,
+          })),
+        ),
+        workerId,
+        leaseUntil,
+        now,
+      ],
+    )
+    const claimed = new Set<string>()
+    const byActivation = new Map(candidates.map((candidate) => [candidate.activationId, candidate]))
+    for (const row of rows) {
+      const candidate = byActivation.get(row.activation_id)
+      if (!candidate) {
+        continue
+      }
+      candidate.leaseUntil = leaseUntil
+      claimed.add(row.activation_id)
+      const reclaimed = !row.inserted
+      if (reclaimed) {
+        await this.resetPendingEffectsForActivationReclaim(client, candidate.activationId)
+      }
+      this.log("debug", reclaimed ? "provider.activation.reclaim" : "provider.activation.claim", {
+        workerId,
+        workflowName: candidate.workflowName,
+        workflowId: candidate.workflowId,
+        runId: candidate.runId,
+        activationId: candidate.activationId,
+        activationKind: candidate.kind,
+        eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+        leaseUntil,
+      })
+      this.count("durable.provider.activation.claim", {
+        workerId,
+        workflowName: candidate.workflowName,
+        activationKind: candidate.kind,
+        eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+        status: reclaimed ? "reclaimed" : "success",
+      })
+    }
+    return claimed
   }
 
   private async tryWriteActivationClaim(
@@ -2274,8 +2500,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   ): Promise<ActivationClaimRow> {
     const claim = await this.one<ActivationClaimRow>(
       client,
-      `SELECT * FROM ${this.table("activation_claims")} WHERE activation_id = $1 FOR UPDATE`,
-      [input.activationId],
+      `
+      SELECT * FROM ${this.table("activation_claims")}
+      WHERE activation_id = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM ${this.table("activity_deadlines")} d
+          WHERE d.activation_id = $1 AND d.deadline_at <= $2::timestamptz
+        )
+      FOR UPDATE
+      `,
+      [input.activationId, input.now],
     )
     if (
       !claim ||
@@ -2343,7 +2577,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         effect.effect_id,
       ],
     )
-    return row ?? {
+    const started = row ?? {
       ...effect,
       attempt,
       attempt_id: attemptId,
@@ -2355,44 +2589,83 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       first_attempt_started_at: firstAttemptStartedAt,
       next_attempt_at: null,
     }
+    await this.syncActivityDeadline(client, started)
+    return started
+  }
+
+  private async syncActivityDeadline(client: PoolClient, effect: EffectRow): Promise<void> {
+    const deadline = nextActivityDeadline(effect)
+    if (!deadline) {
+      return
+    }
+    await client.query(
+      `
+      INSERT INTO ${this.table("activity_deadlines")} (
+        effect_id, workflow_id, run_id, activation_id, partition_shard, deadline_at, timeout_kind
+      )
+      SELECT $1, $2, $3, $4, i.partition_shard, $5::timestamptz, $6
+      FROM ${this.table("instances")} i
+      WHERE i.workflow_id = $2 AND i.run_id = $3
+      ON CONFLICT (effect_id) DO UPDATE SET
+        workflow_id = EXCLUDED.workflow_id,
+        run_id = EXCLUDED.run_id,
+        activation_id = EXCLUDED.activation_id,
+        partition_shard = EXCLUDED.partition_shard,
+        deadline_at = EXCLUDED.deadline_at,
+        timeout_kind = EXCLUDED.timeout_kind
+      `,
+      [
+        effect.effect_id,
+        effect.workflow_id,
+        effect.run_id,
+        effect.activation_id,
+        deadline.deadlineAt,
+        deadline.timeoutKind,
+      ],
+    )
+  }
+
+  private async deleteActivityDeadline(client: PoolClient, effectId: string): Promise<void> {
+    await client.query(`DELETE FROM ${this.table("activity_deadlines")} WHERE effect_id = $1`, [
+      effectId,
+    ])
   }
 
   private async expireActivityTimeouts(
     client: PoolClient,
     now: string,
-    scope: { activationId?: string; shardIds?: number[] },
+    scope: { activationId?: string; activationIds?: string[]; shardIds?: number[] },
   ): Promise<void> {
-    if (!scope.activationId && (!scope.shardIds || scope.shardIds.length === 0)) {
+    const activationIds = [
+      ...(scope.activationId ? [scope.activationId] : []),
+      ...(scope.activationIds ?? []),
+    ]
+    if (activationIds.length === 0 && (!scope.shardIds || scope.shardIds.length === 0)) {
       return
     }
 
     const filters: string[] = []
-    const params: unknown[] = [now, now]
-    if (scope.activationId) {
-      params.push(scope.activationId)
-      filters.push(`e.activation_id = $${params.length}`)
+    const params: unknown[] = [now]
+    if (activationIds.length > 0) {
+      params.push([...new Set(activationIds)])
+      filters.push(`d.activation_id = ANY($${params.length}::text[])`)
     }
     if (scope.shardIds && scope.shardIds.length > 0) {
       params.push(scope.shardIds)
-      filters.push(`i.partition_shard = ANY($${params.length}::int[])`)
+      filters.push(`d.partition_shard = ANY($${params.length}::int[])`)
     }
 
-    const expired = await this.rows<{ activation_id: string }>(
+    const expired = await this.rows<ActivityDeadlineRow>(
       client,
       `
-      SELECT e.activation_id
-      FROM ${this.table("effects")} e
-      JOIN ${this.table("activation_claims")} a ON a.activation_id = e.activation_id
-      JOIN ${this.table("instances")} i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
-      WHERE e.status = 'pending'
-        AND e.attempt_started_at IS NOT NULL
+      SELECT d.effect_id, d.activation_id
+      FROM ${this.table("activity_deadlines")} d
+      JOIN ${this.table("activation_claims")} a ON a.activation_id = d.activation_id
+      WHERE d.deadline_at <= $1::timestamptz
         AND a.completed_by_sequence IS NULL
         AND (${filters.join(" OR ")})
-        AND (
-          (e.start_to_close_deadline IS NOT NULL AND e.start_to_close_deadline <= $1::timestamptz)
-          OR (e.heartbeat_deadline IS NOT NULL AND e.heartbeat_deadline <= $2::timestamptz)
-        )
-      FOR UPDATE OF e SKIP LOCKED
+      ORDER BY d.deadline_at, d.effect_id
+      FOR UPDATE OF d SKIP LOCKED
       `,
       params,
     )
@@ -2434,6 +2707,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           `,
           [encodeJson(timeoutError), now, timeoutKind, effect.effect_id],
         )
+        await this.deleteActivityDeadline(client, effect.effect_id)
         this.count("durable.provider.effect", {
           status: "timeout_failed",
           reason: timeoutKind,
@@ -2459,6 +2733,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           effect.effect_id,
         ],
       )
+      await this.deleteActivityDeadline(client, effect.effect_id)
       this.count("durable.provider.effect", {
         status: "timeout_retry",
         reason: timeoutKind,
@@ -2484,6 +2759,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `,
       [`attempt-${randomUUID()}`, effect.effect_id],
     )
+    await this.deleteActivityDeadline(client, effect.effect_id)
   }
 
   private async resetPendingEffectsForActivationReclaim(
@@ -3324,6 +3600,23 @@ function effectTimeoutKind(
   }
   if (start && start <= now) {
     return "start_to_close"
+  }
+  return undefined
+}
+
+function nextActivityDeadline(
+  effect: EffectRow,
+): { deadlineAt: string; timeoutKind: "heartbeat" | "start_to_close" } | undefined {
+  if (effect.status !== "pending" || !effect.attempt_started_at) {
+    return undefined
+  }
+  const start = effect.start_to_close_deadline ? iso(effect.start_to_close_deadline) : undefined
+  const heartbeat = effect.heartbeat_deadline ? iso(effect.heartbeat_deadline) : undefined
+  if (heartbeat && (!start || heartbeat <= start)) {
+    return { deadlineAt: heartbeat, timeoutKind: "heartbeat" }
+  }
+  if (start) {
+    return { deadlineAt: start, timeoutKind: "start_to_close" }
   }
   return undefined
 }
