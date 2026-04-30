@@ -7,6 +7,9 @@ commits, durable ready indexes, durable waits, a signal inbox, child records,
 and activation-scoped effects. Short inline TypeScript activities default to
 checkpoint durability, so their results are committed with the workflow
 checkpoint; heartbeat or timeout activities use eager per-attempt durability.
+Child starts also default to checkpoint durability, so local children are
+created atomically with the parent checkpoint unless `durability: "eager"` is
+requested.
 `DurableRuntime.drain()` is useful for tests and manual pumping;
 `DurableRuntime.runWorker()` adds bounded polling, wake hints, lease heartbeats,
 activation prefetch, batched activation commits, and bounded activation
@@ -74,9 +77,9 @@ activity delay:
 
 | Provider | durability mode | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| SQLite | synchronous=full | 513 | 2,564 | 4,102 | 2,935 | 4,696 |
-| SQLite | synchronous=normal | 640 | 3,202 | 5,123 | 3,528 | 5,645 |
-| Postgres | Docker postgres:18.3, pool=24 | 137 | 686 | 1,098 | 1,121 | 1,793 |
+| SQLite | synchronous=full | 611 | 3,054 | 4,886 | 3,562 | 5,699 |
+| SQLite | synchronous=normal | 737 | 3,686 | 5,898 | 4,187 | 6,700 |
+| Postgres | Docker postgres:18.3, pool=24 | 170 | 849 | 1,358 | 1,673 | 2,677 |
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The

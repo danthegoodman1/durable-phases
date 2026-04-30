@@ -5,6 +5,7 @@ import type {
   ClaimedActivation,
   ClaimedActivationWithInstance,
   ConflictPolicy,
+  CheckpointChildStart,
   CheckpointEffectMutation,
   CommitCheckpointResult,
   CommitActivationInput,
@@ -132,6 +133,11 @@ type DrainTaskEvent = ActivationTaskSettled | DispatchHeartbeatFailure | QueuedA
 type ActivationEffectLedger = {
   initial: Map<string, EffectRecord>
   mutations: Map<string, CheckpointEffectMutation>
+}
+
+type ActivationChildLedger = {
+  byKey: Map<string, CheckpointChildStart>
+  keyByRef: Map<string, string>
 }
 
 type PendingCommit = {
@@ -944,6 +950,7 @@ export class DurableRuntime {
 
     if (activation.kind === "migration") {
       const effectLedger = this.activationEffectLedger(effects)
+      const childLedger = this.activationChildLedger()
       const next = await this.migrateSnapshot(workflow, latest)
       const commitTime = this.now()
       const waits = this.materializeWaits(
@@ -953,6 +960,7 @@ export class DurableRuntime {
       )
       await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
         effects: [...effectLedger.mutations.values()],
+        childStarts: [...childLedger.byKey.values()],
       }, commitBatcher)
       return
     }
@@ -970,6 +978,7 @@ export class DurableRuntime {
 
     const data = trustedJsonCopy(phaseSnapshot.data)
     const effectLedger = this.activationEffectLedger(effects)
+    const childLedger = this.activationChildLedger()
     const ctx = this.contextFor(
       workflow,
       latest,
@@ -977,6 +986,7 @@ export class DurableRuntime {
       activation.activationTime,
       signal,
       effectLedger,
+      childLedger,
     )
     let transition: TransitionCommand
     let consumeSignalId: string | undefined
@@ -1033,6 +1043,7 @@ export class DurableRuntime {
       consumeSignalId,
       consumeChildRecordId,
       effects: [...effectLedger.mutations.values()],
+      childStarts: [...childLedger.byKey.values()],
     }, commitBatcher)
   }
 
@@ -1047,6 +1058,7 @@ export class DurableRuntime {
       consumeSignalId?: string
       consumeChildRecordId?: string
       effects?: CheckpointEffectMutation[]
+      childStarts?: CheckpointChildStart[]
     } = {},
     commitBatcher?: ActivationCommitBatcher,
   ): Promise<CommitCheckpointResult> {
@@ -1063,6 +1075,7 @@ export class DurableRuntime {
       consumeSignalId: options.consumeSignalId,
       consumeChildRecordId: options.consumeChildRecordId,
       effects: options.effects,
+      childStarts: options.childStarts,
     }
     const result =
       commitBatcher
@@ -1089,6 +1102,16 @@ export class DurableRuntime {
         activationId,
         workerId: this.workerId,
       })
+      if (result.retryable === false) {
+        throw errorFromSerialized(
+          result.error ?? {
+            name: "CommitFailed",
+            message: result.reason
+              ? `Activation commit failed: ${result.reason}`
+              : "Activation commit failed",
+          },
+        )
+      }
       return result
     }
 
@@ -1113,6 +1136,13 @@ export class DurableRuntime {
     return {
       initial: new Map(effects.map((effect) => [effect.key, effect])),
       mutations: new Map(),
+    }
+  }
+
+  private activationChildLedger(): ActivationChildLedger {
+    return {
+      byKey: new Map(),
+      keyByRef: new Map(),
     }
   }
 
@@ -1376,6 +1406,7 @@ export class DurableRuntime {
     activationTime: string,
     activationSignal: AbortSignal,
     effects: ActivationEffectLedger,
+    childLedger: ActivationChildLedger,
   ): DurableContext {
     return {
       now: () => activationTime,
@@ -1602,8 +1633,84 @@ export class DurableRuntime {
             startCommand,
             now,
           )
+          const handle: ChildHandle<W> = {
+            workflowName: childWorkflow.name,
+            workflowVersion: childWorkflow.version,
+            workflowId: childInstance.workflowId,
+            runId: childInstance.runId,
+          } as ChildHandle<W>
+          const conflictPolicy = options.conflictPolicy ?? "use_existing"
+          const parentClosePolicy = options.parentClosePolicy ?? "cancel"
 
-          const handle = await this.provider.createChildInstance({
+          if (childDurability(options) === "checkpoint") {
+            const existingForKey = childLedger.byKey.get(key)
+            if (existingForKey) {
+              if (conflictPolicy === "fail") {
+                throw new Error(
+                  `Child workflow already exists for activation key: ${instance.workflowId}/${instance.runId}/${currentActivationId}/${key}`,
+                )
+              }
+              if (conflictPolicy !== "terminate_existing") {
+                return childHandleFromStart<W>(existingForKey)
+              }
+              childLedger.byKey.delete(key)
+              childLedger.keyByRef.delete(childRefKey(existingForKey.workflowId, existingForKey.runId))
+            }
+
+            const existingRefKey = childRefKey(childInstance.workflowId, childInstance.runId)
+            const existingRefKeyOwner = childLedger.keyByRef.get(existingRefKey)
+            if (existingRefKeyOwner && existingRefKeyOwner !== key) {
+              if (conflictPolicy === "terminate_existing") {
+                childLedger.byKey.delete(existingRefKeyOwner)
+                childLedger.keyByRef.delete(existingRefKey)
+              } else {
+                throw new Error(
+                  `Child workflow instance already exists in this activation: ${childInstance.workflowId}/${childInstance.runId}`,
+                )
+              }
+            }
+
+            childLedger.byKey.set(key, {
+              key,
+              workflowName: childWorkflow.name,
+              workflowVersion: childWorkflow.version,
+              workflowId: childInstance.workflowId,
+              runId: childInstance.runId,
+              partitionShard: workflowPartitionShard(
+                childInstance.workflowId,
+                childInstance.runId,
+                this.shardCount,
+              ),
+              common: childInstance.common!,
+              phase: childInstance.phase!,
+              waits: childInstance.waits,
+              parentClosePolicy,
+              conflictPolicy,
+            })
+            childLedger.keyByRef.set(existingRefKey, key)
+
+            this.log("info", "runtime.child.start", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              childWorkflowName: childWorkflow.name,
+              workflowId: instance.workflowId,
+              runId: instance.runId,
+              activationId: currentActivationId,
+              childWorkflowId: handle.workflowId,
+              childRunId: handle.runId,
+              key,
+              durability: "checkpoint",
+            })
+            this.count("durable.runtime.child", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              status: "started",
+            })
+
+            return handle
+          }
+
+          const eagerHandle = await this.provider.createChildInstance({
             workflowName: childWorkflow.name,
             workflowVersion: childWorkflow.version,
             workflowId: childInstance.workflowId,
@@ -1623,8 +1730,8 @@ export class DurableRuntime {
             workerId: this.workerId,
             leaseNow: this.now(),
             key,
-            parentClosePolicy: options.parentClosePolicy ?? "cancel",
-            conflictPolicy: options.conflictPolicy ?? "use_existing",
+            parentClosePolicy,
+            conflictPolicy,
           })
 
           this.log("info", "runtime.child.start", {
@@ -1634,9 +1741,10 @@ export class DurableRuntime {
             workflowId: instance.workflowId,
             runId: instance.runId,
             activationId: currentActivationId,
-            childWorkflowId: handle.workflowId,
-            childRunId: handle.runId,
+            childWorkflowId: eagerHandle.workflowId,
+            childRunId: eagerHandle.runId,
             key,
+            durability: "eager",
           })
           this.count("durable.runtime.child", {
             workerId: this.workerId,
@@ -1644,9 +1752,30 @@ export class DurableRuntime {
             status: "started",
           })
 
-          return handle as ChildHandle<W>
+          return eagerHandle as ChildHandle<W>
         },
         cancel: async (handle: ChildHandle<any>): Promise<void> => {
+          const bufferedKey = childLedger.keyByRef.get(childRefKey(handle.workflowId, handle.runId))
+          if (bufferedKey) {
+            childLedger.keyByRef.delete(childRefKey(handle.workflowId, handle.runId))
+            childLedger.byKey.delete(bufferedKey)
+            this.log("info", "runtime.child.cancel", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              workflowId: instance.workflowId,
+              runId: instance.runId,
+              activationId: currentActivationId,
+              childWorkflowId: handle.workflowId,
+              childRunId: handle.runId,
+              durability: "checkpoint",
+            })
+            this.count("durable.runtime.child", {
+              workerId: this.workerId,
+              workflowName: workflow.name,
+              status: "canceled",
+            })
+            return
+          }
           await this.provider.cancelChild({
             parentWorkflowId: instance.workflowId,
             parentRunId: instance.runId,
@@ -2383,6 +2512,23 @@ function activityDurability(options?: ActivityOptions): "checkpoint" | "eager" {
     return "eager"
   }
   return "checkpoint"
+}
+
+function childDurability(options?: ChildOptions): "checkpoint" | "eager" {
+  return options?.durability === "eager" ? "eager" : "checkpoint"
+}
+
+function childRefKey(workflowId: string, runId: string): string {
+  return `${workflowId}\0${runId}`
+}
+
+function childHandleFromStart<W extends AnyWorkflow>(start: CheckpointChildStart): ChildHandle<W> {
+  return {
+    workflowName: start.workflowName,
+    workflowVersion: start.workflowVersion,
+    workflowId: start.workflowId,
+    runId: start.runId,
+  } as ChildHandle<W>
 }
 
 type LocalActivityOptions = {

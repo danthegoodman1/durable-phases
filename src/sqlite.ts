@@ -14,6 +14,7 @@ import type {
   ClaimReadyActivationsResult,
   ClaimReadyActivationInput,
   ClaimReadyActivationResult,
+  CheckpointChildStart,
   CheckpointEffectMutation,
   CommitActivationInput,
   CommitActivationsResult,
@@ -1308,7 +1309,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
     const commit = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
-      const conflict = (reason: string, sequence: number): CommitCheckpointResult => {
+      const conflict = (
+        reason: string,
+        sequence: number,
+        options: { retryable?: boolean; error?: SerializedError } = {},
+      ): CommitCheckpointResult => {
         this.log("warn", "provider.checkpoint.conflict", {
           workflowId: input.workflowId,
           runId: input.runId,
@@ -1323,7 +1328,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           status: "conflict",
           reason,
         })
-        return { ok: false, sequence }
+        return {
+          ok: false,
+          sequence,
+          reason,
+          ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
+          ...(options.error === undefined ? {} : { error: options.error }),
+        }
       }
 
       const instance = this.instanceRow(input)
@@ -1391,8 +1402,17 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         return conflict("child_not_consumable", instance.sequence)
       }
 
+      const childStartConflict = this.validateCheckpointChildStarts(input)
+      if (childStartConflict) {
+        return conflict(childStartConflict.reason, instance.sequence, {
+          retryable: false,
+          error: childStartConflict.error,
+        })
+      }
+
       const nextSequence = instance.sequence + 1
       this.writeCheckpointEffectMutations(input)
+      this.writeCheckpointChildStarts(input)
       this.writeNextInstance(input, nextSequence)
 
       if (signalToConsume) {
@@ -2698,6 +2718,143 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     throw new Error(`Effect is already terminal: ${input.effectId}`)
   }
 
+  private validateCheckpointChildStarts(
+    input: CommitCheckpointInput,
+  ): { reason: string; error: SerializedError } | undefined {
+    const seenKeys = new Set<string>()
+    const seenRefs = new Map<string, CheckpointChildStart>()
+    for (const start of input.childStarts ?? []) {
+      if (seenKeys.has(start.key)) {
+        return childStartCommitConflict("duplicate_child_start_key", start)
+      }
+      seenKeys.add(start.key)
+
+      const refKey = `${start.workflowId}\0${start.runId}`
+      if (seenRefs.has(refKey) && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("duplicate_child_start_instance", start)
+      }
+      seenRefs.set(refKey, start)
+
+      const existingForKey = oneRow<ChildRow>(
+        this.prepare(
+            `
+            SELECT * FROM children
+            WHERE parent_workflow_id = ? AND parent_run_id = ? AND activation_id = ? AND key = ?
+            LIMIT 1
+          `,
+          )
+          .get(input.workflowId, input.runId, input.activationId, start.key),
+      )
+      if (existingForKey && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("existing_child_activation_key", start)
+      }
+
+      const existingInstance = this.instanceRow(start)
+      if (existingInstance && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("existing_child_instance", start)
+      }
+    }
+    return undefined
+  }
+
+  private writeCheckpointChildStarts(input: CommitCheckpointInput): void {
+    for (const start of input.childStarts ?? []) {
+      const existingForKey = oneRow<ChildRow>(
+        this.prepare(
+            `
+            SELECT * FROM children
+            WHERE parent_workflow_id = ? AND parent_run_id = ? AND activation_id = ? AND key = ?
+            LIMIT 1
+          `,
+          )
+          .get(input.workflowId, input.runId, input.activationId, start.key),
+      )
+      if (existingForKey && start.conflictPolicy === "terminate_existing") {
+        this.deleteInstanceRecords(existingForKey.workflow_id, existingForKey.run_id)
+      }
+      if (this.instanceRow(start) && start.conflictPolicy === "terminate_existing") {
+        this.deleteInstanceRecords(start.workflowId, start.runId)
+      }
+
+      const childRecordId = `child-${randomUUID()}`
+      this.prepare(
+          `
+          INSERT INTO instances (
+            workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+            sequence, status, common_json, phase_name, phase_data_json, output_json,
+            error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
+            parent_child_record_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, 0, 'running', ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+        `,
+        )
+        .run(
+          start.workflowName,
+          start.workflowVersion,
+          start.workflowId,
+          start.runId,
+          start.partitionShard,
+          encodeJson(start.common),
+          start.phase.name,
+          encodeJson(start.phase.data),
+          encodeJson(start.waits),
+          input.workflowId,
+          input.runId,
+          childRecordId,
+          input.now,
+          input.now,
+        )
+
+      this.prepare(
+          `
+          INSERT INTO children (
+            child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+            workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)
+        `,
+        )
+        .run(
+          childRecordId,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          start.key,
+          start.workflowName,
+          start.workflowVersion,
+          start.workflowId,
+          start.runId,
+          start.parentClosePolicy ?? "cancel",
+        )
+
+      this.replaceReadyEventsForState({
+        workflowName: start.workflowName,
+        workflowVersion: start.workflowVersion,
+        workflowId: start.workflowId,
+        runId: start.runId,
+        partitionShard: start.partitionShard,
+        sequence: 0,
+        status: "running",
+        waits: start.waits,
+        updatedAt: input.now,
+      })
+      this.log("info", "provider.child.create", {
+        workflowName: start.workflowName,
+        workflowId: start.workflowId,
+        runId: start.runId,
+        childRecordId,
+        parentWorkflowId: input.workflowId,
+        parentRunId: input.runId,
+        activationId: input.activationId,
+        key: start.key,
+        parentClosePolicy: start.parentClosePolicy ?? "cancel",
+        durability: "checkpoint",
+      })
+      this.count("durable.provider.child", {
+        workflowName: start.workflowName,
+        status: "created",
+      })
+    }
+  }
+
   private writeCheckpointEffectMutations(input: {
     workflowId: string
     runId: string
@@ -3177,6 +3334,19 @@ function parentClosedChildError(status: "canceled" | "failed"): SerializedError 
   return {
     name: "ParentClosed",
     message: `Child canceled because parent ${status}`,
+  }
+}
+
+function childStartCommitConflict(
+  reason: string,
+  start: CheckpointChildStart,
+): { reason: string; error: SerializedError } {
+  return {
+    reason,
+    error: {
+      name: "ChildStartConflict",
+      message: `Child start ${start.key} failed: ${reason} (${start.workflowId}/${start.runId})`,
+    },
   }
 }
 

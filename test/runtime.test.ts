@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import { z } from "zod"
 import {
   cancel,
+  type ChildHandle,
   checkpoint,
   child,
   complete,
@@ -817,7 +818,7 @@ describe("durable workflow PoC", () => {
         waits: [],
         now: "2026-01-01T00:00:00.000Z",
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
+    ).resolves.toMatchObject({ ok: false, sequence: 0 })
 
     const reservation = await provider.getOrReserveEffect({
       ...ref,
@@ -868,7 +869,7 @@ describe("durable workflow PoC", () => {
       phases: {
         start: phase({
           run: async ({ ctx }) => {
-            const handle = await ctx.child.start("child", WaitingChildWorkflow, {})
+            const handle = await ctx.child.start("child", WaitingChildWorkflow, {}, { durability: "eager" })
             await ctx.child.cancel(handle)
             return complete({ ok: true })
           },
@@ -3298,7 +3299,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.000Z",
         consumeSignalId: signalRecord.signalId,
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
+    ).resolves.toMatchObject({ ok: false, sequence: 0 })
     expect((await provider.listSignals())[0].consumedBySequence).toBeUndefined()
 
     await expect(
@@ -3313,7 +3314,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.011Z",
         consumeSignalId: signalRecord.signalId,
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
+    ).resolves.toMatchObject({ ok: false, sequence: 0 })
     expect((await provider.listSignals())[0].consumedBySequence).toBeUndefined()
   })
 
@@ -4653,7 +4654,7 @@ describe("durable workflow PoC", () => {
         waits: [],
         now: "2026-01-01T00:00:00.000Z",
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
+    ).resolves.toMatchObject({ ok: false, sequence: 0 })
     await expect(
       provider.commitCheckpoint({
         ...ref,
@@ -4666,7 +4667,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.000Z",
         consumeSignalId: secondSignal.signalId,
       }),
-    ).resolves.toEqual({ ok: false, sequence: 0 })
+    ).resolves.toMatchObject({ ok: false, sequence: 0 })
     expect((await provider.listSignals()).find((record) => record.signalId === firstSignal.signalId)?.consumedBySequence).toBeUndefined()
     expect((await provider.listSignals()).find((record) => record.signalId === secondSignal.signalId)?.consumedBySequence).toBeUndefined()
   })
@@ -4807,7 +4808,7 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.000Z",
         consumeChildRecordId: wrongChild!.childRecordId,
       }),
-    ).resolves.toEqual({ ok: false, sequence: 1 })
+    ).resolves.toMatchObject({ ok: false, sequence: 1 })
     expect(
       (await provider.listChildren()).find((record) => record.childRecordId === wrongChild!.childRecordId)
         ?.deliveredBySequence,
@@ -5380,6 +5381,140 @@ describe("durable workflow PoC", () => {
     })
     expect(await provider.loadInstance(ref)).toMatchObject({ status: "canceled", cancelReason: "stop" })
     expect((await provider.listChildren())[0]).toMatchObject({ status: "abandoned" })
+  })
+
+  it("buffers checkpoint child starts until parent checkpoint commit", async () => {
+    const path = await storePath()
+    let shouldThrow = true
+    const handles: ChildHandle[] = []
+    const ChildWorkflow = defineWorkflow({
+      name: "checkpoint_buffered_child",
+      version: 1,
+      input: z.object({ value: z.string() }),
+      output: z.object({ ok: z.boolean() }),
+      initial(input) {
+        return start({ phase: "waiting", data: { value: input.value } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ value: z.string() }),
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "checkpoint_buffered_child_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ childWorkflowId: z.string() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const handle = await ctx.child.start("child", ChildWorkflow, { value: "one" })
+            handles.push(handle)
+            if (shouldThrow) {
+              shouldThrow = false
+              throw new Error("crash before parent checkpoint")
+            }
+            return complete({ childWorkflowId: handle.workflowId })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(path)
+    const runtimeA = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, ChildWorkflow],
+      workerId: "checkpoint-child-worker-a",
+    })
+    const ref = await runtimeA.start(ParentWorkflow, {}, { workflowId: "checkpoint-child-parent" })
+
+    await expect(runtimeA.drain({ maxActivations: 1 })).rejects.toThrow("crash before parent checkpoint")
+    expect(await provider.listChildren()).toEqual([])
+    expect(await provider.loadInstance({ workflowId: handles[0].workflowId, runId: handles[0].runId })).toBeNull()
+
+    const runtimeB = new DurableRuntime(testProvider(path), {
+      workflows: [ParentWorkflow, ChildWorkflow],
+      workerId: "checkpoint-child-worker-b",
+    })
+    await runtimeB.drain({ maxActivations: 1 })
+
+    expect(handles).toHaveLength(2)
+    expect(handles[1]).toEqual(handles[0])
+    expect(await provider.listChildren()).toHaveLength(1)
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { childWorkflowId: handles[0].workflowId },
+    })
+    expect(await provider.loadInstance(handles[0])).toMatchObject({
+      status: "running",
+      phase: { name: "waiting", data: { value: "one" } },
+    })
+  })
+
+  it("fails checkpoint child start commit conflicts as non-retryable", async () => {
+    const ChildWorkflow = defineWorkflow({
+      name: "checkpoint_child_commit_conflict_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async () => complete({ ok: true }),
+        }),
+      },
+    })
+    const ParentWorkflow = defineWorkflow({
+      name: "checkpoint_child_commit_conflict_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            await ctx.child.start("child", ChildWorkflow, {}, { workflowId: "existing-child-instance" })
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    const provider = testProvider(await storePath())
+    await provider.createInstance({
+      workflowName: ChildWorkflow.name,
+      workflowVersion: ChildWorkflow.version,
+      workflowId: "existing-child-instance",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    const runtime = new DurableRuntime(provider, {
+      workflows: [ParentWorkflow, ChildWorkflow],
+      workerId: "checkpoint-child-conflict-worker",
+    })
+    const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "checkpoint-child-conflict-parent" })
+
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("existing_child_instance")
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "running", sequence: 0 })
+    expect(
+      (await provider.listChildren()).filter((childRecord) =>
+        childRecord.parentWorkflowId === ref.workflowId && childRecord.parentRunId === ref.runId,
+      ),
+    ).toEqual([])
   })
 
   it("applies child conflict policies for repeated starts", async () => {

@@ -12,6 +12,7 @@ import type {
   ClaimReadyActivationsResult,
   ClaimReadyActivationInput,
   ClaimReadyActivationResult,
+  CheckpointChildStart,
   CheckpointEffectMutation,
   CommitActivationInput,
   CommitActivationsResult,
@@ -181,6 +182,27 @@ type CommitClaimRow = InstanceRow & {
   claim_lease_until: Date | string | null
   claim_activation_time: Date | string | null
   claim_completed_by_sequence: number | null
+}
+
+type IndexedInstanceRow = InstanceRow & {
+  input_index: number
+}
+
+type IndexedActivationClaimRow = ActivationClaimRow & {
+  input_index: number
+}
+
+type IndexedSignalRow = SignalRow & {
+  input_index: number
+}
+
+type IndexedChildRow = ChildRow & {
+  input_index: number
+}
+
+type IndexedChildStartExistingRow<T> = T & {
+  input_index: number
+  start_index: number
 }
 
 type DispatchShardRow = {
@@ -1325,13 +1347,20 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (inputs.length === 0) {
       return { results: [] }
     }
+    if (inputs.length === 1) {
+      const result = await this.commitCheckpoint(inputs[0])
+      return { results: [{ ...result, activationId: inputs[0].activationId }] }
+    }
     return this.transaction(async (client) => {
-      const results: Array<CommitCheckpointResult & { activationId: string }> = []
-      for (const input of inputs) {
-        const result = await this.commitCheckpointInTransaction(client, input)
-        results.push({ ...result, activationId: input.activationId })
+      if (shouldCommitSequentially(inputs)) {
+        const results: Array<CommitCheckpointResult & { activationId: string }> = []
+        for (const input of inputs) {
+          const result = await this.commitCheckpointInTransaction(client, input)
+          results.push({ ...result, activationId: input.activationId })
+        }
+        return { results }
       }
-      return { results }
+      return this.commitActivationBatchInTransaction(client, inputs)
     })
   }
 
@@ -1339,11 +1368,293 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return this.transaction((client) => this.commitCheckpointInTransaction(client, input))
   }
 
+  private checkpointConflict(
+    input: CommitCheckpointInput,
+    reason: string,
+    sequence: number,
+    options: { retryable?: boolean; error?: SerializedError } = {},
+  ): CommitCheckpointResult {
+    this.log("warn", "provider.checkpoint.conflict", {
+      workflowId: input.workflowId,
+      runId: input.runId,
+      activationId: input.activationId,
+      workerId: input.workerId,
+      reason,
+      sequence,
+      expectedSequence: input.expectedSequence,
+    })
+    this.count("durable.provider.checkpoint", {
+      workerId: input.workerId,
+      status: "conflict",
+      reason,
+    })
+    return {
+      ok: false,
+      sequence,
+      reason,
+      ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
+      ...(options.error === undefined ? {} : { error: options.error }),
+    }
+  }
+
+  private async commitActivationBatchInTransaction(
+    client: PoolClient,
+    inputs: CommitActivationInput[],
+  ): Promise<CommitActivationsResult> {
+    const inputRows = inputs.map((input, index) => ({
+      input_index: index,
+      workflow_id: input.workflowId,
+      run_id: input.runId,
+      activation_id: input.activationId,
+      worker_id: input.workerId,
+      expected_sequence: input.expectedSequence,
+      now: input.now,
+      consume_signal_id: input.consumeSignalId ?? null,
+      consume_child_record_id: input.consumeChildRecordId ?? null,
+    }))
+    const instances = await this.rows<IndexedInstanceRow>(
+      client,
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          input_index integer,
+          workflow_id text,
+          run_id text
+        )
+      )
+      SELECT input.input_index, i.*
+      FROM input
+      JOIN ${this.table("instances")} i
+        ON i.workflow_id = input.workflow_id
+       AND i.run_id = input.run_id
+      FOR UPDATE OF i
+      `,
+      [encodeJson(inputRows)],
+    )
+    const claims = await this.rows<IndexedActivationClaimRow>(
+      client,
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          input_index integer,
+          workflow_id text,
+          run_id text,
+          activation_id text,
+          now timestamptz
+        )
+      )
+      SELECT input.input_index, a.*
+      FROM input
+      JOIN ${this.table("activation_tasks")} a
+        ON a.activation_id = input.activation_id
+       AND NOT EXISTS (
+         SELECT 1 FROM ${this.table("activity_deadlines")} d
+         WHERE d.activation_id = input.activation_id
+           AND d.deadline_at <= input.now
+       )
+      FOR UPDATE OF a
+      `,
+      [encodeJson(inputRows)],
+    )
+    const signalRows = inputRows.some((row) => row.consume_signal_id)
+      ? await this.rows<IndexedSignalRow>(
+          client,
+          `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS i(
+              input_index integer,
+              workflow_id text,
+              run_id text,
+              consume_signal_id text
+            )
+          )
+          SELECT input.input_index, s.*
+          FROM input
+          JOIN ${this.table("signals")} s
+            ON s.signal_id = input.consume_signal_id
+           AND s.workflow_id = input.workflow_id
+           AND s.run_id = input.run_id
+           AND s.consumed_by_sequence IS NULL
+          FOR UPDATE OF s
+          `,
+          [encodeJson(inputRows)],
+        )
+      : []
+    const childConsumeRows = inputRows.some((row) => row.consume_child_record_id)
+      ? await this.rows<IndexedChildRow>(
+          client,
+          `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS i(
+              input_index integer,
+              workflow_id text,
+              run_id text,
+              consume_child_record_id text
+            )
+          )
+          SELECT input.input_index, c.*
+          FROM input
+          JOIN ${this.table("children")} c
+            ON c.child_record_id = input.consume_child_record_id
+           AND c.parent_workflow_id = input.workflow_id
+           AND c.parent_run_id = input.run_id
+           AND c.delivered_by_sequence IS NULL
+          FOR UPDATE OF c
+          `,
+          [encodeJson(inputRows)],
+        )
+      : []
+
+    const childStartConflicts = await this.validateCheckpointChildStartsForBatch(client, inputs)
+    const instanceByIndex = new Map(instances.map((row) => [row.input_index, row]))
+    const claimByIndex = new Map(claims.map((row) => [row.input_index, row]))
+    const signalByIndex = new Map(signalRows.map((row) => [row.input_index, row]))
+    const childConsumeByIndex = new Map(childConsumeRows.map((row) => [row.input_index, row]))
+    const results: Array<CommitCheckpointResult & { activationId: string }> = []
+    const successes: Array<{
+      input: CommitActivationInput
+      instance: InstanceRow
+      claim: ActivationClaimRow
+      nextSequence: number
+    }> = []
+
+    for (const [index, input] of inputs.entries()) {
+      const instance = instanceByIndex.get(index)
+      if (!instance || instance.status !== "running") {
+        results.push({
+          ...this.checkpointConflict(input, "not_running", instance?.sequence ?? -1),
+          activationId: input.activationId,
+        })
+        continue
+      }
+      if (instance.sequence !== input.expectedSequence) {
+        results.push({
+          ...this.checkpointConflict(input, "stale_sequence", instance.sequence),
+          activationId: input.activationId,
+        })
+        continue
+      }
+
+      const claim = claimByIndex.get(index)
+      if (
+        !claim ||
+        claim.workflow_id !== input.workflowId ||
+        claim.run_id !== input.runId ||
+        claim.sequence !== input.expectedSequence ||
+        claim.owner_id !== input.workerId ||
+        !claim.lease_until ||
+        iso(claim.lease_until) < input.now ||
+        claim.completed_by_sequence !== null
+      ) {
+        results.push({
+          ...this.checkpointConflict(input, "lost_activation_lease", instance.sequence),
+          activationId: input.activationId,
+        })
+        continue
+      }
+      if (!claimMatchesCommit(claim, input)) {
+        results.push({
+          ...this.checkpointConflict(input, "activation_event_mismatch", instance.sequence),
+          activationId: input.activationId,
+        })
+        continue
+      }
+
+      if (input.consumeSignalId && !signalByIndex.has(index)) {
+        results.push({
+          ...this.checkpointConflict(input, "signal_not_consumable", instance.sequence),
+          activationId: input.activationId,
+        })
+        continue
+      }
+      if (input.consumeChildRecordId && !childConsumeByIndex.has(index)) {
+        results.push({
+          ...this.checkpointConflict(input, "child_not_consumable", instance.sequence),
+          activationId: input.activationId,
+        })
+        continue
+      }
+
+      const childStartConflict = childStartConflicts.get(index)
+      if (childStartConflict) {
+        results.push({
+          ...this.checkpointConflict(input, childStartConflict.reason, instance.sequence, {
+            retryable: false,
+            error: childStartConflict.error,
+          }),
+          activationId: input.activationId,
+        })
+        continue
+      }
+
+      const nextSequence = instance.sequence + 1
+      successes.push({ input, instance, claim, nextSequence })
+      results.push({ ok: true, sequence: nextSequence, activationId: input.activationId })
+    }
+
+    if (successes.length === 0) {
+      return { results }
+    }
+
+    await this.writeCheckpointEffectMutationsForBatch(client, successes.map((success) => success.input))
+    await this.writeCheckpointChildStartsForBatch(client, successes.map((success) => success.input))
+    await this.writeNextInstancesForBatch(client, successes)
+    await this.consumeSignalsForBatch(client, successes)
+    await this.consumeChildrenForBatch(client, successes)
+
+    for (const success of successes) {
+      await this.updateParentChildRecord(client, success.instance, success.input, success.nextSequence)
+      await this.applyParentClosePolicy(client, success.instance, success.input, success.nextSequence)
+      if (success.input.next.status === "running") {
+        await this.replaceReadyEventsForState(client, {
+          workflowName: success.instance.workflow_name,
+          workflowVersion: success.input.workflowVersion,
+          workflowId: success.input.workflowId,
+          runId: success.input.runId,
+          partitionShard: success.instance.partition_shard,
+          sequence: success.nextSequence,
+          status: success.input.next.status,
+          waits: success.input.waits,
+          updatedAt: success.input.now,
+        })
+      } else if (success.claim.kind !== "run") {
+        await this.deletePendingReadyEventsForInstance(client, success.input.workflowId, success.input.runId)
+      }
+    }
+
+    await this.completeActivationTasksForBatch(client, successes)
+    for (const success of successes) {
+      this.log("info", "provider.checkpoint.commit", {
+        workflowName: success.instance.workflow_name,
+        workflowId: success.input.workflowId,
+        runId: success.input.runId,
+        activationId: success.input.activationId,
+        workerId: success.input.workerId,
+        sequence: success.nextSequence,
+        status: success.input.next.status,
+      })
+      this.count("durable.provider.checkpoint", {
+        workerId: success.input.workerId,
+        workflowName: success.instance.workflow_name,
+        status: "success",
+      })
+    }
+    return { results }
+  }
+
   private async commitCheckpointInTransaction(
     client: PoolClient,
     input: CommitCheckpointInput,
   ): Promise<CommitCheckpointResult> {
-      const conflict = (reason: string, sequence: number): CommitCheckpointResult => {
+      const conflict = (
+        reason: string,
+        sequence: number,
+        options: { retryable?: boolean; error?: SerializedError } = {},
+      ): CommitCheckpointResult => {
         this.log("warn", "provider.checkpoint.conflict", {
           workflowId: input.workflowId,
           runId: input.runId,
@@ -1358,7 +1669,13 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           status: "conflict",
           reason,
         })
-        return { ok: false, sequence }
+        return {
+          ok: false,
+          sequence,
+          reason,
+          ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
+          ...(options.error === undefined ? {} : { error: options.error }),
+        }
       }
 
       const joined = await this.one<CommitClaimRow>(
@@ -1452,8 +1769,17 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         return conflict("child_not_consumable", instance.sequence)
       }
 
+      const childStartConflict = await this.validateCheckpointChildStarts(client, input)
+      if (childStartConflict) {
+        return conflict(childStartConflict.reason, instance.sequence, {
+          retryable: false,
+          error: childStartConflict.error,
+        })
+      }
+
       const nextSequence = instance.sequence + 1
       await this.writeCheckpointEffectMutations(client, input)
+      await this.writeCheckpointChildStarts(client, input)
       await this.writeNextInstance(client, input, nextSequence)
       if (signalToConsume) {
         await client.query(
@@ -2954,6 +3280,388 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     }
   }
 
+  private async validateCheckpointChildStarts(
+    client: PoolClient,
+    input: CommitCheckpointInput,
+  ): Promise<{ reason: string; error: SerializedError } | undefined> {
+    const seenKeys = new Set<string>()
+    const seenRefs = new Map<string, CheckpointChildStart>()
+    for (const start of input.childStarts ?? []) {
+      if (seenKeys.has(start.key)) {
+        return childStartCommitConflict("duplicate_child_start_key", start)
+      }
+      seenKeys.add(start.key)
+
+      const refKey = `${start.workflowId}\0${start.runId}`
+      if (seenRefs.has(refKey) && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("duplicate_child_start_instance", start)
+      }
+      seenRefs.set(refKey, start)
+
+      const existingForKey = await this.one<ChildRow>(
+        client,
+        `
+        SELECT * FROM ${this.table("children")}
+        WHERE parent_workflow_id = $1 AND parent_run_id = $2 AND activation_id = $3 AND key = $4
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [input.workflowId, input.runId, input.activationId, start.key],
+      )
+      if (existingForKey && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("existing_child_activation_key", start)
+      }
+
+      const existingInstance = await this.instanceRow(client, start)
+      if (existingInstance && start.conflictPolicy !== "terminate_existing") {
+        return childStartCommitConflict("existing_child_instance", start)
+      }
+    }
+    return undefined
+  }
+
+  private async validateCheckpointChildStartsForBatch(
+    client: PoolClient,
+    inputs: CommitCheckpointInput[],
+  ): Promise<Map<number, { reason: string; error: SerializedError }>> {
+    const conflicts = new Map<number, { reason: string; error: SerializedError }>()
+    const flattened = inputs.flatMap((input, inputIndex) =>
+      (input.childStarts ?? []).map((start, startIndex) => ({
+        input_index: inputIndex,
+        start_index: startIndex,
+        parent_workflow_id: input.workflowId,
+        parent_run_id: input.runId,
+        activation_id: input.activationId,
+        key: start.key,
+        workflow_id: start.workflowId,
+        run_id: start.runId,
+        conflict_policy: start.conflictPolicy ?? "use_existing",
+      })),
+    )
+    if (flattened.length === 0) {
+      return conflicts
+    }
+
+    for (const [inputIndex, input] of inputs.entries()) {
+      const seenKeys = new Set<string>()
+      const seenRefs = new Set<string>()
+      for (const start of input.childStarts ?? []) {
+        if (seenKeys.has(start.key)) {
+          conflicts.set(inputIndex, childStartCommitConflict("duplicate_child_start_key", start))
+          break
+        }
+        seenKeys.add(start.key)
+
+        const refKey = `${start.workflowId}\0${start.runId}`
+        if (seenRefs.has(refKey) && start.conflictPolicy !== "terminate_existing") {
+          conflicts.set(inputIndex, childStartCommitConflict("duplicate_child_start_instance", start))
+          break
+        }
+        seenRefs.add(refKey)
+      }
+    }
+
+    const existingChildRows = await this.rows<IndexedChildStartExistingRow<ChildRow>>(
+      client,
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          input_index integer,
+          start_index integer,
+          parent_workflow_id text,
+          parent_run_id text,
+          activation_id text,
+          key text
+        )
+      )
+      SELECT input.input_index, input.start_index, c.*
+      FROM input
+      JOIN ${this.table("children")} c
+        ON c.parent_workflow_id = input.parent_workflow_id
+       AND c.parent_run_id = input.parent_run_id
+       AND c.activation_id = input.activation_id
+       AND c.key = input.key
+      FOR UPDATE OF c
+      `,
+      [encodeJson(flattened)],
+    )
+    for (const row of existingChildRows) {
+      if (conflicts.has(row.input_index)) {
+        continue
+      }
+      const start = inputs[row.input_index].childStarts?.[row.start_index]
+      if (start && start.conflictPolicy !== "terminate_existing") {
+        conflicts.set(row.input_index, childStartCommitConflict("existing_child_activation_key", start))
+      }
+    }
+
+    const existingInstanceRows = await this.rows<IndexedChildStartExistingRow<InstanceRow>>(
+      client,
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          input_index integer,
+          start_index integer,
+          workflow_id text,
+          run_id text
+        )
+      )
+      SELECT input.input_index, input.start_index, i.*
+      FROM input
+      JOIN ${this.table("instances")} i
+        ON i.workflow_id = input.workflow_id
+       AND i.run_id = input.run_id
+      FOR UPDATE OF i
+      `,
+      [encodeJson(flattened)],
+    )
+    for (const row of existingInstanceRows) {
+      if (conflicts.has(row.input_index)) {
+        continue
+      }
+      const start = inputs[row.input_index].childStarts?.[row.start_index]
+      if (start && start.conflictPolicy !== "terminate_existing") {
+        conflicts.set(row.input_index, childStartCommitConflict("existing_child_instance", start))
+      }
+    }
+
+    return conflicts
+  }
+
+  private async writeCheckpointChildStarts(
+    client: PoolClient,
+    input: CommitCheckpointInput,
+  ): Promise<void> {
+    for (const start of input.childStarts ?? []) {
+      const existingForKey = await this.one<ChildRow>(
+        client,
+        `
+        SELECT * FROM ${this.table("children")}
+        WHERE parent_workflow_id = $1 AND parent_run_id = $2 AND activation_id = $3 AND key = $4
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [input.workflowId, input.runId, input.activationId, start.key],
+      )
+      if (existingForKey && start.conflictPolicy === "terminate_existing") {
+        await this.deleteInstanceRecords(client, existingForKey.workflow_id, existingForKey.run_id)
+      }
+      if ((await this.instanceRow(client, start)) && start.conflictPolicy === "terminate_existing") {
+        await this.deleteInstanceRecords(client, start.workflowId, start.runId)
+      }
+
+      const childRecordId = `child-${randomUUID()}`
+      await client.query(
+        `
+        INSERT INTO ${this.table("instances")} (
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          sequence, status, common_json, phase_name, phase_data_json, output_json,
+          error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
+          parent_child_record_id, created_at, updated_at
+        ) VALUES (
+          $1, $2, $3, $4, $5, 0, 'running', $6::jsonb, $7, $8::jsonb,
+          NULL, NULL, NULL, $9::jsonb, $10, $11, $12, $13::timestamptz, $13::timestamptz
+        )
+        `,
+        [
+          start.workflowName,
+          start.workflowVersion,
+          start.workflowId,
+          start.runId,
+          start.partitionShard,
+          encodeJson(start.common),
+          start.phase.name,
+          encodeJson(start.phase.data),
+          encodeJson(start.waits),
+          input.workflowId,
+          input.runId,
+          childRecordId,
+          input.now,
+        ],
+      )
+      await client.query(
+        `
+        INSERT INTO ${this.table("children")} (
+          child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+          workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', $10)
+        `,
+        [
+          childRecordId,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          start.key,
+          start.workflowName,
+          start.workflowVersion,
+          start.workflowId,
+          start.runId,
+          start.parentClosePolicy ?? "cancel",
+        ],
+      )
+      await this.insertReadyEventsForState(client, {
+        workflowName: start.workflowName,
+        workflowVersion: start.workflowVersion,
+        workflowId: start.workflowId,
+        runId: start.runId,
+        partitionShard: start.partitionShard,
+        sequence: 0,
+        status: "running",
+        waits: start.waits,
+        updatedAt: input.now,
+      })
+      this.log("info", "provider.child.create", {
+        workflowName: start.workflowName,
+        workflowId: start.workflowId,
+        runId: start.runId,
+        childRecordId,
+        parentWorkflowId: input.workflowId,
+        parentRunId: input.runId,
+        activationId: input.activationId,
+        key: start.key,
+        parentClosePolicy: start.parentClosePolicy ?? "cancel",
+        durability: "checkpoint",
+      })
+      this.count("durable.provider.child", {
+        workflowName: start.workflowName,
+        status: "created",
+      })
+    }
+  }
+
+  private async writeCheckpointChildStartsForBatch(
+    client: PoolClient,
+    inputs: CommitCheckpointInput[],
+  ): Promise<void> {
+    const flattened = inputs.flatMap((input) =>
+      (input.childStarts ?? []).map((start) => ({
+        child_record_id: `child-${randomUUID()}`,
+        parent_workflow_id: input.workflowId,
+        parent_run_id: input.runId,
+        activation_id: input.activationId,
+        key: start.key,
+        workflow_name: start.workflowName,
+        workflow_version: start.workflowVersion,
+        workflow_id: start.workflowId,
+        run_id: start.runId,
+        partition_shard: start.partitionShard,
+        common_json: start.common,
+        phase_name: start.phase.name,
+        phase_data_json: start.phase.data,
+        waits_json: start.waits,
+        parent_close_policy: start.parentClosePolicy ?? "cancel",
+        conflict_policy: start.conflictPolicy ?? "use_existing",
+        now: input.now,
+        start,
+      })),
+    )
+    if (flattened.length === 0) {
+      return
+    }
+    if (flattened.some((row) => row.conflict_policy === "terminate_existing")) {
+      for (const input of inputs) {
+        await this.writeCheckpointChildStarts(client, input)
+      }
+      return
+    }
+
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS c(
+          child_record_id text,
+          parent_workflow_id text,
+          parent_run_id text,
+          workflow_name text,
+          workflow_version integer,
+          workflow_id text,
+          run_id text,
+          partition_shard integer,
+          common_json jsonb,
+          phase_name text,
+          phase_data_json jsonb,
+          waits_json jsonb,
+          now timestamptz
+        )
+      )
+      INSERT INTO ${this.table("instances")} (
+        workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+        sequence, status, common_json, phase_name, phase_data_json, output_json,
+        error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
+        parent_child_record_id, created_at, updated_at
+      )
+      SELECT
+        workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+        0, 'running', common_json, phase_name, phase_data_json, NULL,
+        NULL, NULL, waits_json, parent_workflow_id, parent_run_id,
+        child_record_id, now, now
+      FROM input
+      `,
+      [encodeJson(flattened)],
+    )
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS c(
+          child_record_id text,
+          parent_workflow_id text,
+          parent_run_id text,
+          activation_id text,
+          key text,
+          workflow_name text,
+          workflow_version integer,
+          workflow_id text,
+          run_id text,
+          parent_close_policy text
+        )
+      )
+      INSERT INTO ${this.table("children")} (
+        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+        workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
+      )
+      SELECT
+        child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
+        workflow_name, workflow_version, workflow_id, run_id, 'started', parent_close_policy
+      FROM input
+      `,
+      [encodeJson(flattened)],
+    )
+
+    for (const row of flattened) {
+      await this.insertReadyEventsForState(client, {
+        workflowName: row.workflow_name,
+        workflowVersion: row.workflow_version,
+        workflowId: row.workflow_id,
+        runId: row.run_id,
+        partitionShard: row.partition_shard,
+        sequence: 0,
+        status: "running",
+        waits: row.waits_json,
+        updatedAt: row.now,
+      })
+      this.log("info", "provider.child.create", {
+        workflowName: row.workflow_name,
+        workflowId: row.workflow_id,
+        runId: row.run_id,
+        childRecordId: row.child_record_id,
+        parentWorkflowId: row.parent_workflow_id,
+        parentRunId: row.parent_run_id,
+        activationId: row.activation_id,
+        key: row.key,
+        parentClosePolicy: row.parent_close_policy,
+        durability: "checkpoint",
+      })
+      this.count("durable.provider.child", {
+        workflowName: row.workflow_name,
+        status: "created",
+      })
+    }
+  }
+
   private async writeCheckpointEffectMutations(
     client: PoolClient,
     input: {
@@ -2964,7 +3672,52 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       effects?: CheckpointEffectMutation[]
     },
   ): Promise<void> {
-    const effects = input.effects ?? []
+    await this.writeCheckpointEffectMutationsForBatch(client, [input])
+  }
+
+  private async writeCheckpointEffectMutationsForBatch(
+    client: PoolClient,
+    inputs: Array<{
+      workflowId: string
+      runId: string
+      activationId: string
+      now: string
+      effects?: CheckpointEffectMutation[]
+    }>,
+  ): Promise<void> {
+    const effects = inputs.flatMap((input) =>
+      (input.effects ?? []).map((effect) => {
+        const status = effect.status === "retry_scheduled" ? "pending" : effect.status
+        return {
+          effect_id: `effect-${randomUUID()}`,
+          workflow_id: input.workflowId,
+          run_id: input.runId,
+          activation_id: input.activationId,
+          key: effect.key,
+          idempotency_key:
+            effect.idempotencyKey ??
+            `${input.workflowId}/${input.runId}/${input.activationId}/${effect.key}`,
+          status,
+          attempt:
+            effect.status === "retry_scheduled"
+              ? effect.nextAttempt
+              : effect.attempt ?? 1,
+          max_attempts: effect.maxAttempts ?? 3,
+          max_elapsed_ms: effect.maxElapsedMs ?? null,
+          initial_interval_ms: effect.initialIntervalMs ?? 1_000,
+          max_interval_ms: effect.maxIntervalMs ?? 30_000,
+          backoff_coefficient: effect.backoffCoefficient ?? 2,
+          first_attempt_started_at: effect.firstAttemptStartedAt ?? input.now,
+          next_attempt_at:
+            effect.status === "retry_scheduled" ? effect.nextAttemptAt : null,
+          last_failure_json: effect.status === "completed" ? null : effect.error,
+          non_retryable_error_names_json: effect.nonRetryableErrorNames ?? [],
+          result_json: effect.status === "completed" ? effect.result : null,
+          error_json: effect.status === "completed" ? null : effect.error,
+          heartbeat_details_json: effect.heartbeatDetails ?? null,
+        }
+      }),
+    )
     if (effects.length === 0) {
       return
     }
@@ -3034,41 +3787,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         heartbeat_details_json = EXCLUDED.heartbeat_details_json
       WHERE ${this.table("effects")}.status <> 'completed'
       `,
-      [
-        encodeJson(
-          effects.map((effect) => {
-            const status = effect.status === "retry_scheduled" ? "pending" : effect.status
-            return {
-              effect_id: `effect-${randomUUID()}`,
-              workflow_id: input.workflowId,
-              run_id: input.runId,
-              activation_id: input.activationId,
-              key: effect.key,
-              idempotency_key:
-                effect.idempotencyKey ??
-                `${input.workflowId}/${input.runId}/${input.activationId}/${effect.key}`,
-              status,
-              attempt:
-                effect.status === "retry_scheduled"
-                  ? effect.nextAttempt
-                  : effect.attempt ?? 1,
-              max_attempts: effect.maxAttempts ?? 3,
-              max_elapsed_ms: effect.maxElapsedMs ?? null,
-              initial_interval_ms: effect.initialIntervalMs ?? 1_000,
-              max_interval_ms: effect.maxIntervalMs ?? 30_000,
-              backoff_coefficient: effect.backoffCoefficient ?? 2,
-              first_attempt_started_at: effect.firstAttemptStartedAt ?? input.now,
-              next_attempt_at:
-                effect.status === "retry_scheduled" ? effect.nextAttemptAt : null,
-              last_failure_json: effect.status === "completed" ? null : effect.error,
-              non_retryable_error_names_json: effect.nonRetryableErrorNames ?? [],
-              result_json: effect.status === "completed" ? effect.result : null,
-              error_json: effect.status === "completed" ? null : effect.error,
-              heartbeat_details_json: effect.heartbeatDetails ?? null,
-            }
-          }),
-        ),
-      ],
+      [encodeJson(effects)],
     )
   }
 
@@ -3164,7 +3883,318 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         encodeJson(input.waits),
         input.now,
         input.workflowId,
-        input.runId,
+      input.runId,
+    ],
+  )
+  }
+
+  private async writeNextInstancesForBatch(
+    client: PoolClient,
+    successes: Array<{ input: CommitActivationInput; nextSequence: number }>,
+  ): Promise<void> {
+    const running = successes
+      .filter(({ input }) => input.next.status === "running")
+      .map(({ input, nextSequence }) => {
+        if (input.next.status !== "running") {
+          throw new Error("unreachable")
+        }
+        return {
+          workflow_id: input.workflowId,
+          run_id: input.runId,
+          workflow_version: input.workflowVersion,
+          sequence: nextSequence,
+          common_json: input.next.common,
+          phase_name: input.next.phase.name,
+          phase_data_json: input.next.phase.data,
+          waits_json: input.waits,
+          updated_at: input.now,
+        }
+      })
+    if (running.length > 0) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(
+            workflow_id text,
+            run_id text,
+            workflow_version integer,
+            sequence integer,
+            common_json jsonb,
+            phase_name text,
+            phase_data_json jsonb,
+            waits_json jsonb,
+            updated_at timestamptz
+          )
+        )
+        UPDATE ${this.table("instances")} target
+        SET workflow_version = input.workflow_version,
+          sequence = input.sequence,
+          status = 'running',
+          common_json = input.common_json,
+          phase_name = input.phase_name,
+          phase_data_json = input.phase_data_json,
+          output_json = NULL,
+          error_json = NULL,
+          cancel_reason = NULL,
+          waits_json = input.waits_json,
+          updated_at = input.updated_at
+        FROM input
+        WHERE target.workflow_id = input.workflow_id
+          AND target.run_id = input.run_id
+        `,
+        [encodeJson(running)],
+      )
+    }
+
+    const completed = successes
+      .filter(({ input }) => input.next.status === "completed")
+      .map(({ input, nextSequence }) => {
+        if (input.next.status !== "completed") {
+          throw new Error("unreachable")
+        }
+        return {
+          workflow_id: input.workflowId,
+          run_id: input.runId,
+          workflow_version: input.workflowVersion,
+          sequence: nextSequence,
+          output_json: toJson(input.next.output),
+          waits_json: input.waits,
+          updated_at: input.now,
+        }
+      })
+    if (completed.length > 0) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(
+            workflow_id text,
+            run_id text,
+            workflow_version integer,
+            sequence integer,
+            output_json jsonb,
+            waits_json jsonb,
+            updated_at timestamptz
+          )
+        )
+        UPDATE ${this.table("instances")} target
+        SET workflow_version = input.workflow_version,
+          sequence = input.sequence,
+          status = 'completed',
+          common_json = NULL,
+          phase_name = NULL,
+          phase_data_json = NULL,
+          output_json = input.output_json,
+          error_json = NULL,
+          cancel_reason = NULL,
+          waits_json = input.waits_json,
+          updated_at = input.updated_at
+        FROM input
+        WHERE target.workflow_id = input.workflow_id
+          AND target.run_id = input.run_id
+        `,
+        [encodeJson(completed)],
+      )
+    }
+
+    const canceled = successes
+      .filter(({ input }) => input.next.status === "canceled")
+      .map(({ input, nextSequence }) => {
+        if (input.next.status !== "canceled") {
+          throw new Error("unreachable")
+        }
+        return {
+          workflow_id: input.workflowId,
+          run_id: input.runId,
+          workflow_version: input.workflowVersion,
+          sequence: nextSequence,
+          cancel_reason: input.next.reason,
+          waits_json: input.waits,
+          updated_at: input.now,
+        }
+      })
+    if (canceled.length > 0) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(
+            workflow_id text,
+            run_id text,
+            workflow_version integer,
+            sequence integer,
+            cancel_reason text,
+            waits_json jsonb,
+            updated_at timestamptz
+          )
+        )
+        UPDATE ${this.table("instances")} target
+        SET workflow_version = input.workflow_version,
+          sequence = input.sequence,
+          status = 'canceled',
+          common_json = NULL,
+          phase_name = NULL,
+          phase_data_json = NULL,
+          output_json = NULL,
+          error_json = NULL,
+          cancel_reason = input.cancel_reason,
+          waits_json = input.waits_json,
+          updated_at = input.updated_at
+        FROM input
+        WHERE target.workflow_id = input.workflow_id
+          AND target.run_id = input.run_id
+        `,
+        [encodeJson(canceled)],
+      )
+    }
+
+    const failed = successes
+      .filter(({ input }) => input.next.status === "failed")
+      .map(({ input, nextSequence }) => {
+        if (input.next.status !== "failed") {
+          throw new Error("unreachable")
+        }
+        return {
+          workflow_id: input.workflowId,
+          run_id: input.runId,
+          workflow_version: input.workflowVersion,
+          sequence: nextSequence,
+          error_json: input.next.error,
+          waits_json: input.waits,
+          updated_at: input.now,
+        }
+      })
+    if (failed.length > 0) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(
+            workflow_id text,
+            run_id text,
+            workflow_version integer,
+            sequence integer,
+            error_json jsonb,
+            waits_json jsonb,
+            updated_at timestamptz
+          )
+        )
+        UPDATE ${this.table("instances")} target
+        SET workflow_version = input.workflow_version,
+          sequence = input.sequence,
+          status = 'failed',
+          common_json = NULL,
+          phase_name = NULL,
+          phase_data_json = NULL,
+          output_json = NULL,
+          error_json = input.error_json,
+          cancel_reason = NULL,
+          waits_json = input.waits_json,
+          updated_at = input.updated_at
+        FROM input
+        WHERE target.workflow_id = input.workflow_id
+          AND target.run_id = input.run_id
+        `,
+        [encodeJson(failed)],
+      )
+    }
+  }
+
+  private async consumeSignalsForBatch(
+    client: PoolClient,
+    successes: Array<{ input: CommitActivationInput; nextSequence: number }>,
+  ): Promise<void> {
+    const rows = successes
+      .filter(({ input }) => input.consumeSignalId)
+      .map(({ input, nextSequence }) => ({
+        signal_id: input.consumeSignalId,
+        consumed_by_sequence: nextSequence,
+      }))
+    if (rows.length === 0) {
+      return
+    }
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          signal_id text,
+          consumed_by_sequence integer
+        )
+      )
+      UPDATE ${this.table("signals")} target
+      SET consumed_by_sequence = input.consumed_by_sequence
+      FROM input
+      WHERE target.signal_id = input.signal_id
+      `,
+      [encodeJson(rows)],
+    )
+  }
+
+  private async consumeChildrenForBatch(
+    client: PoolClient,
+    successes: Array<{ input: CommitActivationInput; nextSequence: number }>,
+  ): Promise<void> {
+    const rows = successes
+      .filter(({ input }) => input.consumeChildRecordId)
+      .map(({ input, nextSequence }) => ({
+        child_record_id: input.consumeChildRecordId,
+        delivered_by_sequence: nextSequence,
+      }))
+    if (rows.length === 0) {
+      return
+    }
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          child_record_id text,
+          delivered_by_sequence integer
+        )
+      )
+      UPDATE ${this.table("children")} target
+      SET delivered_by_sequence = input.delivered_by_sequence
+      FROM input
+      WHERE target.child_record_id = input.child_record_id
+      `,
+      [encodeJson(rows)],
+    )
+  }
+
+  private async completeActivationTasksForBatch(
+    client: PoolClient,
+    successes: Array<{ input: CommitActivationInput; nextSequence: number }>,
+  ): Promise<void> {
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          activation_id text,
+          completed_by_sequence integer,
+          completed_at timestamptz,
+          worker_id text
+        )
+      )
+      UPDATE ${this.table("activation_tasks")} target
+      SET completed_by_sequence = input.completed_by_sequence,
+        completed_at = input.completed_at,
+        lease_until = input.completed_at,
+        owner_id = input.worker_id
+      FROM input
+      WHERE target.activation_id = input.activation_id
+      `,
+      [
+        encodeJson(
+          successes.map(({ input, nextSequence }) => ({
+            activation_id: input.activationId,
+            completed_by_sequence: nextSequence,
+            completed_at: input.now,
+            worker_id: input.workerId,
+          })),
+        ),
       ],
     )
   }
@@ -3805,6 +4835,49 @@ function parentClosedChildError(status: "canceled" | "failed"): SerializedError 
     name: "ParentClosed",
     message: `Child canceled because parent ${status}`,
   }
+}
+
+function childStartCommitConflict(
+  reason: string,
+  start: CheckpointChildStart,
+): { reason: string; error: SerializedError } {
+  return {
+    reason,
+    error: {
+      name: "ChildStartConflict",
+      message: `Child start ${start.key} failed: ${reason} (${start.workflowId}/${start.runId})`,
+    },
+  }
+}
+
+function shouldCommitSequentially(inputs: CommitActivationInput[]): boolean {
+  const activationIds = new Set<string>()
+  const instanceSequences = new Set<string>()
+  const childRefs = new Set<string>()
+  for (const input of inputs) {
+    if (activationIds.has(input.activationId)) {
+      return true
+    }
+    activationIds.add(input.activationId)
+
+    const instanceSequenceKey = `${input.workflowId}\0${input.runId}\0${input.expectedSequence}`
+    if (instanceSequences.has(instanceSequenceKey)) {
+      return true
+    }
+    instanceSequences.add(instanceSequenceKey)
+
+    for (const start of input.childStarts ?? []) {
+      if (start.conflictPolicy === "terminate_existing") {
+        return true
+      }
+      const refKey = `${start.workflowId}\0${start.runId}`
+      if (childRefs.has(refKey)) {
+        return true
+      }
+      childRefs.add(refKey)
+    }
+  }
+  return false
 }
 
 type NormalizedEffectOptions = {

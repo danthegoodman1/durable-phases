@@ -639,6 +639,7 @@ Child options:
 ```ts
 type ChildOptions = {
   workflowId?: string
+  durability?: "checkpoint" | "eager"
   parentClosePolicy?: "cancel" | "abandon"
   conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
 }
@@ -648,10 +649,22 @@ Default:
 
 ```ts
 {
+  durability: "checkpoint",
   parentClosePolicy: "cancel",
   conflictPolicy: "use_existing"
 }
 ```
+
+Child starts default to checkpoint durability. In checkpoint mode,
+`ctx.child.start(...)` validates input, returns a deterministic handle, and
+buffers the child start until the parent activation checkpoint commits. If the
+worker crashes before that checkpoint, the child was never durably started and
+the retried activation will produce the same handle. Repeated starts with the
+same activation key are resolved locally by `conflictPolicy`.
+
+Use `durability: "eager"` when the child must be created in the durable store
+immediately and DB-side conflicts should be observed before the parent
+checkpoint.
 
 `ctx.child.cancel(handle)` cancels a running local child workflow. If the child is already terminal, cancellation is idempotent and does not overwrite the child's terminal state.
 
@@ -1159,6 +1172,21 @@ type CommitCheckpointInput = {
   consumeSignalId?: string
   consumeChildRecordId?: string
   effects?: CheckpointEffectMutation[]
+  childStarts?: CheckpointChildStart[]
+}
+
+type CheckpointChildStart = {
+  key: string
+  workflowName: string
+  workflowVersion: number
+  workflowId: string
+  runId: string
+  partitionShard: number
+  common: JsonObject
+  phase: PhaseSnapshot
+  waits: DurableWait[]
+  parentClosePolicy?: "cancel" | "abandon"
+  conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
 }
 ```
 
@@ -1170,6 +1198,7 @@ verify activation lease is held or still valid
 consume the selected signal, if any
 consume the selected child completion, if any
 persist checkpoint-durable effect mutations, if any
+persist checkpoint-durable child starts, if any
 write the new instance snapshot or terminal state
 replace the current wait set
 persist child completion delivery and parent-close updates
@@ -1184,6 +1213,10 @@ If `expectedSequence` does not match, the commit fails without partial writes. T
 Signal and child consumption must be committed with the checkpoint. If the
 checkpoint fails, the signal or child completion remains unconsumed and
 checkpoint-durable effect mutations from that completion must not be written.
+Checkpoint-durable child starts are also all-or-nothing with the parent
+checkpoint. Child start conflicts that cannot be retried, such as a requested
+child workflow id already existing, must be reported as non-retryable commit
+failures so workers do not spin on the same activation.
 
 `recordActivationFailures(...)` records activation-scoped checkpoint activity
 failures that do not advance workflow sequence, such as retry-scheduled local

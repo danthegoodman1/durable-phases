@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { z } from "zod"
 import type {
   ClaimedActivation,
+  CheckpointChildStart,
   CommitCheckpointInput,
   DurabilityProvider,
   DurableWait,
@@ -543,7 +544,7 @@ export function describeDurabilityProviderConformance(
               },
             ],
           }),
-        ).resolves.toEqual({ ok: false, sequence: 0 })
+        ).resolves.toMatchObject({ ok: false, sequence: 0 })
         await expect(provider.loadInstance(ref)).resolves.toMatchObject({
           sequence: 0,
           status: "running",
@@ -578,7 +579,7 @@ export function describeDurabilityProviderConformance(
             now: T2,
             consumeSignalId: activation.event.consumeSignalId,
           }),
-        ).resolves.toEqual({ ok: false, sequence: 1 })
+        ).resolves.toMatchObject({ ok: false, sequence: 1 })
         await expect(provider.loadInstance(ref)).resolves.toMatchObject({
           sequence: 1,
           status: "completed",
@@ -620,7 +621,7 @@ export function describeDurabilityProviderConformance(
             now: T1,
             consumeSignalId: activationA.event.consumeSignalId,
           }),
-        ).resolves.toEqual({ ok: false, sequence: 0 })
+        ).resolves.toMatchObject({ ok: false, sequence: 0 })
 
         await providerB.claimDispatchShard({
           shardId: 0,
@@ -1034,6 +1035,152 @@ export function describeDurabilityProviderConformance(
             conflictPolicy: "fail",
           }),
         ).rejects.toThrow()
+      })
+    })
+
+    it("commits checkpoint child starts atomically and reports non-retryable child conflicts", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const { ref, activation } = await activeRun(provider, "checkpoint-child-start")
+        const startInput = checkpointChildStart(
+          childCreateInput(ref, activation.activationId, "child", "checkpoint-child-run"),
+        )
+
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 0,
+            activationId: activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { ok: true } },
+            waits: [],
+            now: T0,
+            childStarts: [startInput],
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+        await expect(provider.loadInstance({ workflowId: startInput.workflowId, runId: startInput.runId }))
+          .resolves.toMatchObject({
+            status: "running",
+            parent: {
+              workflowId: ref.workflowId,
+              runId: ref.runId,
+            },
+          })
+
+        const { ref: conflictRef, activation: conflictActivation } = await activeRun(
+          provider,
+          "checkpoint-child-conflict",
+        )
+        await provider.createInstance({
+          workflowName: "conformance_child",
+          workflowVersion: 1,
+          workflowId: "checkpoint-child-conflict-run",
+          runId: "run-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [],
+          now: T0,
+        })
+        await expect(
+          provider.commitCheckpoint({
+            ...conflictRef,
+            expectedSequence: 0,
+            activationId: conflictActivation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { ok: true } },
+            waits: [],
+            now: T0,
+            childStarts: [
+              checkpointChildStart(
+                childCreateInput(
+                  conflictRef,
+                  conflictActivation.activationId,
+                  "child",
+                  "checkpoint-child-conflict-run",
+                ),
+              ),
+            ],
+          }),
+        ).resolves.toMatchObject({
+          ok: false,
+          sequence: 0,
+          reason: "existing_child_instance",
+          retryable: false,
+        })
+        await expect(provider.loadInstance(conflictRef)).resolves.toMatchObject({
+          status: "running",
+          sequence: 0,
+        })
+      })
+    })
+
+    it("keeps batched child-start conflicts isolated to the conflicting activation", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const first = await activeRun(provider, "batch-child-start-conflict-a")
+        const second = await activeRun(provider, "batch-child-start-conflict-b")
+        const sharedChildId = "batch-shared-child"
+
+        const result = await provider.commitActivations([
+          {
+            ...first.ref,
+            expectedSequence: 0,
+            activationId: first.activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { parent: "first" } },
+            waits: [],
+            now: T0,
+            childStarts: [
+              checkpointChildStart(
+                childCreateInput(first.ref, first.activation.activationId, "child", sharedChildId),
+              ),
+            ],
+          },
+          {
+            ...second.ref,
+            expectedSequence: 0,
+            activationId: second.activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { parent: "second" } },
+            waits: [],
+            now: T0,
+            childStarts: [
+              checkpointChildStart(
+                childCreateInput(second.ref, second.activation.activationId, "child", sharedChildId),
+              ),
+            ],
+          },
+        ])
+
+        expect(result.results).toHaveLength(2)
+        expect(result.results[0]).toMatchObject({ ok: true, sequence: 1 })
+        expect(result.results[1]).toMatchObject({
+          ok: false,
+          sequence: 0,
+          reason: "existing_child_instance",
+          retryable: false,
+        })
+        await expect(provider.loadInstance(first.ref)).resolves.toMatchObject({
+          status: "completed",
+          sequence: 1,
+        })
+        await expect(provider.loadInstance(second.ref)).resolves.toMatchObject({
+          status: "running",
+          sequence: 0,
+        })
+        await expect(provider.loadInstance({ workflowId: sharedChildId, runId: "run-1" }))
+          .resolves.toMatchObject({
+            status: "running",
+            parent: {
+              workflowId: first.ref.workflowId,
+              runId: first.ref.runId,
+            },
+          })
       })
     })
 
@@ -1529,6 +1676,24 @@ function childCreateInput(
     leaseNow: T0,
     key,
   } satisfies Parameters<DurabilityProvider["createChildInstance"]>[0]
+}
+
+function checkpointChildStart(
+  input: Parameters<DurabilityProvider["createChildInstance"]>[0],
+): CheckpointChildStart {
+  return {
+    key: input.key,
+    workflowName: input.workflowName,
+    workflowVersion: input.workflowVersion,
+    workflowId: input.workflowId,
+    runId: input.runId,
+    partitionShard: input.partitionShard,
+    common: input.common,
+    phase: input.phase,
+    waits: input.waits,
+    parentClosePolicy: input.parentClosePolicy,
+    conflictPolicy: input.conflictPolicy,
+  }
 }
 
 function jsonChildHandle(handle: {

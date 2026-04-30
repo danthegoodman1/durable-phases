@@ -372,12 +372,15 @@ export type CommitCheckpointInput = {
   consumeSignalId?: string
   consumeChildRecordId?: string
   effects?: CheckpointEffectMutation[]
+  childStarts?: CheckpointChildStart[]
 }
 
 export type CommitCheckpointResult = {
   ok: boolean
   sequence: number
   reason?: string
+  retryable?: boolean
+  error?: SerializedError
 }
 
 export type CheckpointEffectMutation =
@@ -429,6 +432,20 @@ export type CheckpointEffectMutation =
       backoffCoefficient?: number
       nonRetryableErrorNames?: string[]
     }
+
+export type CheckpointChildStart = {
+  key: string
+  workflowName: string
+  workflowVersion: number
+  workflowId: string
+  runId: string
+  partitionShard: number
+  common: JsonObject
+  phase: PhaseSnapshot
+  waits: DurableWait[]
+  parentClosePolicy?: "cancel" | "abandon"
+  conflictPolicy?: ConflictPolicy
+}
 
 export type CommitActivationInput = CommitCheckpointInput
 

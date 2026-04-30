@@ -105,6 +105,7 @@ export type ActivityRetryOptions = {
 
 export type ChildOptions = {
   workflowId?: string
+  durability?: "checkpoint" | "eager"
   parentClosePolicy?: "cancel" | "abandon"
   conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
 }
