@@ -181,6 +181,55 @@ export function describeDurabilityProviderConformance(
       })
     })
 
+    it("batch claims ordered activations with current lean snapshots", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        for (let index = 0; index < 3; index += 1) {
+          await createConformanceInstance(provider, {
+            workflowId: `batch-${index}`,
+            common: { index },
+            phase: { name: "run", data: { index } },
+          })
+        }
+        await ownShard(provider, "worker-a")
+
+        await expect(
+          provider.claimReadyActivations({
+            workerId: "worker-a",
+            shardIds: [0],
+            workflows: WORKFLOWS,
+            now: T0,
+            leaseMs: LONG_LEASE_MS,
+            limit: 0,
+          }),
+        ).rejects.toThrow()
+
+        const batch = await provider.claimReadyActivations({
+          workerId: "worker-a",
+          shardIds: [0],
+          workflows: WORKFLOWS,
+          now: T0,
+          leaseMs: LONG_LEASE_MS,
+          limit: 2,
+        })
+
+        expect(batch.claims).toHaveLength(2)
+        expect(batch.claims.map((claim) => claim.activation.workflowId)).toEqual([
+          "batch-0",
+          "batch-1",
+        ])
+        expect(batch.claims[0].instance).toMatchObject({
+          workflowId: "batch-0",
+          runId: "run-1",
+          sequence: 0,
+          status: "running",
+          common: { index: 0 },
+          phase: { name: "run", data: { index: 0 } },
+        })
+        expect("effects" in batch.claims[0].instance).toBe(false)
+      })
+    })
+
     it("enforces dispatch shard leases and stable activation reclaim", async () => {
       await withStore(factory, async (store) => {
         const providerA = await store.createProvider()
@@ -1341,13 +1390,20 @@ async function claim(
   leaseMs = LONG_LEASE_MS,
   workflows: Record<string, { version: number }> = WORKFLOWS,
 ) {
-  return provider.claimReadyActivation({
+  const result = await provider.claimReadyActivations({
     workerId,
     shardIds: [0],
     workflows,
     now,
     leaseMs,
+    limit: 1,
   })
+  const first = result.claims[0]
+  return first
+    ? { activation: first.activation, instance: first.instance }
+    : result.nextWakeAt
+      ? { activation: null, nextWakeAt: result.nextWakeAt }
+      : { activation: null }
 }
 
 function requireActivation(result: Awaited<ReturnType<typeof claim>>): ClaimedActivation {

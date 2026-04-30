@@ -44,9 +44,9 @@ and zero artificial activity delay:
 
 | SQLite synchronous | activation concurrency | e2e workflows/sec | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| full | 1 | 272 | 1,358 | 2,173 | 1,452 | 2,323 |
-| full | 4 | 272 | 1,362 | 2,179 | 1,455 | 2,327 |
-| normal | 4 | 320 | 1,601 | 2,562 | 1,701 | 2,721 |
+| full | 1 | 265 | 1,323 | 2,116 | 1,407 | 2,251 |
+| full | 4 | 274 | 1,372 | 2,195 | 1,461 | 2,337 |
+| normal | 4 | 317 | 1,586 | 2,537 | 1,672 | 2,675 |
 
 This benchmark is mostly SQLite/CPU-bound, so higher activation concurrency does
 not improve this particular throughput row. The concurrency path is still useful
@@ -58,8 +58,8 @@ machine measured:
 
 | activation concurrency | e2e activations/sec | e2e mixed actions/sec | processing activations/sec | processing mixed actions/sec |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 891 | 1,426 | 944 | 1,511 |
-| 4 | 1,434 | 2,295 | 1,559 | 2,494 |
+| 1 | 874 | 1,398 | 921 | 1,474 |
+| 4 | 1,461 | 2,337 | 1,611 | 2,578 |
 
 `synchronous=full` is the conservative default. `synchronous=normal` is available
 for deployments that accept SQLite's weaker crash window in exchange for higher

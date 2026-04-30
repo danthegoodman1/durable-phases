@@ -805,7 +805,8 @@ type DurabilityProvider = {
   heartbeatDispatchShard?(input: HeartbeatDispatchShardInput): Promise<void>
   releaseDispatchShard?(input: ReleaseDispatchShardInput): Promise<void>
 
-  claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimedActivation | null>
+  claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult>
+  claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
   heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
   releaseActivation(input: ReleaseActivationInput): Promise<void>
 
@@ -967,7 +968,9 @@ SQLite's weaker crash-recovery window for the most recent transactions.
 
 ### Activation claiming
 
-`claimReadyActivation(...)` returns one ready handler activation, or `null`.
+`claimReadyActivations(...)` returns up to `limit` ready handler activations plus
+their current lean instance snapshots. `claimReadyActivation(...)` is a
+compatibility wrapper over batch limit `1`.
 
 Ready activations come from:
 
@@ -982,9 +985,29 @@ When more than one wait is ready for an instance, the provider and runtime must 
 
 Claims are leased. If a worker crashes, another worker may claim the activation after the lease expires.
 
-In a sharded provider, `claimReadyActivation(...)` should verify that the caller owns the dispatch shard for the requested work, or otherwise use an equivalent mechanism that prevents all workers from scanning all shards.
+In a sharded provider, claim calls should verify that the caller owns the dispatch shard for the requested work, or otherwise use an equivalent mechanism that prevents all workers from scanning all shards.
+
+The instance snapshot returned with a claim is for activation execution, not
+debug introspection. It includes identity, version, current sequence, status,
+common state, phase/output/error, waits, parent link, and timestamps. It does
+not need to include effect ledger records. Full `loadInstance(...)` reads may
+include provider-specific debug details such as effects.
 
 ```ts
+type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
+  limit: number
+}
+
+type ClaimedActivationWithInstance = {
+  activation: ClaimedActivation
+  instance: ActivationInstanceSnapshot
+}
+
+type ClaimReadyActivationsResult = {
+  claims: ClaimedActivationWithInstance[]
+  nextWakeAt?: string
+}
+
 type ClaimedActivation =
   | {
       kind: "event"

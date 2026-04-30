@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { z } from "zod"
 import type {
+  ActivationInstanceSnapshot,
   ClaimedActivation,
   ConflictPolicy,
   CommitCheckpointResult,
@@ -313,7 +314,7 @@ export class DurableRuntime {
     }
 
     const tasks = new Set<ActivationTask>()
-    const startActivation = (activation: ClaimedActivation, instance: PersistedInstance) => {
+    const startActivation = (activation: ClaimedActivation, instance: ActivationInstanceSnapshot) => {
       claimedActivations += 1
       const task: ActivationTask = {
         promise: this.runClaimedActivation(activation, instance, drainController.signal).catch(
@@ -395,16 +396,21 @@ export class DurableRuntime {
             break
           }
 
-          const claim = await this.provider.claimReadyActivation({
+          const openSlots = Math.min(
+            maxConcurrentActivations - tasks.size,
+            maxActivations - claimedActivations,
+          )
+          const batch = await this.provider.claimReadyActivations({
             workerId: this.workerId,
             shardIds,
             workflows: this.workflowVersions(),
             now: this.now(),
             leaseMs: this.activationLeaseMs,
+            limit: openSlots,
           })
 
-          if (!claim.activation) {
-            nextWakeAt = claim.nextWakeAt
+          if (batch.claims.length === 0) {
+            nextWakeAt = batch.nextWakeAt
             claimMissed = true
             this.log("debug", "runtime.activation.claim_miss", () => ({
               workerId: this.workerId,
@@ -419,23 +425,31 @@ export class DurableRuntime {
             break
           }
 
-          this.log("debug", "runtime.activation.claimed", () => ({
-            workerId: this.workerId,
-            workflowName: claim.activation.workflowName,
-            workflowId: claim.activation.workflowId,
-            runId: claim.activation.runId,
-            activationId: claim.activation.activationId,
-            activationKind: claim.activation.kind,
-            eventKind: activationEventKind(claim.activation),
-            sequence: claim.activation.sequence,
-            activeSlots: tasks.size + 1,
-            maxConcurrentActivations,
-          }))
-          this.count(
-            "durable.runtime.activation.claim",
-            () => this.activationTags(claim.activation, "claimed"),
-          )
-          startActivation(claim.activation, claim.instance)
+          for (const claim of batch.claims) {
+            this.log("debug", "runtime.activation.claimed", () => ({
+              workerId: this.workerId,
+              workflowName: claim.activation.workflowName,
+              workflowId: claim.activation.workflowId,
+              runId: claim.activation.runId,
+              activationId: claim.activation.activationId,
+              activationKind: claim.activation.kind,
+              eventKind: activationEventKind(claim.activation),
+              sequence: claim.activation.sequence,
+              activeSlots: tasks.size + 1,
+              maxConcurrentActivations,
+            }))
+            this.count(
+              "durable.runtime.activation.claim",
+              () => this.activationTags(claim.activation, "claimed"),
+            )
+            startActivation(claim.activation, claim.instance)
+          }
+
+          if (batch.claims.length < openSlots) {
+            nextWakeAt = batch.nextWakeAt
+            claimMissed = true
+            break
+          }
         }
 
         if (tasks.size === 0) {
@@ -662,7 +676,7 @@ export class DurableRuntime {
 
   private async runActivation(
     activation: ClaimedActivation,
-    latest: PersistedInstance,
+    latest: ActivationInstanceSnapshot,
     signal: AbortSignal,
   ): Promise<void> {
     this.log("debug", "runtime.activation.started", () => ({
@@ -807,7 +821,7 @@ export class DurableRuntime {
   }
 
   private async commitOrDiscard(
-    latest: PersistedInstance,
+    latest: ActivationInstanceSnapshot,
     workflow: AnyWorkflow,
     activationId: string,
     next: InstanceStatus<any>,
@@ -870,7 +884,7 @@ export class DurableRuntime {
 
   private contextFor(
     workflow: AnyWorkflow,
-    instance: PersistedInstance,
+    instance: ActivationInstanceSnapshot,
     currentActivationId: string,
     activationTime: string,
     activationSignal: AbortSignal,
@@ -1162,7 +1176,7 @@ export class DurableRuntime {
 
   private async runClaimedActivation(
     activation: ClaimedActivation,
-    instance: PersistedInstance,
+    instance: ActivationInstanceSnapshot,
     signal: AbortSignal,
   ): Promise<ActivationTaskOutcome> {
     try {
@@ -1381,7 +1395,7 @@ export class DurableRuntime {
 
   private applyTransition(
     workflow: AnyWorkflow,
-    instance: PersistedInstance,
+    instance: ActivationInstanceSnapshot,
     transition: TransitionCommand,
   ): InstanceStatus<any> {
     const current = snapshotFromInstance(instance)
@@ -1438,7 +1452,7 @@ export class DurableRuntime {
 
   private async migrateSnapshot(
     workflow: AnyWorkflow,
-    instance: PersistedInstance,
+    instance: ActivationInstanceSnapshot,
   ): Promise<InstanceStatus<any>> {
     if (instance.workflowVersion > workflow.version) {
       throw new Error(
@@ -1547,7 +1561,7 @@ export class DurableRuntime {
 
   private waitDefinition(
     workflow: AnyWorkflow,
-    instance: PersistedInstance,
+    instance: ActivationInstanceSnapshot,
     wait: Exclude<DurableWait, { kind: "run" }>,
   ): WaitDefinition {
     if (wait.kind === "signal" && wait.scope === "global") {
@@ -1707,7 +1721,7 @@ function commonSchema(workflow: AnyWorkflow): Schema<any> {
   return workflow.common ?? z.object({})
 }
 
-function snapshotFromInstance(instance: PersistedInstance): InstanceStatus<any> {
+function snapshotFromInstance(instance: ActivationInstanceSnapshot): InstanceStatus<any> {
   if (instance.status === "running") {
     return {
       status: "running",

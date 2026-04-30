@@ -79,6 +79,21 @@ async function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void>
   }
 }
 
+async function waitForInstanceStatus(
+  provider: SqliteDurabilityProvider,
+  ref: { workflowId: string; runId: string },
+  status: string,
+  timeoutMs = 250,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while ((await provider.loadInstance(ref))?.status !== status) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${ref.workflowId}/${ref.runId} to be ${status}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+}
+
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   let reject!: (reason?: unknown) => void
@@ -2929,6 +2944,121 @@ describe("durable workflow PoC", () => {
     })
   })
 
+  it("batch claims ready activations up to the requested limit with lean snapshots", async () => {
+    const provider = testProvider(await storePath())
+    for (let index = 0; index < 4; index += 1) {
+      await provider.createInstance({
+        workflowName: "batch_claim",
+        workflowVersion: 1,
+        workflowId: `batch-claim-${index}`,
+        runId: "run-1",
+        partitionShard: 0,
+        common: { index },
+        phase: { name: "run", data: { index } },
+        waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+        now: "2026-01-01T00:00:00.000Z",
+      })
+    }
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+
+    await expect(
+      provider.claimReadyActivations({
+        workerId: "worker-a",
+        shardIds: [0],
+        workflows: { batch_claim: { version: 1 } },
+        now: "2026-01-01T00:00:00.000Z",
+        leaseMs: 60_000,
+        limit: 0,
+      }),
+    ).rejects.toThrow("claimReadyActivations limit must be a positive integer")
+
+    const batch = await provider.claimReadyActivations({
+      workerId: "worker-a",
+      shardIds: [0],
+      workflows: { batch_claim: { version: 1 } },
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+      limit: 2,
+    })
+    expect(batch.claims).toHaveLength(2)
+    expect(batch.nextWakeAt).toBeUndefined()
+    expect(batch.claims.map((claim) => claim.activation.workflowId)).toEqual([
+      "batch-claim-0",
+      "batch-claim-1",
+    ])
+    expect(batch.claims[0].instance).toMatchObject({
+      workflowId: "batch-claim-0",
+      runId: "run-1",
+      sequence: 0,
+      status: "running",
+      common: { index: 0 },
+      phase: { name: "run", data: { index: 0 } },
+    })
+    expect("effects" in batch.claims[0].instance).toBe(false)
+
+    const wrapperClaim = await provider.claimReadyActivation({
+      workerId: "worker-a",
+      shardIds: [0],
+      workflows: { batch_claim: { version: 1 } },
+      now: "2026-01-01T00:00:00.001Z",
+      leaseMs: 60_000,
+    })
+    expect(wrapperClaim).toMatchObject({
+      activation: { workflowId: "batch-claim-2" },
+      instance: { workflowId: "batch-claim-2", sequence: 0 },
+    })
+  })
+
+  it("does not batch-claim competing ready events for the same workflow sequence", async () => {
+    const provider = testProvider(await storePath())
+    const ref = await provider.createInstance({
+      workflowName: "batch_activation_race",
+      workflowVersion: 1,
+      workflowId: "batch-activation-race",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [
+        { kind: "signal", name: "finish", type: "finish", scope: "phase" },
+        { kind: "timer", name: "timeout", fireAt: "2026-01-01T00:00:00.000Z" },
+      ],
+      now: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: {},
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    })
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "worker-a",
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+    })
+
+    const batch = await provider.claimReadyActivations({
+      workerId: "worker-a",
+      shardIds: [0],
+      workflows: { batch_activation_race: { version: 1 } },
+      now: "2026-01-01T00:00:00.000Z",
+      leaseMs: 60_000,
+      limit: 2,
+    })
+
+    expect(batch.claims).toHaveLength(1)
+    expect(batch.claims[0].activation).toMatchObject({
+      kind: "event",
+      event: { kind: "signal" },
+    })
+  })
+
   it("requires a live activation lease to start a child workflow", async () => {
     const provider = testProvider(await storePath())
     const parentRef = await provider.createInstance({
@@ -3825,6 +3955,7 @@ describe("durable workflow PoC", () => {
 
     await slowStarted.promise
     await waitFor(() => fastCompleted)
+    await waitForInstanceStatus(provider, fastRef, "completed")
     expect(await provider.loadInstance(fastRef)).toMatchObject({ status: "completed" })
     expect(await provider.loadInstance(slowRef)).toMatchObject({ status: "running" })
     releaseSlow.resolve()

@@ -64,7 +64,7 @@ export type EffectRecord = {
   heartbeatDetails?: JsonValue
 }
 
-export type PersistedInstance = {
+export type ActivationInstanceSnapshot = {
   workflowName: string
   workflowVersion: number
   workflowId: string
@@ -77,7 +77,6 @@ export type PersistedInstance = {
   error?: SerializedError
   cancelReason?: string
   waits: DurableWait[]
-  effects: EffectRecord[]
   createdAt: string
   updatedAt: string
   parent?: {
@@ -85,6 +84,10 @@ export type PersistedInstance = {
     runId: string
     childRecordId: string
   }
+}
+
+export type PersistedInstance = ActivationInstanceSnapshot & {
+  effects: EffectRecord[]
 }
 
 export type ChildRecord = {
@@ -233,10 +236,24 @@ export type ClaimReadyActivationInput = {
   leaseMs: number
 }
 
+export type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
+  limit: number
+}
+
+export type ClaimedActivationWithInstance = {
+  activation: ClaimedActivation
+  instance: ActivationInstanceSnapshot
+}
+
+export type ClaimReadyActivationsResult = {
+  claims: ClaimedActivationWithInstance[]
+  nextWakeAt?: string
+}
+
 export type ClaimReadyActivationResult =
   | {
       activation: ClaimedActivation
-      instance: PersistedInstance
+      instance: ActivationInstanceSnapshot
       nextWakeAt?: undefined
     }
   | {
@@ -352,6 +369,7 @@ export type DurabilityProvider = {
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>
   releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void>
+  claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult>
   claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
   heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
   releaseActivation(input: ReleaseActivationInput): Promise<void>
