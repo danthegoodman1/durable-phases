@@ -2,6 +2,7 @@ import pg from "pg"
 import { performance } from "node:perf_hooks"
 import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
+import type { Pool as PgPool, PoolClient } from "pg"
 import { DurableRuntime, PostgresDurabilityProvider } from "../durable.js"
 import {
   activityCount,
@@ -27,7 +28,34 @@ export type PostgresBenchmarkOptions = {
   batch: number
   maxRounds: number
   keepSchema: boolean
+  profileQueries: boolean
   json: boolean
+}
+
+type QueryProfilePhase = "setup" | "processing" | "verify" | "cleanup"
+
+type QueryProfileEntry = {
+  phase: QueryProfilePhase | "all"
+  count: number
+  totalMs: number
+  avgMs: number
+  maxMs: number
+  sql: string
+}
+
+export type PostgresQueryProfile = {
+  totalQueries: number
+  queriesPerActivation: number
+  totalSqlMs: number
+  avgQueryMs: number
+  byPhase: Record<QueryProfilePhase, {
+    totalQueries: number
+    queriesPerActivation: number
+    totalSqlMs: number
+    avgQueryMs: number
+  }>
+  topByTotal: QueryProfileEntry[]
+  topByCount: QueryProfileEntry[]
 }
 
 export type PostgresBenchmarkResult = {
@@ -52,6 +80,7 @@ export type PostgresBenchmarkResult = {
   processingMixedActionsPerSecond: number
   processingWorkflowsPerSecond: number
   counters: BenchmarkCounters
+  queryProfile?: PostgresQueryProfile
 }
 
 const defaultOptions: PostgresBenchmarkOptions = {
@@ -67,6 +96,7 @@ const defaultOptions: PostgresBenchmarkOptions = {
   batch: 32,
   maxRounds: 10_000,
   keepSchema: false,
+  profileQueries: false,
   json: false,
 }
 
@@ -96,6 +126,10 @@ export async function runPostgresBenchmark(
     connectionString: options.connectionString,
     max: options.poolSize,
   })
+  let profilePhase: QueryProfilePhase = "setup"
+  const queryProfiler = options.profileQueries
+    ? installPostgresQueryProfiler(pool, () => profilePhase)
+    : undefined
   const providers: PostgresDurabilityProvider[] = []
   let schemaInitialized = false
 
@@ -154,6 +188,7 @@ export async function runPostgresBenchmark(
     }
 
     setupFinishedAt = performance.now()
+    profilePhase = "processing"
     processingStartedAt = setupFinishedAt
 
     for (; rounds < options.maxRounds; rounds += 1) {
@@ -168,6 +203,7 @@ export async function runPostgresBenchmark(
     }
 
     processingFinishedAt = performance.now()
+    profilePhase = "verify"
     const verifyStartedAt = processingFinishedAt
     if (activations < expectedActivations) {
       throw new Error(
@@ -203,7 +239,7 @@ export async function runPostgresBenchmark(
     const elapsedSeconds = elapsedMs / 1_000
     const processingSeconds = Math.max(processingMs / 1_000, Number.EPSILON)
 
-    return {
+    const result: PostgresBenchmarkResult = {
       backend: "postgres",
       options: {
         ...options,
@@ -226,8 +262,11 @@ export async function runPostgresBenchmark(
       processingMixedActionsPerSecond: mixedActions / processingSeconds,
       processingWorkflowsPerSecond: completedWorkflows / processingSeconds,
       counters,
+      queryProfile: queryProfiler?.snapshot(activations),
     }
+    return result
   } finally {
+    profilePhase = "cleanup"
     if (!options.keepSchema && schemaInitialized && providers[0]) {
       await providers[0].dropSchema().catch(() => undefined)
     }
@@ -277,6 +316,8 @@ function parseArgs(args: string[]): PostgresBenchmarkOptions {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--keep-schema") {
       options.keepSchema = true
+    } else if (flag === "--profile-queries") {
+      options.profileQueries = true
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -322,6 +363,8 @@ Options:
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
   --keep-schema     Keep the benchmark schema for inspection.
+  --profile-queries
+                    Include pg query counts and latency grouped by SQL fingerprint.
   --json            Print machine-readable JSON.
 `)
 }
@@ -336,6 +379,7 @@ function printResult(result: PostgresBenchmarkResult): void {
   activation concurrency: ${result.options.activationConcurrency} per worker
   activity delay: ${formatMs(result.options.activityDelayMs)}
   pool size: ${result.options.poolSize}
+  query profiling: ${result.options.profileQueries ? "on" : "off"}
   schema: ${result.options.schema}${result.options.keepSchema ? " (kept)" : ""}
   batch: ${result.options.batch}
   rounds: ${result.rounds}
@@ -359,6 +403,15 @@ Action breakdown:
   timer handlers: ${result.counters.timerHandlers}
   activities: ${activityTotal} (${result.counters.bootActivities} boot, ${result.counters.childActivities} child, ${result.counters.finishActivities} finish)
 `)
+
+  if (result.queryProfile) {
+    process.stdout.write(`
+Query profile:
+  total queries: ${result.queryProfile.totalQueries}
+  queries/activation: ${result.queryProfile.queriesPerActivation.toFixed(1)}
+  avg query: ${formatMs(result.queryProfile.avgQueryMs)}
+`)
+  }
 }
 
 function dispatchShardIdsForWorker(
@@ -377,6 +430,151 @@ function dispatchShardIdsForWorker(
 
 function redactConnectionString(connectionString: string): string {
   return connectionString.replace(/:\/\/([^:/?#]+):([^@/?#]+)@/, "://$1:***@")
+}
+
+function installPostgresQueryProfiler(
+  pool: PgPool,
+  currentPhase: () => QueryProfilePhase,
+): { snapshot(activations: number): PostgresQueryProfile } {
+  const stats = new Map<string, {
+    count: number
+    maxMs: number
+    phase: QueryProfilePhase | "all"
+    sql: string
+    totalMs: number
+  }>()
+
+  const record = (sql: string, elapsedMs: number) => {
+    const fingerprint = queryFingerprint(sql)
+    for (const phase of ["all", currentPhase()] as const) {
+      const key = `${phase}\0${fingerprint}`
+      const existing = stats.get(key) ?? {
+        count: 0,
+        maxMs: 0,
+        phase,
+        sql: fingerprint,
+        totalMs: 0,
+      }
+      existing.count += 1
+      existing.totalMs += elapsedMs
+      existing.maxMs = Math.max(existing.maxMs, elapsedMs)
+      stats.set(key, existing)
+    }
+  }
+
+  const wrapQuery = <T extends (...args: any[]) => any>(query: T, receiver: unknown): T =>
+    function profiledQuery(...args: Parameters<T>): ReturnType<T> {
+      const sql = sqlFromQueryArgs(args)
+      const startedAt = performance.now()
+      try {
+        const result = query.apply(receiver, args)
+        return Promise.resolve(result).finally(() => {
+          record(sql, performance.now() - startedAt)
+        }) as ReturnType<T>
+      } catch (error) {
+        record(sql, performance.now() - startedAt)
+        throw error
+      }
+    } as T
+
+  const wrapClient = (client: PoolClient): PoolClient => {
+    const wrapped = client as PoolClient & { __durableProfileWrapped?: boolean }
+    if (wrapped.__durableProfileWrapped) {
+      return client
+    }
+    wrapped.query = wrapQuery(wrapped.query, wrapped)
+    wrapped.__durableProfileWrapped = true
+    return wrapped
+  }
+
+  const originalPoolQuery = pool.query as (...args: any[]) => any
+  pool.query = wrapQuery(originalPoolQuery, pool) as PgPool["query"]
+
+  const originalConnect = pool.connect.bind(pool) as (...args: any[]) => any
+  pool.connect = function profiledConnect(...args: any[]) {
+    if (typeof args[0] === "function") {
+      const callback = args[0]
+      return originalConnect((error: Error | undefined, client: PoolClient, done: () => void) => {
+        callback(error, client ? wrapClient(client) : client, done)
+      })
+    }
+    return Promise.resolve(originalConnect()).then(wrapClient)
+  } as PgPool["connect"]
+
+  return {
+    snapshot(activations: number): PostgresQueryProfile {
+      const entries = [...stats.values()].map((entry) => ({
+        phase: entry.phase,
+        count: entry.count,
+        totalMs: round(entry.totalMs),
+        avgMs: round(entry.totalMs / entry.count),
+        maxMs: round(entry.maxMs),
+        sql: entry.sql,
+      }))
+      const all = entries.filter((entry) => entry.phase === "all")
+      const totals = summarizeProfileEntries(all, activations)
+      return {
+        ...totals,
+        byPhase: {
+          setup: summarizeProfileEntries(entries.filter((entry) => entry.phase === "setup"), activations),
+          processing: summarizeProfileEntries(
+            entries.filter((entry) => entry.phase === "processing"),
+            activations,
+          ),
+          verify: summarizeProfileEntries(entries.filter((entry) => entry.phase === "verify"), activations),
+          cleanup: summarizeProfileEntries(entries.filter((entry) => entry.phase === "cleanup"), activations),
+        },
+        topByTotal: [...entries]
+          .sort((left, right) => right.totalMs - left.totalMs)
+          .slice(0, 25),
+        topByCount: [...entries]
+          .sort((left, right) => right.count - left.count)
+          .slice(0, 25),
+      }
+    },
+  }
+}
+
+function summarizeProfileEntries(
+  entries: QueryProfileEntry[],
+  activations: number,
+): {
+  avgQueryMs: number
+  queriesPerActivation: number
+  totalQueries: number
+  totalSqlMs: number
+} {
+  const totalQueries = entries.reduce((total, entry) => total + entry.count, 0)
+  const totalSqlMs = entries.reduce((total, entry) => total + entry.totalMs, 0)
+  return {
+    totalQueries,
+    queriesPerActivation: round(totalQueries / Math.max(activations, 1)),
+    totalSqlMs: round(totalSqlMs),
+    avgQueryMs: totalQueries > 0 ? round(totalSqlMs / totalQueries) : 0,
+  }
+}
+
+function sqlFromQueryArgs(args: unknown[]): string {
+  const query = args[0]
+  if (typeof query === "string") {
+    return query
+  }
+  if (query && typeof query === "object" && "text" in query && typeof query.text === "string") {
+    return query.text
+  }
+  return String(query)
+}
+
+function queryFingerprint(sql: string): string {
+  return sql
+    .replace(/"durable_bench_[a-z0-9_]+"\./g, "SCHEMA.")
+    .replace(/durable_bench_[a-z0-9_]+\./g, "SCHEMA.")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function round(value: number): number {
+  return Number(value.toFixed(3))
 }
 
 function formatMs(value: number): string {
