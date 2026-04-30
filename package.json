@@ -5,11 +5,13 @@
   "description": "Node TS ESM Template",
   "dependencies": {
     "better-sqlite3": "^12.9.0",
+    "pg": "^8.20.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.19.0",
     "typescript": "~5.8.0",
     "vitest": "^4.1.5"
@@ -22,6 +24,10 @@
     "test:soak": "DURABLE_SOAK=1 vitest run",
     "benchmark": "tsx src/benchmarks/sqlite.ts",
     "benchmark:sqlite": "tsx src/benchmarks/sqlite.ts",
+    "benchmark:postgres": "tsx src/benchmarks/postgres.ts",
+    "postgres:up": "docker compose -f docker-compose.postgres.yml up -d --wait",
+    "postgres:down": "docker compose -f docker-compose.postgres.yml down -v",
+    "test:postgres": "DURABLE_POSTGRES_URL=${DURABLE_POSTGRES_URL:-postgresql://durable:durable@127.0.0.1:55432/durable} vitest run test/postgres-conformance.test.ts test/postgres.test.ts test/postgres-benchmark.test.ts",
     "watch": "tsx watch src/index.ts",
     "build": "tsc"
   },

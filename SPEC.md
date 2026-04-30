@@ -813,7 +813,7 @@ type DurabilityProvider = {
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
   heartbeatEffect(input: HeartbeatEffectInput): Promise<void>
   completeEffect(input: CompleteEffectInput): Promise<void>
-  failEffect(input: FailEffectInput): Promise<void>
+  failEffect(input: FailEffectInput): Promise<FailEffectResult>
 
   commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
 }
@@ -821,7 +821,7 @@ type DurabilityProvider = {
 
 ### Operational observability
 
-The TypeScript runtime and SQLite provider accept optional best-effort observability sinks:
+The TypeScript runtime and bundled SQLite/Postgres providers accept optional best-effort observability sinks:
 
 ```ts
 type DurableLogger = {
@@ -965,6 +965,14 @@ The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`, and
 a conservative `synchronous: "full"` default. `synchronous: "normal"` may be
 opted into when a deployment prefers higher write throughput and accepts
 SQLite's weaker crash-recovery window for the most recent transactions.
+
+The TypeScript Postgres provider uses a pooled `pg` client, explicit
+transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
+conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
+pending/ready paths, statement and lock timeouts, and an advisory transaction
+lock for concurrent schema initialization. Provider startup must not rebuild or
+rewrite live ready indexes; readiness is maintained transactionally by instance
+creation, signal append, child completion/cancel, and checkpoint commits.
 
 ### Activation claiming
 

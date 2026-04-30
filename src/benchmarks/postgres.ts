@@ -1,12 +1,8 @@
-import { mkdtemp, rm, stat } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import pg from "pg"
 import { performance } from "node:perf_hooks"
 import { pathToFileURL } from "node:url"
-import {
-  DurableRuntime,
-  SqliteDurabilityProvider,
-} from "../durable.js"
+import { randomUUID } from "node:crypto"
+import { DurableRuntime, PostgresDurabilityProvider } from "../durable.js"
 import {
   activityCount,
   createBenchmarkCounters,
@@ -17,21 +13,28 @@ import {
   type BenchmarkCounters,
 } from "./workload.js"
 
-export type BenchmarkOptions = {
+const { Pool } = pg
+
+export type PostgresBenchmarkOptions = {
+  connectionString: string
+  schema: string
+  poolSize: number
   workflows: number
   workers: number
   shards: number
   activationConcurrency: number
   activityDelayMs: number
-  sqliteSynchronous: "full" | "normal"
   batch: number
   maxRounds: number
-  keepDb: boolean
+  keepSchema: boolean
   json: boolean
 }
 
-export type BenchmarkResult = {
-  options: BenchmarkOptions
+export type PostgresBenchmarkResult = {
+  backend: "postgres"
+  options: Omit<PostgresBenchmarkOptions, "connectionString"> & {
+    connectionString: string
+  }
   elapsedMs: number
   setupMs: number
   processingMs: number
@@ -49,20 +52,21 @@ export type BenchmarkResult = {
   processingMixedActionsPerSecond: number
   processingWorkflowsPerSecond: number
   counters: BenchmarkCounters
-  dbPath?: string
-  dbBytes?: number
 }
 
-const defaultOptions: BenchmarkOptions = {
+const defaultOptions: PostgresBenchmarkOptions = {
+  connectionString:
+    process.env.DURABLE_POSTGRES_URL ?? "postgresql://durable:durable@127.0.0.1:55432/durable",
+  schema: `durable_bench_${randomUUID().replaceAll("-", "_")}`,
+  poolSize: 24,
   workflows: 250,
   workers: 4,
   shards: 4,
   activationConcurrency: 4,
   activityDelayMs: 0,
-  sqliteSynchronous: "full",
   batch: 32,
   maxRounds: 10_000,
-  keepDb: false,
+  keepSchema: false,
   json: false,
 }
 
@@ -70,10 +74,10 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, SQLite synchronous ${options.sqliteSynchronous}...\n\n`,
+      `Running Postgres durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, pool size ${options.poolSize}, schema ${options.schema}...\n\n`,
     )
   }
-  const result = await runSqliteBenchmark(options)
+  const result = await runPostgresBenchmark(options)
   if (options.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
   } else {
@@ -81,32 +85,23 @@ async function main(): Promise<void> {
   }
 }
 
-export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<BenchmarkResult> {
-  const tempDir = await mkdtemp(join(tmpdir(), "durable-bench-"))
-  const dbPath = join(tempDir, "bench.sqlite")
+export async function runPostgresBenchmark(
+  options: PostgresBenchmarkOptions,
+): Promise<PostgresBenchmarkResult> {
   const counters = createBenchmarkCounters()
-  const providers: SqliteDurabilityProvider[] = []
   const { ParentWorkflow, workflows } = createBenchmarkWorkflows(counters, {
     activityDelayMs: options.activityDelayMs,
   })
+  const pool = new Pool({
+    connectionString: options.connectionString,
+    max: options.poolSize,
+  })
+  const providers: PostgresDurabilityProvider[] = []
+  let schemaInitialized = false
+
   let now = new Date("2026-01-01T00:00:00.000Z")
   const clock = () => now
-  const runtimes = Array.from({ length: options.workers }, (_value, workerIndex) => {
-    const provider = new SqliteDurabilityProvider(dbPath, {
-      synchronous: options.sqliteSynchronous,
-    })
-    providers.push(provider)
-    return new DurableRuntime(provider, {
-      clock,
-      workflows,
-      workerId: `bench-worker-${workerIndex}`,
-      shardCount: options.shards,
-      dispatchShardIds: dispatchShardIdsForWorker(workerIndex, options.workers, options.shards),
-      maxConcurrentActivations: options.activationConcurrency,
-      dispatchLeaseMs: 30_000,
-      activationLeaseMs: 30_000,
-    })
-  })
+  const runtimes: DurableRuntime[] = []
 
   let rounds = 0
   let activations = 0
@@ -117,14 +112,39 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
   let processingFinishedAt = setupStartedAt
 
   try {
+    for (let workerIndex = 0; workerIndex < options.workers; workerIndex += 1) {
+      const provider = await PostgresDurabilityProvider.create({
+        pool,
+        schema: options.schema,
+      })
+      schemaInitialized = true
+      providers.push(provider)
+      runtimes.push(
+        new DurableRuntime(provider, {
+          clock,
+          workflows,
+          workerId: `bench-worker-${workerIndex}`,
+          shardCount: options.shards,
+          dispatchShardIds: dispatchShardIdsForWorker(
+            workerIndex,
+            options.workers,
+            options.shards,
+          ),
+          maxConcurrentActivations: options.activationConcurrency,
+          dispatchLeaseMs: 30_000,
+          activationLeaseMs: 30_000,
+        }),
+      )
+    }
+
     for (let index = 0; index < options.workflows; index += 1) {
-      const ref = await runtimes[0].start(
+      const ref = await runtimes[0]!.start(
         ParentWorkflow,
         { index },
         { workflowId: `bench-parent-${index}` },
       )
       counters.workflowStarts += 1
-      await runtimes[0].signal(
+      await runtimes[0]!.signal(
         ParentWorkflow,
         ref,
         "finish",
@@ -144,7 +164,6 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       if (activations >= expectedActivations) {
         break
       }
-
       now = new Date(now.getTime() + 1)
     }
 
@@ -156,7 +175,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       )
     }
 
-    const instances = await providers[0].listInstances()
+    const instances = await providers[0]!.listInstances()
     const completedWorkflows = instances.filter(
       (instance) => instance.workflowName === ParentWorkflow.name && instance.status === "completed",
     ).length
@@ -168,7 +187,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
 
     verifyBenchmarkOutputs(instances, options.workflows)
     verifyBenchmarkCounters(counters, options.workflows)
-    const claims = await providers[0].listActivationClaims()
+    const claims = await providers[0]!.listActivationClaims()
     const committedWorkers = new Set(
       claims
         .filter((claim) => claim.completedBySequence !== undefined)
@@ -185,7 +204,11 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
     const processingSeconds = Math.max(processingMs / 1_000, Number.EPSILON)
 
     return {
-      options,
+      backend: "postgres",
+      options: {
+        ...options,
+        connectionString: redactConnectionString(options.connectionString),
+      },
       elapsedMs,
       setupMs,
       processingMs,
@@ -203,20 +226,17 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       processingMixedActionsPerSecond: mixedActions / processingSeconds,
       processingWorkflowsPerSecond: completedWorkflows / processingSeconds,
       counters,
-      dbPath: options.keepDb ? dbPath : undefined,
-      dbBytes: options.keepDb ? await sqliteStoreBytes(dbPath) : undefined,
     }
   } finally {
-    for (const provider of providers) {
-      provider.close()
+    if (!options.keepSchema && schemaInitialized && providers[0]) {
+      await providers[0].dropSchema().catch(() => undefined)
     }
-    if (!options.keepDb) {
-      await rm(tempDir, { force: true, maxRetries: 3, recursive: true, retryDelay: 10 })
-    }
+    await Promise.all(providers.map((provider) => provider.close()))
+    await pool.end()
   }
 }
 
-function parseArgs(args: string[]): BenchmarkOptions {
+function parseArgs(args: string[]): PostgresBenchmarkOptions {
   const options = { ...defaultOptions }
   for (let index = 0; index < args.length; index += 1) {
     const raw = args[index]
@@ -235,6 +255,12 @@ function parseArgs(args: string[]): BenchmarkOptions {
     if (flag === "--help" || flag === "-h") {
       printHelp()
       process.exit(0)
+    } else if (flag === "--connection-string") {
+      options.connectionString = nextValue()
+    } else if (flag === "--schema") {
+      options.schema = nextValue()
+    } else if (flag === "--pool-size") {
+      options.poolSize = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--workflows") {
       options.workflows = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--workers") {
@@ -245,14 +271,12 @@ function parseArgs(args: string[]): BenchmarkOptions {
       options.activationConcurrency = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--activity-delay-ms") {
       options.activityDelayMs = parseNonNegativeInteger(nextValue(), flag)
-    } else if (flag === "--sqlite-synchronous") {
-      options.sqliteSynchronous = parseSqliteSynchronous(nextValue(), flag)
     } else if (flag === "--batch") {
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
-    } else if (flag === "--keep-db") {
-      options.keepDb = true
+    } else if (flag === "--keep-schema") {
+      options.keepSchema = true
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -278,20 +302,16 @@ function parseNonNegativeInteger(value: string, flag: string): number {
   return parsed
 }
 
-function parseSqliteSynchronous(value: string, flag: string): "full" | "normal" {
-  const normalized = value.toLowerCase()
-  if (normalized !== "full" && normalized !== "normal") {
-    throw new Error(`${flag} must be "full" or "normal"`)
-  }
-  return normalized
-}
-
 function printHelp(): void {
-  process.stdout.write(`SQLite durability benchmark
+  process.stdout.write(`Postgres durability benchmark
 
-Runs real TypeScript workflows against the SQLite durability provider.
+Runs the shared real workflow benchmark against the Postgres durability provider.
 
 Options:
+  --connection-string <url>
+                    Postgres connection string. Default: DURABLE_POSTGRES_URL or local Docker.
+  --schema <name>   Isolated schema to create/drop. Default: generated durable_bench_* schema.
+  --pool-size <n>   Shared pg pool size. Default: ${defaultOptions.poolSize}
   --workflows <n>   Parent workflow count. Default: ${defaultOptions.workflows}
   --workers <n>     Logical in-process worker count. Default: ${defaultOptions.workers}
   --shards <n>      Dispatch shard count. Default: ${defaultOptions.shards}
@@ -299,25 +319,24 @@ Options:
                     Max concurrent activations per worker. Default: ${defaultOptions.activationConcurrency}
   --activity-delay-ms <n>
                     Async delay inside each activity. Default: ${defaultOptions.activityDelayMs}
-  --sqlite-synchronous <full|normal>
-                    SQLite synchronous pragma. Default: ${defaultOptions.sqliteSynchronous}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
-  --keep-db         Keep the temporary SQLite database and print its path.
+  --keep-schema     Keep the benchmark schema for inspection.
   --json            Print machine-readable JSON.
 `)
 }
 
-function printResult(result: BenchmarkResult): void {
+function printResult(result: PostgresBenchmarkResult): void {
   const activityTotal = activityCount(result.counters)
-  process.stdout.write(`SQLite durability benchmark
+  process.stdout.write(`Postgres durability benchmark
   workflows: ${result.options.workflows}
   workers: ${result.options.workers} logical in-process workers
   committed workers: ${result.committedWorkers}
   shards: ${result.options.shards}
   activation concurrency: ${result.options.activationConcurrency} per worker
   activity delay: ${formatMs(result.options.activityDelayMs)}
-  SQLite synchronous: ${result.options.sqliteSynchronous}
+  pool size: ${result.options.poolSize}
+  schema: ${result.options.schema}${result.options.keepSchema ? " (kept)" : ""}
   batch: ${result.options.batch}
   rounds: ${result.rounds}
   elapsed: ${formatMs(result.elapsedMs)} (${formatMs(result.setupMs)} setup, ${formatMs(result.processingMs)} processing, ${formatMs(result.verifyMs)} verify)
@@ -340,14 +359,6 @@ Action breakdown:
   timer handlers: ${result.counters.timerHandlers}
   activities: ${activityTotal} (${result.counters.bootActivities} boot, ${result.counters.childActivities} child, ${result.counters.finishActivities} finish)
 `)
-
-  if (result.dbPath) {
-    process.stdout.write(`
-SQLite store kept:
-  path: ${result.dbPath}
-  size: ${result.dbBytes ?? 0} bytes
-`)
-  }
 }
 
 function dispatchShardIdsForWorker(
@@ -364,12 +375,8 @@ function dispatchShardIdsForWorker(
   return shardIds
 }
 
-async function sqliteStoreBytes(dbPath: string): Promise<number> {
-  const paths = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]
-  const sizes = await Promise.all(
-    paths.map((path) => stat(path).then((info) => info.size).catch(() => 0)),
-  )
-  return sizes.reduce((total, size) => total + size, 0)
+function redactConnectionString(connectionString: string): string {
+  return connectionString.replace(/:\/\/([^:/?#]+):([^@/?#]+)@/, "://$1:***@")
 }
 
 function formatMs(value: number): string {
