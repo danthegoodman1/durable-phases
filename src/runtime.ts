@@ -2516,7 +2516,6 @@ function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
       resolve()
     }, ms)
     signal?.addEventListener("abort", onAbort, { once: true })
-    timer.unref?.()
   })
 }
 

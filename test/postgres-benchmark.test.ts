@@ -48,6 +48,7 @@ describeIfPostgres("Postgres benchmark", () => {
     expect(result.completedWorkflows).toBe(6)
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
+    expect(result.activeWorkers).toBeGreaterThan(0)
     expect(result.mixedActions).toBe(48)
     expect(result.counters).toMatchObject({
       workflowStarts: 6,

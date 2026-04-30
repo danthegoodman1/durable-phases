@@ -309,6 +309,12 @@ type ReadyEventInsert = {
   event: ReadyEvent | null
 }
 
+type SelectedReadyCandidateRow = {
+  partition: number
+  row: ReadyEventJoinedRow & { reclaimed: boolean }
+  candidate: ReadyCandidate
+}
+
 type PartitionedTableName =
   | "instances"
   | "signals"
@@ -3007,12 +3013,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     const claims: ClaimedActivationWithInstance[] = []
     const effectActivationIds: string[] = []
     const effectClaimByActivation = new Map<string, ClaimedActivationWithInstance>()
+    const candidateRows: SelectedReadyCandidateRow[] = []
 
     for (const partition of physicalPartitions) {
-      if (claims.length >= limit) {
-        break
-      }
-      const version = workflowVersionClause("re", workflowEntries, 6)
+      const version = workflowVersionClause("re", workflowEntries, 4)
       const rows = await this.rows<ReadyEventJoinedRow & { reclaimed: boolean }>(
         client,
         `
@@ -3050,58 +3054,40 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         ),
         selected AS (
           SELECT
-            re.activation_id,
-            (re.owner_id IS NOT NULL AND (re.lease_until IS NULL OR re.lease_until <= $3::timestamptz)) AS reclaimed
+            re.*,
+            (re.owner_id IS NOT NULL AND (re.lease_until IS NULL OR re.lease_until <= $3::timestamptz)) AS reclaimed,
+            i.workflow_name AS instance_workflow_name,
+            i.workflow_version AS instance_workflow_version,
+            i.workflow_id AS instance_workflow_id,
+            i.run_id AS instance_run_id,
+            i.partition_shard AS instance_partition_shard,
+            i.sequence AS instance_sequence,
+            i.status AS instance_status,
+            i.common_json AS instance_common_json,
+            i.phase_name AS instance_phase_name,
+            i.phase_data_json AS instance_phase_data_json,
+            i.output_json AS instance_output_json,
+            i.error_json AS instance_error_json,
+            i.cancel_reason AS instance_cancel_reason,
+            i.waits_json AS instance_waits_json,
+            i.parent_workflow_id AS instance_parent_workflow_id,
+            i.parent_run_id AS instance_parent_run_id,
+            i.parent_child_record_id AS instance_parent_child_record_id,
+            i.created_at AS instance_created_at,
+            i.updated_at AS instance_updated_at
           FROM candidates c
           JOIN ${this.partitionedTable("activation_tasks", partition)} re
             ON re.activation_id = c.activation_id
+          JOIN ${this.partitionedTable("instances", partition)} i
+            ON i.workflow_id = re.workflow_id
+           AND i.run_id = re.run_id
           ORDER BY c.sort_key
           LIMIT $${version.nextIndex}
           FOR UPDATE OF re SKIP LOCKED
-        ),
-        updated AS (
-          UPDATE ${this.partitionedTable("activation_tasks", partition)} re
-          SET owner_id = $4,
-            lease_until = $5::timestamptz,
-            activation_time = COALESCE(re.activation_time, re.ready_at),
-            blocked_until = NULL
-          FROM selected
-          WHERE re.activation_id = selected.activation_id
-            AND (
-              re.owner_id IS NULL
-              OR re.lease_until IS NULL
-              OR re.lease_until <= $3::timestamptz
-            )
-          RETURNING re.*, selected.reclaimed
         )
-        SELECT
-          updated.*,
-          i.workflow_name AS instance_workflow_name,
-          i.workflow_version AS instance_workflow_version,
-          i.workflow_id AS instance_workflow_id,
-          i.run_id AS instance_run_id,
-          i.partition_shard AS instance_partition_shard,
-          i.sequence AS instance_sequence,
-          i.status AS instance_status,
-          i.common_json AS instance_common_json,
-          i.phase_name AS instance_phase_name,
-          i.phase_data_json AS instance_phase_data_json,
-          i.output_json AS instance_output_json,
-          i.error_json AS instance_error_json,
-          i.cancel_reason AS instance_cancel_reason,
-          i.waits_json AS instance_waits_json,
-          i.parent_workflow_id AS instance_parent_workflow_id,
-          i.parent_run_id AS instance_parent_run_id,
-          i.parent_child_record_id AS instance_parent_child_record_id,
-          i.created_at AS instance_created_at,
-          i.updated_at AS instance_updated_at
-        FROM updated
-        JOIN ${this.partitionedTable("instances", partition)} i
-          ON i.workflow_id = updated.workflow_id
-         AND i.run_id = updated.run_id
-        ORDER BY updated.sort_key
+        SELECT * FROM selected ORDER BY sort_key, activation_id
         `,
-        [input.shardIds, input.now, input.now, input.workerId, leaseUntil, ...version.params, limit - claims.length],
+        [input.shardIds, input.now, input.now, ...version.params, limit],
       )
 
       for (const row of rows) {
@@ -3110,35 +3096,84 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           continue
         }
         candidate.leaseUntil = leaseUntil
-        if (row.reclaimed) {
-          await this.resetPendingEffectsForActivationReclaim(client, candidate, candidate.activationId)
+        candidateRows.push({ partition, row, candidate })
+      }
+    }
+
+    const selectedRows = candidateRows
+      .sort((left, right) => compareReadyCandidates(left.candidate, right.candidate))
+      .slice(0, limit)
+    const selectedOrder = new Map(
+      selectedRows.map((item, index) => [item.candidate.activationId, index]),
+    )
+
+    for (const group of groupSelectedRowsByPartition(selectedRows)) {
+      const updated = await this.rows<{ activation_id: string }>(
+        client,
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(activation_id text)
+        )
+        UPDATE ${this.partitionedTable("activation_tasks", group.partition)} re
+        SET owner_id = $2,
+          lease_until = $3::timestamptz,
+          activation_time = COALESCE(re.activation_time, re.ready_at),
+          blocked_until = NULL
+        FROM input
+        WHERE re.activation_id = input.activation_id
+          AND (
+            re.owner_id IS NULL
+            OR re.lease_until IS NULL
+            OR re.lease_until <= $4::timestamptz
+          )
+        RETURNING re.activation_id
+        `,
+        [
+          encodeJson(group.items.map((item) => ({ activation_id: item.candidate.activationId }))),
+          input.workerId,
+          leaseUntil,
+          input.now,
+        ],
+      )
+      const updatedIds = new Set(updated.map((row) => row.activation_id))
+      for (const item of group.items) {
+        if (!updatedIds.has(item.candidate.activationId)) {
+          continue
+        }
+        if (item.row.reclaimed) {
+          await this.resetPendingEffectsForActivationReclaim(
+            client,
+            item.candidate,
+            item.candidate.activationId,
+          )
         }
         const claim: ClaimedActivationWithInstance = {
-          activation: stripCandidateMetadata(candidate),
-          instance: this.activationInstanceSnapshot(candidate.instance),
+          activation: stripCandidateMetadata(item.candidate),
+          instance: this.activationInstanceSnapshot(item.candidate.instance),
           effects: [],
         }
         claims.push(claim)
-        if (row.has_effects) {
-          effectActivationIds.push(candidate.activationId)
-          effectClaimByActivation.set(candidate.activationId, claim)
+        if (item.row.has_effects) {
+          effectActivationIds.push(item.candidate.activationId)
+          effectClaimByActivation.set(item.candidate.activationId, claim)
         }
-        this.log("debug", row.reclaimed ? "provider.activation.reclaim" : "provider.activation.claim", {
+        this.log("debug", item.row.reclaimed ? "provider.activation.reclaim" : "provider.activation.claim", {
           workerId: input.workerId,
-          workflowName: candidate.workflowName,
-          workflowId: candidate.workflowId,
-          runId: candidate.runId,
-          activationId: candidate.activationId,
-          activationKind: candidate.kind,
-          eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+          workflowName: item.candidate.workflowName,
+          workflowId: item.candidate.workflowId,
+          runId: item.candidate.runId,
+          activationId: item.candidate.activationId,
+          activationKind: item.candidate.kind,
+          eventKind: item.candidate.kind === "event" ? item.candidate.eventKind : undefined,
           leaseUntil,
         })
         this.count("durable.provider.activation.claim", {
           workerId: input.workerId,
-          workflowName: candidate.workflowName,
-          activationKind: candidate.kind,
-          eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
-          status: row.reclaimed ? "reclaimed" : "success",
+          workflowName: item.candidate.workflowName,
+          activationKind: item.candidate.kind,
+          eventKind: item.candidate.kind === "event" ? item.candidate.eventKind : undefined,
+          status: item.row.reclaimed ? "reclaimed" : "success",
         })
       }
     }
@@ -3152,10 +3187,11 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         }
       }
     }
-    return claims.sort((left, right) =>
-      left.activation.activationTime.localeCompare(right.activation.activationTime) ||
-      left.activation.activationId.localeCompare(right.activation.activationId),
-    ).slice(0, limit)
+    return claims.sort(
+      (left, right) =>
+        (selectedOrder.get(left.activation.activationId) ?? Number.MAX_SAFE_INTEGER) -
+        (selectedOrder.get(right.activation.activationId) ?? Number.MAX_SAFE_INTEGER),
+    )
   }
 
   private async migrationReadyCandidates(
@@ -5372,6 +5408,21 @@ function compareReadyCandidates(left: ReadyCandidate, right: ReadyCandidate): nu
     return 1
   }
   return 0
+}
+
+function groupSelectedRowsByPartition(
+  items: SelectedReadyCandidateRow[],
+): Array<{ partition: number; items: SelectedReadyCandidateRow[] }> {
+  const groups = new Map<number, SelectedReadyCandidateRow[]>()
+  for (const item of items) {
+    const group = groups.get(item.partition) ?? []
+    group.push(item)
+    groups.set(item.partition, group)
+  }
+  return [...groups.entries()].map(([partition, grouped]) => ({
+    partition,
+    items: grouped,
+  }))
 }
 
 function readyCandidateFromRow(row: ReadyEventJoinedRow): ReadyCandidate | null {

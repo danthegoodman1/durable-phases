@@ -61,6 +61,20 @@ function partitionSuffix(workflowId: string, runId: string, partitionCount: numb
   return `p${String(partition).padStart(width, "0")}`
 }
 
+function refForPhysicalPartition(
+  prefix: string,
+  partition: number,
+  partitionCount: number,
+): { workflowId: string; runId: string } {
+  for (let index = 0; index < 10_000; index += 1) {
+    const ref = { workflowId: `${prefix}-${index}`, runId: "run-1" }
+    if (workflowPartitionShard(ref.workflowId, ref.runId, partitionCount) === partition) {
+      return ref
+    }
+  }
+  throw new Error(`Unable to find workflow id for physical partition ${partition}`)
+}
+
 describeIfPostgres("PostgresDurabilityProvider", () => {
   it("validates schema names", async () => {
     await expect(
@@ -236,6 +250,61 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
             [child.workflowId, child.runId],
           ),
         ).resolves.toBe(1)
+      },
+      { physicalPartitions: 4 },
+    )
+  })
+
+  it("claims ready activations in canonical order across physical partitions", async () => {
+    await withProvider(
+      async (provider) => {
+        const late = refForPhysicalPartition("pg-order-late", 0, 4)
+        const early = refForPhysicalPartition("pg-order-early", 1, 4)
+        for (const [ref, readyAt] of [
+          [late, "2026-01-01T00:00:10.000Z"],
+          [early, "2026-01-01T00:00:00.000Z"],
+        ] as const) {
+          await provider.createInstance({
+            workflowName: "pg_order",
+            workflowVersion: 1,
+            workflowId: ref.workflowId,
+            runId: ref.runId,
+            partitionShard: 0,
+            common: {},
+            phase: { name: "run", data: {} },
+            waits: [{ kind: "run", name: "__run", readyAt }],
+            now: "2026-01-01T00:00:00.000Z",
+          })
+        }
+        await provider.claimDispatchShard({
+          shardId: 0,
+          ownerId: "order-worker",
+          now: "2026-01-01T00:00:11.000Z",
+          leaseMs: 60_000,
+        })
+        const first = await provider.claimReadyActivations({
+          workerId: "order-worker",
+          shardIds: [0],
+          shardCount: 1,
+          workflows: { pg_order: { version: 1 } },
+          now: "2026-01-01T00:00:11.000Z",
+          leaseMs: 60_000,
+          limit: 1,
+        })
+        expect(first.claims).toHaveLength(1)
+        expect(first.claims[0].activation.workflowId).toBe(early.workflowId)
+
+        const second = await provider.claimReadyActivations({
+          workerId: "order-worker",
+          shardIds: [0],
+          shardCount: 1,
+          workflows: { pg_order: { version: 1 } },
+          now: "2026-01-01T00:00:11.000Z",
+          leaseMs: 60_000,
+          limit: 1,
+        })
+        expect(second.claims).toHaveLength(1)
+        expect(second.claims[0].activation.workflowId).toBe(late.workflowId)
       },
       { physicalPartitions: 4 },
     )

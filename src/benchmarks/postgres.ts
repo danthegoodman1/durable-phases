@@ -108,7 +108,7 @@ export type PostgresBenchmarkResult = {
   activations: number
   expectedActivations: number
   completedWorkflows: number
-  committedWorkers: number
+  activeWorkers: number
   mixedActions: number
   activationsPerSecond: number
   mixedActionsPerSecond: number
@@ -196,6 +196,7 @@ export async function runPostgresBenchmark(
   let processingEventLoopUtilization:
     | ReturnType<typeof performance.eventLoopUtilization>
     | undefined
+  const activeWorkers = new Set<string>()
 
   try {
     for (let workerIndex = 0; workerIndex < options.workers; workerIndex += 1) {
@@ -256,6 +257,11 @@ export async function runPostgresBenchmark(
           }),
         ),
       )
+      for (const [workerIndex, result] of drainResults.entries()) {
+        if (result.activations > 0) {
+          activeWorkers.add(`bench-worker-${workerIndex}`)
+        }
+      }
       activations += drainResults.reduce((total, result) => total + result.activations, 0)
       if (activations >= expectedActivations) {
         break
@@ -288,13 +294,6 @@ export async function runPostgresBenchmark(
 
     verifyBenchmarkOutputs(instances, options.workflows)
     verifyBenchmarkCounters(counters, options.workflows)
-    const claims = await providers[0]!.listActivationClaims()
-    const committedWorkers = new Set(
-      claims
-        .filter((claim) => claim.completedBySequence !== undefined)
-        .map((claim) => claim.ownerId)
-        .filter((ownerId): ownerId is string => Boolean(ownerId)),
-    ).size
     const mixedActions = mixedActionCount(counters)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
@@ -318,7 +317,7 @@ export async function runPostgresBenchmark(
       activations,
       expectedActivations,
       completedWorkflows,
-      committedWorkers,
+      activeWorkers: activeWorkers.size,
       mixedActions,
       activationsPerSecond: activations / elapsedSeconds,
       mixedActionsPerSecond: mixedActions / elapsedSeconds,
@@ -471,7 +470,7 @@ function printResult(result: PostgresBenchmarkResult): void {
   process.stdout.write(`Postgres durability benchmark
   workflows: ${result.options.workflows}
   workers: ${result.options.workers} logical in-process workers
-  committed workers: ${result.committedWorkers}
+  active workers: ${result.activeWorkers}
   shards: ${result.options.shards}
   activation concurrency: ${result.options.activationConcurrency} per worker
   activation prefetch limit: ${result.options.activationPrefetchLimit}
