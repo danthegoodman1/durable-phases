@@ -3688,6 +3688,8 @@ describe("durable workflow PoC", () => {
     })
 
     const siblingStarted = deferred()
+    let badAttempts = 0
+    let siblingAttempts = 0
     let siblingAborted = false
     const ErrorWorkflow = defineWorkflow({
       name: "concurrent_error_abort",
@@ -3702,10 +3704,18 @@ describe("durable workflow PoC", () => {
         run: phase({
           run: async ({ ctx, common }) => {
             if (common.kind === "bad") {
-              await siblingStarted.promise
-              throw new Error("boom")
+              badAttempts += 1
+              if (badAttempts === 1) {
+                await siblingStarted.promise
+                throw new Error("boom")
+              }
+              return complete({ kind: "bad" })
             }
             await ctx.activity("cooperative", async ({ signal: activitySignal }) => {
+              siblingAttempts += 1
+              if (siblingAttempts > 1) {
+                return "recovered"
+              }
               siblingStarted.resolve()
               await new Promise((_resolve, reject) => {
                 activitySignal.addEventListener(
@@ -3724,7 +3734,8 @@ describe("durable workflow PoC", () => {
       },
     })
 
-    const errorProvider = testProvider(await storePath())
+    const errorPath = await storePath()
+    const errorProvider = testProvider(errorPath)
     const errorRuntime = new DurableRuntime(errorProvider, {
       workflows: [ErrorWorkflow],
       workerId: "error-abort-worker",
@@ -3736,6 +3747,17 @@ describe("durable workflow PoC", () => {
     expect(siblingAborted).toBe(true)
     expect(await errorProvider.loadInstance(badRef)).toMatchObject({ status: "running", sequence: 0 })
     expect(await errorProvider.loadInstance(siblingRef)).toMatchObject({ status: "running", sequence: 0 })
+
+    const recoveryRuntime = new DurableRuntime(testProvider(errorPath), {
+      workflows: [ErrorWorkflow],
+      workerId: "error-abort-recovery-worker",
+      maxConcurrentActivations: 2,
+    })
+    await expect(recoveryRuntime.drain({ maxActivations: 2 })).resolves.toEqual({ activations: 2 })
+    expect(badAttempts).toBe(2)
+    expect(siblingAttempts).toBe(2)
+    expect(await errorProvider.loadInstance(badRef)).toMatchObject({ status: "completed" })
+    expect(await errorProvider.loadInstance(siblingRef)).toMatchObject({ status: "completed" })
   })
 
   it("heartbeats long activations and releases dispatch shards after drain", async () => {
@@ -3799,6 +3821,93 @@ describe("durable workflow PoC", () => {
         leaseMs: 10,
       }),
     ).resolves.toMatchObject({ ownerId: "long-worker-b" })
+  })
+
+  it("heartbeats each concurrent activation lease independently", async () => {
+    const clock = manualClock()
+    const started: number[] = []
+    const releases = new Map<number, () => void>()
+    const ConcurrentLeaseWorkflow = defineWorkflow({
+      name: "concurrent_activation_lease",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            started.push(common.index)
+            await new Promise<void>((resolve) => {
+              releases.set(common.index, resolve)
+            })
+            return complete({ index: common.index })
+          },
+        }),
+      },
+    })
+
+    const path = await storePath()
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [ConcurrentLeaseWorkflow],
+      workerId: "multi-lease-worker",
+      dispatchLeaseMs: 10,
+      activationLeaseMs: 10,
+      leaseHeartbeatIntervalMs: 1,
+      maxConcurrentActivations: 2,
+    })
+    const refs = await Promise.all([
+      runtime.start(ConcurrentLeaseWorkflow, { index: 0 }, { workflowId: "multi-lease-0" }),
+      runtime.start(ConcurrentLeaseWorkflow, { index: 1 }, { workflowId: "multi-lease-1" }),
+    ])
+    const draining = runtime.drain({ maxActivations: 2 })
+    await waitFor(() => started.length === 2)
+
+    const claims = (await provider.listActivationClaims()).filter(
+      (claim) => claim.ownerId === "multi-lease-worker",
+    )
+    expect(claims).toHaveLength(2)
+
+    clock.advance(8)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    clock.advance(8)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    for (const claim of claims) {
+      await expect(
+        provider.heartbeatActivation({
+          activationId: claim.activationId,
+          workerId: "multi-lease-worker",
+          now: clock.clock().toISOString(),
+          leaseMs: 10,
+        }),
+      ).resolves.toBeUndefined()
+    }
+
+    const competingProvider = testProvider(path)
+    await expect(
+      competingProvider.claimDispatchShard({
+        shardId: 0,
+        ownerId: "multi-lease-competitor",
+        now: clock.clock().toISOString(),
+        leaseMs: 10,
+      }),
+    ).resolves.toBeNull()
+
+    for (const release of releases.values()) {
+      release()
+    }
+    await expect(draining).resolves.toEqual({ activations: 2 })
+    await expect(Promise.all(refs.map((ref) => provider.loadInstance(ref)))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "completed", output: { index: 0 } }),
+        expect.objectContaining({ status: "completed", output: { index: 1 } }),
+      ]),
+    )
   })
 
   it("requires a live activation lease for effect mutation and prevents terminal overwrites", async () => {

@@ -1145,16 +1145,25 @@ export class DurableRuntime {
   private startDispatchShardHeartbeat(shardIds: number[]): DispatchHeartbeat {
     let rejectHeartbeat: (error: unknown) => void = () => undefined
     let failed = false
+    let inFlight = false
     const failure = new Promise<never>((_resolve, reject) => {
       rejectHeartbeat = reject
     })
     const timer = setInterval(() => {
-      void this.heartbeatDispatchShards(shardIds).catch((error) => {
-        if (!failed) {
-          failed = true
-          rejectHeartbeat(error)
-        }
-      })
+      if (inFlight || failed) {
+        return
+      }
+      inFlight = true
+      void this.heartbeatDispatchShards(shardIds)
+        .catch((error) => {
+          if (!failed) {
+            failed = true
+            rejectHeartbeat(error)
+          }
+        })
+        .finally(() => {
+          inFlight = false
+        })
     }, this.leaseHeartbeatIntervalMs)
     timer.unref?.()
 
@@ -1173,6 +1182,8 @@ export class DurableRuntime {
   ): Promise<T> {
     const controller = new AbortController()
     let rejectHeartbeat: (error: unknown) => void = () => undefined
+    let heartbeatInFlight = false
+    let stopped = false
     const heartbeatFailure = new Promise<never>((_resolve, reject) => {
       rejectHeartbeat = reject
     })
@@ -1186,6 +1197,10 @@ export class DurableRuntime {
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true })
 
     const timer = setInterval(() => {
+      if (heartbeatInFlight || stopped) {
+        return
+      }
+      heartbeatInFlight = true
       void this.provider
         .heartbeatActivation({
           activationId: activation.activationId,
@@ -1209,6 +1224,9 @@ export class DurableRuntime {
           })
           failActivation(error)
         })
+        .finally(() => {
+          heartbeatInFlight = false
+        })
     }, this.leaseHeartbeatIntervalMs)
     timer.unref?.()
 
@@ -1222,6 +1240,7 @@ export class DurableRuntime {
     try {
       return await Promise.race([work, heartbeatFailure])
     } finally {
+      stopped = true
       clearInterval(timer)
       externalSignal?.removeEventListener("abort", onExternalAbort)
     }
