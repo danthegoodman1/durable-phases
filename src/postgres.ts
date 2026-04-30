@@ -157,6 +157,10 @@ type ActivationClaimRow = {
   completed_by_sequence: number | null
 }
 
+type ActivationClaimUpsertRow = ActivationClaimRow & {
+  inserted: boolean
+}
+
 type DispatchShardRow = {
   shard_id: number
   owner_id: string | null
@@ -705,8 +709,82 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   async getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
     return this.transaction(async (client) => {
       await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
-      await this.assertLiveActivationLease(client, input)
       const options = normalizeEffectOptions(input)
+      const effectId = `effect-${randomUUID()}`
+      const attemptId = `attempt-${randomUUID()}`
+      const idempotencyKey = `${input.workflowId}/${input.runId}/${input.activationId}/${input.key}`
+      const inserted = await this.one<EffectRow>(
+        client,
+        `
+        INSERT INTO ${this.table("effects")} (
+          effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
+          attempt, attempt_id, attempt_owner_id, attempt_started_at,
+          start_to_close_timeout_ms, start_to_close_deadline,
+          heartbeat_timeout_ms, heartbeat_deadline, max_attempts,
+          max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
+          first_attempt_started_at, next_attempt_at, non_retryable_error_names_json
+        )
+        SELECT
+          $1, $2, $3, $4, $5, $6, 'pending',
+          1, $7, $8, $9::timestamptz,
+          $10, $11::timestamptz, $12, $13::timestamptz, $14, $15, $16, $17, $18,
+          $9::timestamptz, NULL, $19::jsonb
+        WHERE EXISTS (
+          SELECT 1 FROM ${this.table("activation_claims")} a
+          WHERE a.activation_id = $4
+            AND a.workflow_id = $2
+            AND a.run_id = $3
+            AND a.owner_id = $8
+            AND a.completed_by_sequence IS NULL
+            AND a.lease_until >= $9::timestamptz
+        )
+        ON CONFLICT (workflow_id, run_id, activation_id, key) DO NOTHING
+        RETURNING *
+        `,
+        [
+          effectId,
+          input.workflowId,
+          input.runId,
+          input.activationId,
+          input.key,
+          idempotencyKey,
+          attemptId,
+          input.workerId,
+          input.now,
+          options.startToCloseTimeoutMs,
+          deadlineFrom(input.now, options.startToCloseTimeoutMs),
+          options.heartbeatTimeoutMs,
+          deadlineFrom(input.now, options.heartbeatTimeoutMs),
+          options.maxAttempts,
+          options.maxElapsedMs,
+          options.initialIntervalMs,
+          options.maxIntervalMs,
+          options.backoffCoefficient,
+          encodeJson(options.nonRetryableErrorNames),
+        ],
+      )
+      if (inserted) {
+        this.log("debug", "provider.effect.reserve", {
+          workerId: input.workerId,
+          workflowId: input.workflowId,
+          runId: input.runId,
+          activationId: input.activationId,
+          effectId: inserted.effect_id,
+          attemptId: inserted.attempt_id,
+          key: input.key,
+          attempt: inserted.attempt ?? 1,
+        })
+        this.count("durable.provider.effect", { workerId: input.workerId, status: "reserved" })
+        return {
+          status: "reserved",
+          effectId: inserted.effect_id,
+          idempotencyKey: inserted.idempotency_key,
+          attempt: inserted.attempt ?? 1,
+          attemptId: requireAttemptId(inserted),
+        } satisfies EffectReservation
+      }
+
+      await this.assertLiveActivationLease(client, input)
       const existing = await this.effectRow(client, input)
 
       if (existing?.status === "completed") {
@@ -767,65 +845,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         } satisfies EffectReservation
       }
 
-      const effectId = `effect-${randomUUID()}`
-      const attemptId = `attempt-${randomUUID()}`
-      const idempotencyKey = `${input.workflowId}/${input.runId}/${input.activationId}/${input.key}`
-      await client.query(
-        `
-        INSERT INTO ${this.table("effects")} (
-          effect_id, workflow_id, run_id, activation_id, key, idempotency_key, status,
-          attempt, attempt_id, attempt_owner_id, attempt_started_at,
-          start_to_close_timeout_ms, start_to_close_deadline,
-          heartbeat_timeout_ms, heartbeat_deadline, max_attempts,
-          max_elapsed_ms, initial_interval_ms, max_interval_ms, backoff_coefficient,
-          first_attempt_started_at, next_attempt_at, non_retryable_error_names_json
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, 'pending', 1, $7, $8, $9::timestamptz,
-          $10, $11::timestamptz, $12, $13::timestamptz, $14, $15, $16, $17, $18,
-          $9::timestamptz, NULL, $19::jsonb
-        )
-        `,
-        [
-          effectId,
-          input.workflowId,
-          input.runId,
-          input.activationId,
-          input.key,
-          idempotencyKey,
-          attemptId,
-          input.workerId,
-          input.now,
-          options.startToCloseTimeoutMs,
-          deadlineFrom(input.now, options.startToCloseTimeoutMs),
-          options.heartbeatTimeoutMs,
-          deadlineFrom(input.now, options.heartbeatTimeoutMs),
-          options.maxAttempts,
-          options.maxElapsedMs,
-          options.initialIntervalMs,
-          options.maxIntervalMs,
-          options.backoffCoefficient,
-          encodeJson(options.nonRetryableErrorNames),
-        ],
-      )
-
-      this.log("debug", "provider.effect.reserve", {
-        workerId: input.workerId,
-        workflowId: input.workflowId,
-        runId: input.runId,
-        activationId: input.activationId,
-        effectId,
-        attemptId,
-        key: input.key,
-        attempt: 1,
-      })
-      this.count("durable.provider.effect", { workerId: input.workerId, status: "reserved" })
-      return {
-        status: "reserved",
-        effectId,
-        idempotencyKey,
-        attempt: 1,
-        attemptId,
-      } satisfies EffectReservation
+      throw new Error(`Unable to reserve effect: ${input.workflowId}/${input.runId}/${input.activationId}/${input.key}`)
     })
   }
 
@@ -874,7 +894,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   async completeEffect(input: CompleteEffectInput): Promise<void> {
     const result = await this.transaction(async (client) => {
       await this.expireActivityTimeouts(client, input.now, { activationId: input.activationId })
-      await this.assertLiveActivationLease(client, input)
       return client.query(
         `
         UPDATE ${this.table("effects")}
@@ -882,6 +901,15 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           start_to_close_deadline = NULL, heartbeat_deadline = NULL
         WHERE workflow_id = $2 AND run_id = $3 AND activation_id = $4 AND effect_id = $5
           AND attempt_id = $6 AND status = 'pending'
+          AND EXISTS (
+            SELECT 1 FROM ${this.table("activation_claims")} a
+            WHERE a.activation_id = $4
+              AND a.workflow_id = $2
+              AND a.run_id = $3
+              AND a.owner_id = $7
+              AND a.completed_by_sequence IS NULL
+              AND a.lease_until >= $8::timestamptz
+          )
         `,
         [
           encodeJson(input.result),
@@ -890,6 +918,8 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input.activationId,
           input.effectId,
           input.attemptId,
+          input.workerId,
+          input.now,
         ],
       )
     })
@@ -1508,13 +1538,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
     try {
-      await client.query("BEGIN")
-      await client.query("SELECT set_config('statement_timeout', $1, true)", [
-        `${this.statementTimeoutMs}ms`,
-      ])
-      await client.query("SELECT set_config('lock_timeout', $1, true)", [
-        `${this.lockTimeoutMs}ms`,
-      ])
+      await client.query(
+        `BEGIN; SET LOCAL statement_timeout = '${this.statementTimeoutMs}ms'; SET LOCAL lock_timeout = '${this.lockTimeoutMs}ms'`,
+      )
       const result = await fn(client)
       await client.query("COMMIT")
       return result
@@ -2170,12 +2196,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     leaseMs: number,
   ): Promise<boolean> {
     const leaseUntil = addMs(now, leaseMs)
-    const existing = await this.one<ActivationClaimRow>(
-      client,
-      `SELECT * FROM ${this.table("activation_claims")} WHERE activation_id = $1 FOR UPDATE`,
-      [candidate.activationId],
-    )
-    const row = await this.one<ActivationClaimRow>(
+    const row = await this.one<ActivationClaimUpsertRow>(
       client,
       `
       INSERT INTO ${this.table("activation_claims")} (
@@ -2196,7 +2217,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           OR ${this.table("activation_claims")}.lease_until IS NULL
           OR ${this.table("activation_claims")}.lease_until <= $12::timestamptz
         )
-      RETURNING *
+      RETURNING *, (xmax = 0) AS inserted
       `,
       [
         candidate.activationId,
@@ -2216,7 +2237,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (!row) {
       return false
     }
-    const reclaimed = shouldResetPendingEffectAttemptsOnClaim(existing, workerId, now)
+    const reclaimed = !row.inserted
     if (reclaimed) {
       await this.resetPendingEffectsForActivationReclaim(client, candidate.activationId)
     }
@@ -3085,20 +3106,6 @@ function earliestIso(...values: Array<string | undefined>): string | undefined {
   return values
     .filter((value): value is string => Boolean(value))
     .sort()[0]
-}
-
-function shouldResetPendingEffectAttemptsOnClaim(
-  existing: ActivationClaimRow | null,
-  workerId: string,
-  now: string,
-): boolean {
-  if (!existing || existing.completed_by_sequence !== null) {
-    return false
-  }
-  if (existing.owner_id === workerId && existing.lease_until && iso(existing.lease_until) > now) {
-    return false
-  }
-  return true
 }
 
 function claimMatchesCommit(claim: ActivationClaimRow, input: CommitCheckpointInput): boolean {

@@ -69,7 +69,7 @@ activation concurrency 4, and zero artificial activity delay:
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | SQLite | synchronous=full | 263 | 1,313 | 2,100 | 1,419 | 2,271 |
 | SQLite | synchronous=normal | 339 | 1,695 | 2,712 | 1,788 | 2,861 |
-| Postgres | Docker postgres:18.3, pool=24 | 92 | 459 | 735 | 637 | 1,019 |
+| Postgres | Docker postgres:18.3, pool=24 | 112 | 562 | 899 | 786 | 1,257 |
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The
