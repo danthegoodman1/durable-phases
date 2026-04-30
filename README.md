@@ -86,20 +86,16 @@ activation concurrency 4, activation prefetch 32, batch 32, and
 
 | Provider | workers/shards | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 201 | 1,005 | 1,814 | 2,902 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 213 | 1,066 | 2,046 | 3,274 |
-| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 258 | 1,291 | 3,861 | 6,178 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 273 | 1,365 | 3,898 | 6,237 |
-| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 294 | 1,469 | 3,980 | 6,368 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 270 | 1,351 | 3,788 | 6,060 |
+| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 199 | 993 | 1,786 | 2,858 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 190 | 952 | 1,971 | 3,153 |
+| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 231 | 1,153 | 3,030 | 4,847 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 272 | 1,358 | 3,695 | 5,912 |
+| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 291 | 1,455 | 4,008 | 6,413 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 295 | 1,477 | 4,282 | 6,851 |
 
 `npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
 sampling of pool pressure, active Postgres wait events, WAL/database deltas,
-Node CPU, and event loop utilization. The profiled 16-worker,
-`physicalPartitions=4` row measured 3,677 processing activations/sec with 4.3
-processing SQL calls per activation. The sampler saw no pg pool waiters; the
-remaining local contention showed up mostly as WAL sync/write and lightweight
-lock wait samples.
+Node CPU, and event loop utilization.
 
 The no-delay workload is mostly local DB/CPU-bound, so higher activation
 concurrency does not necessarily improve that particular throughput row. The
