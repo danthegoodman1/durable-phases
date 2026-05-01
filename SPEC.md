@@ -1031,9 +1031,9 @@ Shard leases assign polling responsibility, not correctness ownership. If a work
 Small or embedded providers may omit explicit shard leasing and poll directly. They must still preserve the same activation-lease and checkpoint-CAS invariants.
 
 The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`,
-`synchronous=FULL`, and full-sync pragmas where supported. File-backed SQLite
-stores are the crash-durable SQLite mode. In-memory SQLite stores may be useful
-for tests and local experiments, but they are not crash-durable.
+and `synchronous=FULL`. File-backed SQLite stores are the crash-durable SQLite
+mode. In-memory SQLite stores may be useful for tests and local experiments, but
+they are not crash-durable.
 
 The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,

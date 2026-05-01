@@ -1296,174 +1296,180 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async commitActivations(inputs: CommitActivationInput[]): Promise<CommitActivationsResult> {
-    const results: Array<CommitCheckpointResult & { activationId: string }> = []
-    for (const input of inputs) {
-      const result = await this.commitCheckpoint(input)
-      results.push({ ...result, activationId: input.activationId })
+    if (inputs.length === 0) {
+      return { results: [] }
     }
-    return { results }
+    const commit = this.db.transaction(() => ({
+      results: inputs.map((input) => ({
+        ...this.commitCheckpointInTransaction(input),
+        activationId: input.activationId,
+      })),
+    }))
+    return this.withBufferedObservability(() => commit.immediate() as CommitActivationsResult)
   }
 
   async commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
-    const commit = this.db.transaction(() => {
-      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
-      const conflict = (
-        reason: string,
-        sequence: number,
-        options: { retryable?: boolean; error?: SerializedError } = {},
-      ): CommitCheckpointResult => {
-        this.log("warn", "provider.checkpoint.conflict", {
-          workflowId: input.workflowId,
-          runId: input.runId,
-          activationId: input.activationId,
-          workerId: input.workerId,
-          reason,
-          sequence,
-          expectedSequence: input.expectedSequence,
-        })
-        this.count("durable.provider.checkpoint", {
-          workerId: input.workerId,
-          status: "conflict",
-          reason,
-        })
-        return {
-          ok: false,
-          sequence,
-          reason,
-          ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
-          ...(options.error === undefined ? {} : { error: options.error }),
-        }
-      }
+    const commit = this.db.transaction(() => this.commitCheckpointInTransaction(input))
 
-      const instance = this.instanceRow(input)
-      if (!instance || instance.status !== "running") {
-        return conflict("not_running", instance?.sequence ?? -1)
-      }
+    return this.withBufferedObservability(() => commit.immediate() as CommitCheckpointResult)
+  }
 
-      if (instance.sequence !== input.expectedSequence) {
-        return conflict("stale_sequence", instance.sequence)
-      }
-
-      const claim = oneRow<ActivationClaimRow>(
-        this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
-      )
-
-      if (
-        !claim ||
-        claim.workflow_id !== input.workflowId ||
-        claim.run_id !== input.runId ||
-        claim.sequence !== input.expectedSequence ||
-        claim.owner_id !== input.workerId ||
-        !claim.lease_until ||
-        claim.lease_until < input.now ||
-        claim.completed_by_sequence !== null
-      ) {
-        return conflict("lost_activation_lease", instance.sequence)
-      }
-
-      if (!claimMatchesCommit(claim, input)) {
-        return conflict("activation_event_mismatch", instance.sequence)
-      }
-
-      const signalToConsume = input.consumeSignalId
-        ? oneRow<SignalRow>(
-            this.prepare(
-                `
-                SELECT * FROM signals
-                WHERE signal_id = ? AND workflow_id = ? AND run_id = ? AND consumed_by_sequence IS NULL
-                LIMIT 1
-              `,
-              )
-              .get(input.consumeSignalId, input.workflowId, input.runId),
-          )
-        : undefined
-
-      if (input.consumeSignalId && !signalToConsume) {
-        return conflict("signal_not_consumable", instance.sequence)
-      }
-
-      const childToConsume = input.consumeChildRecordId
-        ? oneRow<ChildRow>(
-            this.prepare(
-                `
-                SELECT * FROM children
-                WHERE child_record_id = ? AND parent_workflow_id = ? AND parent_run_id = ?
-                  AND delivered_by_sequence IS NULL
-                LIMIT 1
-              `,
-              )
-              .get(input.consumeChildRecordId, input.workflowId, input.runId),
-          )
-        : undefined
-
-      if (input.consumeChildRecordId && !childToConsume) {
-        return conflict("child_not_consumable", instance.sequence)
-      }
-
-      const childStartConflict = this.validateCheckpointChildStarts(input)
-      if (childStartConflict) {
-        return conflict(childStartConflict.reason, instance.sequence, {
-          retryable: false,
-          error: childStartConflict.error,
-        })
-      }
-
-      const nextSequence = instance.sequence + 1
-      this.writeCheckpointEffectMutations(input)
-      this.writeCheckpointChildStarts(input)
-      this.writeNextInstance(input, nextSequence)
-
-      if (signalToConsume) {
-        this.prepare("UPDATE signals SET consumed_by_sequence = ? WHERE signal_id = ?")
-          .run(nextSequence, signalToConsume.signal_id)
-      }
-
-      if (childToConsume) {
-        this.prepare("UPDATE children SET delivered_by_sequence = ? WHERE child_record_id = ?")
-          .run(nextSequence, childToConsume.child_record_id)
-      }
-
-      this.updateParentChildRecord(instance, input, nextSequence)
-      this.applyParentClosePolicy(instance, input, nextSequence)
-      this.replaceReadyEventsForState({
-        workflowName: instance.workflow_name,
-        workflowVersion: input.workflowVersion,
-        workflowId: input.workflowId,
-        runId: input.runId,
-        partitionShard: instance.partition_shard,
-        sequence: nextSequence,
-        status: input.next.status,
-        waits: input.waits,
-        updatedAt: input.now,
-      })
-
-      this.prepare(
-          `
-          UPDATE activation_claims
-          SET completed_by_sequence = ?, completed_at = ?, lease_until = ?, owner_id = ?
-          WHERE activation_id = ?
-        `,
-        )
-        .run(nextSequence, input.now, input.now, input.workerId, input.activationId)
-
-      this.log("info", "provider.checkpoint.commit", {
-        workflowName: instance.workflow_name,
+  private commitCheckpointInTransaction(input: CommitCheckpointInput): CommitCheckpointResult {
+    this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+    const conflict = (
+      reason: string,
+      sequence: number,
+      options: { retryable?: boolean; error?: SerializedError } = {},
+    ): CommitCheckpointResult => {
+      this.log("warn", "provider.checkpoint.conflict", {
         workflowId: input.workflowId,
         runId: input.runId,
         activationId: input.activationId,
         workerId: input.workerId,
-        sequence: nextSequence,
-        status: input.next.status,
+        reason,
+        sequence,
+        expectedSequence: input.expectedSequence,
       })
       this.count("durable.provider.checkpoint", {
         workerId: input.workerId,
-        workflowName: instance.workflow_name,
-        status: "success",
+        status: "conflict",
+        reason,
       })
-      return { ok: true, sequence: nextSequence }
+      return {
+        ok: false,
+        sequence,
+        reason,
+        ...(options.retryable === undefined ? {} : { retryable: options.retryable }),
+        ...(options.error === undefined ? {} : { error: options.error }),
+      }
+    }
+
+    const instance = this.instanceRow(input)
+    if (!instance || instance.status !== "running") {
+      return conflict("not_running", instance?.sequence ?? -1)
+    }
+
+    if (instance.sequence !== input.expectedSequence) {
+      return conflict("stale_sequence", instance.sequence)
+    }
+
+    const claim = oneRow<ActivationClaimRow>(
+      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+    )
+
+    if (
+      !claim ||
+      claim.workflow_id !== input.workflowId ||
+      claim.run_id !== input.runId ||
+      claim.sequence !== input.expectedSequence ||
+      claim.owner_id !== input.workerId ||
+      !claim.lease_until ||
+      claim.lease_until < input.now ||
+      claim.completed_by_sequence !== null
+    ) {
+      return conflict("lost_activation_lease", instance.sequence)
+    }
+
+    if (!claimMatchesCommit(claim, input)) {
+      return conflict("activation_event_mismatch", instance.sequence)
+    }
+
+    const signalToConsume = input.consumeSignalId
+      ? oneRow<SignalRow>(
+          this.prepare(
+              `
+              SELECT * FROM signals
+              WHERE signal_id = ? AND workflow_id = ? AND run_id = ? AND consumed_by_sequence IS NULL
+              LIMIT 1
+            `,
+            )
+            .get(input.consumeSignalId, input.workflowId, input.runId),
+        )
+      : undefined
+
+    if (input.consumeSignalId && !signalToConsume) {
+      return conflict("signal_not_consumable", instance.sequence)
+    }
+
+    const childToConsume = input.consumeChildRecordId
+      ? oneRow<ChildRow>(
+          this.prepare(
+              `
+              SELECT * FROM children
+              WHERE child_record_id = ? AND parent_workflow_id = ? AND parent_run_id = ?
+                AND delivered_by_sequence IS NULL
+              LIMIT 1
+            `,
+            )
+            .get(input.consumeChildRecordId, input.workflowId, input.runId),
+        )
+      : undefined
+
+    if (input.consumeChildRecordId && !childToConsume) {
+      return conflict("child_not_consumable", instance.sequence)
+    }
+
+    const childStartConflict = this.validateCheckpointChildStarts(input)
+    if (childStartConflict) {
+      return conflict(childStartConflict.reason, instance.sequence, {
+        retryable: false,
+        error: childStartConflict.error,
+      })
+    }
+
+    const nextSequence = instance.sequence + 1
+    this.writeCheckpointEffectMutations(input)
+    this.writeCheckpointChildStarts(input)
+    this.writeNextInstance(input, nextSequence)
+
+    if (signalToConsume) {
+      this.prepare("UPDATE signals SET consumed_by_sequence = ? WHERE signal_id = ?")
+        .run(nextSequence, signalToConsume.signal_id)
+    }
+
+    if (childToConsume) {
+      this.prepare("UPDATE children SET delivered_by_sequence = ? WHERE child_record_id = ?")
+        .run(nextSequence, childToConsume.child_record_id)
+    }
+
+    this.updateParentChildRecord(instance, input, nextSequence)
+    this.applyParentClosePolicy(instance, input, nextSequence)
+    this.replaceReadyEventsForState({
+      workflowName: instance.workflow_name,
+      workflowVersion: input.workflowVersion,
+      workflowId: input.workflowId,
+      runId: input.runId,
+      partitionShard: instance.partition_shard,
+      sequence: nextSequence,
+      status: input.next.status,
+      waits: input.waits,
+      updatedAt: input.now,
     })
 
-    return this.withBufferedObservability(() => commit.immediate() as CommitCheckpointResult)
+    this.prepare(
+        `
+        UPDATE activation_claims
+        SET completed_by_sequence = ?, completed_at = ?, lease_until = ?, owner_id = ?
+        WHERE activation_id = ?
+      `,
+      )
+      .run(nextSequence, input.now, input.now, input.workerId, input.activationId)
+
+    this.log("info", "provider.checkpoint.commit", {
+      workflowName: instance.workflow_name,
+      workflowId: input.workflowId,
+      runId: input.runId,
+      activationId: input.activationId,
+      workerId: input.workerId,
+      sequence: nextSequence,
+      status: input.next.status,
+    })
+    this.count("durable.provider.checkpoint", {
+      workerId: input.workerId,
+      workflowName: instance.workflow_name,
+      status: "success",
+    })
+    return { ok: true, sequence: nextSequence }
   }
 
   async recordActivationFailures(inputs: RecordActivationFailureInput[]): Promise<void> {
@@ -1499,8 +1505,6 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   private configure(): void {
     this.db.pragma("journal_mode = WAL")
     this.db.pragma("synchronous = FULL")
-    this.db.pragma("fullfsync = ON")
-    this.db.pragma("checkpoint_fullfsync = ON")
     this.db.pragma("foreign_keys = ON")
     this.db.pragma(`busy_timeout = ${this.busyTimeoutMs}`)
   }

@@ -33,9 +33,9 @@ later steps.
 ## SQLite
 
 The SQLite provider is file-backed by default and is configured for crash
-durability with WAL mode, `synchronous=FULL`, foreign keys, `busy_timeout`, and
-full-sync pragmas where supported. `:memory:` stores remain available for tests
-and local experiments, but they are not crash-durable.
+durability with WAL mode, `synchronous=FULL`, foreign keys, and `busy_timeout`.
+`:memory:` stores remain available for tests and local experiments, but they are
+not crash-durable.
 
 ## Local Postgres
 
@@ -90,14 +90,14 @@ file-backed WAL/FULL durability; Postgres uses `synchronous_commit=on`:
 
 | Provider | workers/shards | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| SQLite WAL/FULL | 4/4 | n/a | n/a | 25 | 125 | 166 | 266 |
-| SQLite WAL/FULL | 16/16 | n/a | n/a | 24 | 118 | 155 | 249 |
-| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 205 | 1,025 | 1,780 | 2,848 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 217 | 1,084 | 2,077 | 3,323 |
-| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 293 | 1,464 | 3,994 | 6,391 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 279 | 1,397 | 4,074 | 6,518 |
-| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 309 | 1,545 | 4,112 | 6,580 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 292 | 1,459 | 4,261 | 6,818 |
+| SQLite WAL/FULL | 4/4 | n/a | n/a | 650 | 3,249 | 3,726 | 5,961 |
+| SQLite WAL/FULL | 16/16 | n/a | n/a | 822 | 4,108 | 4,891 | 7,825 |
+| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 194 | 968 | 1,780 | 2,848 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 222 | 1,109 | 2,035 | 3,255 |
+| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 267 | 1,334 | 3,966 | 6,345 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 280 | 1,400 | 4,129 | 6,607 |
+| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 263 | 1,314 | 3,912 | 6,259 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 298 | 1,491 | 4,064 | 6,503 |
 
 `npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
 sampling of pool pressure, active Postgres wait events, WAL/database deltas,

@@ -8,6 +8,8 @@ import {
   type ChildHandle,
   checkpoint,
   child,
+  type CommitActivationInput,
+  type CommitActivationsResult,
   complete,
   defineWorkflow,
   type DurableLogger,
@@ -1010,8 +1012,8 @@ describe("durable workflow PoC", () => {
 
     expect(sqlitePragma(provider, "journal_mode")).toBe("wal")
     expect(sqlitePragma(provider, "synchronous")).toBe(2)
-    expect(sqlitePragma(provider, "fullfsync")).toBe(1)
-    expect(sqlitePragma(provider, "checkpoint_fullfsync")).toBe(1)
+    expect(sqlitePragma(provider, "fullfsync")).toBe(0)
+    expect(sqlitePragma(provider, "checkpoint_fullfsync")).toBe(0)
   })
 
   it("validates activation concurrency and activation limits", async () => {
@@ -3892,6 +3894,68 @@ describe("durable workflow PoC", () => {
         expect.objectContaining({ status: "completed", output: { index: 1 } }),
         expect.objectContaining({ status: "completed", output: { index: 2 } }),
         expect.objectContaining({ status: "completed", output: { index: 3 } }),
+      ]),
+    )
+  })
+
+  it("sends sibling activation completions through one provider commit batch", async () => {
+    class TrackingCommitProvider extends SqliteDurabilityProvider {
+      readonly commitBatchSizes: number[] = []
+
+      override async commitActivations(
+        inputs: CommitActivationInput[],
+      ): Promise<CommitActivationsResult> {
+        this.commitBatchSizes.push(inputs.length)
+        return super.commitActivations(inputs)
+      }
+    }
+
+    const started: number[] = []
+    const release = deferred()
+    const BatchedCommitWorkflow = defineWorkflow({
+      name: "sqlite_batched_commit_runtime",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ common }) => {
+            started.push(common.index)
+            if (started.length === 2) {
+              release.resolve()
+            }
+            await release.promise
+            return complete({ index: common.index })
+          },
+        }),
+      },
+    })
+
+    const provider = new TrackingCommitProvider(await storePath())
+    testProviders.add(provider)
+    const runtime = new DurableRuntime(provider, {
+      workflows: [BatchedCommitWorkflow],
+      workerId: "sqlite-batched-commit-worker",
+      maxConcurrentActivations: 2,
+      activationCommitBatchSize: 2,
+      activationCommitMaxDelayMs: 1_000,
+    })
+    const refs = await Promise.all(
+      [0, 1].map((index) =>
+        runtime.start(BatchedCommitWorkflow, { index }, { workflowId: `sqlite-batched-commit-${index}` }),
+      ),
+    )
+
+    await expect(runtime.drain({ maxActivations: 2 })).resolves.toEqual({ activations: 2 })
+    expect(provider.commitBatchSizes).toContain(2)
+    await expect(Promise.all(refs.map((ref) => provider.loadInstance(ref)))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "completed", output: { index: 0 } }),
+        expect.objectContaining({ status: "completed", output: { index: 1 } }),
       ]),
     )
   })
