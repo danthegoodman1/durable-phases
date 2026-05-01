@@ -24,7 +24,6 @@ export type BenchmarkOptions = {
   activationConcurrency: number
   activationPrefetchLimit: number
   activityDelayMs: number
-  sqliteSynchronous: "full" | "normal"
   batch: number
   maxRounds: number
   keepDb: boolean
@@ -61,7 +60,6 @@ const defaultOptions: BenchmarkOptions = {
   activationConcurrency: 4,
   activationPrefetchLimit: 32,
   activityDelayMs: 0,
-  sqliteSynchronous: "full",
   batch: 32,
   maxRounds: 10_000,
   keepDb: false,
@@ -72,7 +70,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, SQLite synchronous ${options.sqliteSynchronous}...\n\n`,
+      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, SQLite WAL/FULL durability...\n\n`,
     )
   }
   const result = await runSqliteBenchmark(options)
@@ -94,9 +92,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
   let now = new Date("2026-01-01T00:00:00.000Z")
   const clock = () => now
   const runtimes = Array.from({ length: options.workers }, (_value, workerIndex) => {
-    const provider = new SqliteDurabilityProvider(dbPath, {
-      synchronous: options.sqliteSynchronous,
-    })
+    const provider = new SqliteDurabilityProvider(dbPath)
     providers.push(provider)
     return new DurableRuntime(provider, {
       clock,
@@ -255,8 +251,6 @@ function parseArgs(args: string[]): BenchmarkOptions {
       options.activationPrefetchLimit = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--activity-delay-ms") {
       options.activityDelayMs = parseNonNegativeInteger(nextValue(), flag)
-    } else if (flag === "--sqlite-synchronous") {
-      options.sqliteSynchronous = parseSqliteSynchronous(nextValue(), flag)
     } else if (flag === "--batch") {
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
@@ -288,14 +282,6 @@ function parseNonNegativeInteger(value: string, flag: string): number {
   return parsed
 }
 
-function parseSqliteSynchronous(value: string, flag: string): "full" | "normal" {
-  const normalized = value.toLowerCase()
-  if (normalized !== "full" && normalized !== "normal") {
-    throw new Error(`${flag} must be "full" or "normal"`)
-  }
-  return normalized
-}
-
 function printHelp(): void {
   process.stdout.write(`SQLite durability benchmark
 
@@ -311,8 +297,6 @@ Options:
                     Claimed activations to keep leased ahead of execution. Default: ${defaultOptions.activationPrefetchLimit}
   --activity-delay-ms <n>
                     Async delay inside each activity. Default: ${defaultOptions.activityDelayMs}
-  --sqlite-synchronous <full|normal>
-                    SQLite synchronous pragma. Default: ${defaultOptions.sqliteSynchronous}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
   --keep-db         Keep the temporary SQLite database and print its path.
@@ -330,7 +314,7 @@ function printResult(result: BenchmarkResult): void {
   activation concurrency: ${result.options.activationConcurrency} per worker
   activation prefetch limit: ${result.options.activationPrefetchLimit}
   activity delay: ${formatMs(result.options.activityDelayMs)}
-  SQLite synchronous: ${result.options.sqliteSynchronous}
+  SQLite durability: WAL/FULL
   batch: ${result.options.batch}
   rounds: ${result.rounds}
   elapsed: ${formatMs(result.elapsedMs)} (${formatMs(result.setupMs)} setup, ${formatMs(result.processingMs)} processing, ${formatMs(result.verifyMs)} verify)

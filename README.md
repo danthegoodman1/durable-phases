@@ -1,26 +1,22 @@
-# Durable Execution PoC
+# Durable Phases
 
-A small TypeScript prototype of the phase-based durable execution model in
-[`SPEC.md`](SPEC.md). The TypeScript runtime ships with SQLite and Postgres
-durability providers with shard leases, activation leases, atomic checkpoint
-commits, durable ready indexes, durable waits, a signal inbox, child records,
-and activation-scoped effects. Short inline TypeScript activities default to
-checkpoint durability, so their results are committed with the workflow
-checkpoint; heartbeat or timeout activities use eager per-attempt durability.
-Child starts also default to checkpoint durability, so local children are
-created atomically with the parent checkpoint unless `durability: "eager"` is
-requested.
-`DurableRuntime.drain()` is useful for tests and manual pumping;
-`DurableRuntime.runWorker()` adds bounded polling, wake hints, lease heartbeats,
-activation prefetch, batched activation commits, and bounded activation
-concurrency for long-running workers.
+Durable Phases is a TypeScript runtime for phase-based durable execution. It
+turns workflow phases, durable waits, signals, timers, child workflows, and
+activities into checkpointed state backed by a `DurabilityProvider`.
+
+The runtime ships with production-shaped SQLite and Postgres providers. Both
+support shard leases, activation leases, atomic checkpoint commits, durable work
+indexes, signal inboxes, child records, and activation-scoped effects.
+
+## Quickstart
 
 ```bash
 npm run demo
 npm test
+npm run build
 ```
 
-The demos in [`src/demos/`](src/demos/) are intentionally small:
+The demos in [`src/demos/`](src/demos/) cover:
 
 - immediate `run` phases plus signal delivery
 - timer waits that survive runtime reconstruction plus `stay()`
@@ -28,10 +24,18 @@ The demos in [`src/demos/`](src/demos/) are intentionally small:
 - a tiny local child workflow
 - checkpoint-boundary workflow migration
 
-This is still intentionally small. Activity retry policy, the public activity
-heartbeat API, and local child close policies are implemented in the TypeScript
-prototype; remote children and tenant-aware partitioning are left for later
-steps.
+Short inline TypeScript activities and local child starts default to checkpoint
+durability, so they are persisted atomically with the workflow checkpoint.
+Heartbeat or timeout activities use eager per-attempt durability. Remote
+children, tenant-aware partitioning, and external activity workers are left for
+later steps.
+
+## SQLite
+
+The SQLite provider is file-backed by default and is configured for crash
+durability with WAL mode, `synchronous=FULL`, foreign keys, `busy_timeout`, and
+full-sync pragmas where supported. `:memory:` stores remain available for tests
+and local experiments, but they are not crash-durable.
 
 ## Local Postgres
 
@@ -69,7 +73,7 @@ signals, timers, and child completions. These are local sanity numbers, not a
 production guarantee.
 
 ```bash
-npm run benchmark -- --activation-concurrency 4 --sqlite-synchronous full
+npm run benchmark:sqlite -- --workflows 1000 --activation-concurrency 4 --activation-prefetch-limit 32 --json
 npm run benchmark:postgres -- --activation-concurrency 4 --activation-prefetch-limit 32 --json
 npm run benchmark:postgres -- --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
@@ -81,17 +85,19 @@ Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
 
 Measured on this workspace with 1,000 workflows, zero artificial activity delay,
-activation concurrency 4, activation prefetch 32, batch 32, and
-`synchronous_commit=on`:
+activation concurrency 4, activation prefetch 32, and batch 32. SQLite uses
+file-backed WAL/FULL durability; Postgres uses `synchronous_commit=on`:
 
 | Provider | workers/shards | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 199 | 993 | 1,786 | 2,858 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 190 | 952 | 1,971 | 3,153 |
-| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 231 | 1,153 | 3,030 | 4,847 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 272 | 1,358 | 3,695 | 5,912 |
-| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 291 | 1,455 | 4,008 | 6,413 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 295 | 1,477 | 4,282 | 6,851 |
+| SQLite WAL/FULL | 4/4 | n/a | n/a | 25 | 125 | 166 | 266 |
+| SQLite WAL/FULL | 16/16 | n/a | n/a | 24 | 118 | 155 | 249 |
+| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 205 | 1,025 | 1,780 | 2,848 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 217 | 1,084 | 2,077 | 3,323 |
+| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 293 | 1,464 | 3,994 | 6,391 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 279 | 1,397 | 4,074 | 6,518 |
+| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 309 | 1,545 | 4,112 | 6,580 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 292 | 1,459 | 4,261 | 6,818 |
 
 `npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
 sampling of pool pressure, active Postgres wait events, WAL/database deltas,
@@ -102,10 +108,8 @@ concurrency does not necessarily improve that particular throughput row. The
 concurrency path is still useful for workers with long in-flight async
 activations because one blocked activation no longer occupies the entire worker.
 
-`synchronous=full` is SQLite's conservative default. `synchronous=normal` is
-available for deployments that accept SQLite's weaker crash window in exchange
-for higher write throughput. The Postgres rows are from local Docker on the same
-machine, so they include client/server and container overhead.
+The Postgres rows are from local Docker on the same machine, so they include
+client/server and container overhead.
 
 ## Provider conformance
 

@@ -47,6 +47,12 @@ function testProvider(
   return provider
 }
 
+function sqlitePragma(provider: SqliteDurabilityProvider, sql: string): unknown {
+  return (provider as unknown as {
+    db: { pragma(statement: string, options?: { simple?: boolean }): unknown }
+  }).db.pragma(sql, { simple: true })
+}
+
 afterEach(async () => {
   for (const provider of testProviders) {
     provider.close()
@@ -994,9 +1000,18 @@ describe("durable workflow PoC", () => {
     expect(
       () =>
         new SqliteDurabilityProvider(":memory:", {
-          synchronous: "off" as never,
-        }),
-    ).toThrow('SqliteDurabilityProvider synchronous must be "full" or "normal"')
+          synchronous: "normal",
+        } as never),
+    ).toThrow("SqliteDurabilityProvider uses fixed SQLite synchronous=FULL")
+  })
+
+  it("configures file-backed SQLite with WAL and FULL synchronization", async () => {
+    const provider = testProvider(await storePath())
+
+    expect(sqlitePragma(provider, "journal_mode")).toBe("wal")
+    expect(sqlitePragma(provider, "synchronous")).toBe(2)
+    expect(sqlitePragma(provider, "fullfsync")).toBe(1)
+    expect(sqlitePragma(provider, "checkpoint_fullfsync")).toBe(1)
   })
 
   it("validates activation concurrency and activation limits", async () => {

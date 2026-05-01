@@ -83,7 +83,6 @@ const Database = require("better-sqlite3") as SqliteConstructor
 
 export type SqliteDurabilityProviderOptions = DurableObservability & {
   busyTimeoutMs?: number
-  synchronous?: "full" | "normal"
 }
 
 type ReadyCandidate = {
@@ -280,7 +279,6 @@ type ReadyEventInstanceState = {
 export class SqliteDurabilityProvider implements DurabilityProvider {
   private readonly db: SqliteDatabase
   private readonly busyTimeoutMs: number
-  private readonly synchronous: "full" | "normal"
   private readonly observability: DurableObservability
   private readonly statements = new Map<string, SqliteStatement>()
   private observabilityBuffer?: BufferedObservation[]
@@ -290,8 +288,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     private readonly filePath: string,
     options: SqliteDurabilityProviderOptions = {},
   ) {
+    rejectSqliteSynchronousOption(options)
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000
-    this.synchronous = normalizeSqliteSynchronous(options.synchronous)
     this.observability = { logger: options.logger, metrics: options.metrics }
     if (filePath !== ":memory:") {
       mkdirSync(dirname(filePath), { recursive: true })
@@ -1500,7 +1498,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
   private configure(): void {
     this.db.pragma("journal_mode = WAL")
-    this.db.pragma(`synchronous = ${this.synchronous.toUpperCase()}`)
+    this.db.pragma("synchronous = FULL")
+    this.db.pragma("fullfsync = ON")
+    this.db.pragma("checkpoint_fullfsync = ON")
     this.db.pragma("foreign_keys = ON")
     this.db.pragma(`busy_timeout = ${this.busyTimeoutMs}`)
   }
@@ -3453,14 +3453,10 @@ function readyEventStateFromInstanceRow(row: InstanceRow): ReadyEventInstanceSta
   }
 }
 
-function normalizeSqliteSynchronous(value: SqliteDurabilityProviderOptions["synchronous"]): "full" | "normal" {
-  if (value === undefined) {
-    return "full"
+function rejectSqliteSynchronousOption(options: SqliteDurabilityProviderOptions): void {
+  if ("synchronous" in options) {
+    throw new Error("SqliteDurabilityProvider uses fixed SQLite synchronous=FULL; remove the synchronous option")
   }
-  if (value !== "full" && value !== "normal") {
-    throw new Error('SqliteDurabilityProvider synchronous must be "full" or "normal"')
-  }
-  return value
 }
 
 function stripCandidateMetadata(candidate: ReadyCandidate): ClaimedActivation {
