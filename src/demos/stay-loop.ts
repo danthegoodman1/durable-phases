@@ -1,16 +1,16 @@
 /*
- * Shows the bounded unbound-loop pattern with `checkpoint()`:
- * each immediate activation processes a small chunk, checkpoints progress into
+ * Shows the bounded unbound-loop pattern with `stay()`:
+ * each immediate activation processes a small chunk, persists progress into
  * phase data, and the runtime re-enters the same run phase until complete.
  */
 
 import { z } from "zod"
 import {
-  checkpoint,
   complete,
   defineWorkflow,
   phase,
   start,
+  stay,
 } from "../durable.js"
 import { cleanupDemoStore, committed, demoRuntime } from "./_shared.js"
 
@@ -50,7 +50,7 @@ const BatchWorkflow = defineWorkflow({
           chunk.map((item: string) => item.toUpperCase()),
         )
 
-        return checkpoint({
+        return stay({
           cursor: data.cursor + chunk.length,
           processed: [...data.processed, ...processedChunk],
         })
@@ -59,8 +59,8 @@ const BatchWorkflow = defineWorkflow({
   },
 })
 
-export async function runCheckpointLoopDemo(): Promise<void> {
-  const demoName = "checkpoint-loop"
+export async function runStayLoopDemo(): Promise<void> {
+  const demoName = "stay-loop"
   const { runtime, provider } = await demoRuntime(demoName, [BatchWorkflow])
 
   try {
@@ -70,7 +70,7 @@ export async function runCheckpointLoopDemo(): Promise<void> {
       { workflowId: "loop-demo" },
     )
     await runtime.drain()
-    console.log("checkpoint loop: completed", await committed(provider, ref))
+    console.log("stay loop: completed", await committed(provider, ref))
   } finally {
     provider.close()
     await cleanupDemoStore(demoName)

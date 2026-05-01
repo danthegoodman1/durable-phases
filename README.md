@@ -20,7 +20,7 @@ The demos in [`src/demos/`](src/demos/) cover:
 
 - immediate `run` phases plus signal delivery
 - timer waits that survive runtime reconstruction plus `stay()`
-- `checkpoint()` and the bounded unbound-loop pattern
+- bounded unbound-loop processing with `stay()`
 - a tiny local child workflow
 - checkpoint-boundary workflow migration
 

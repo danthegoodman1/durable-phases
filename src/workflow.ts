@@ -210,10 +210,6 @@ export function stay<DataPatch = unknown>(dataPatch?: DataPatch): TransitionComm
   return { kind: "stay", dataPatch }
 }
 
-export function checkpoint<DataPatch = unknown>(dataPatch?: DataPatch): TransitionCommand {
-  return stay(dataPatch)
-}
-
 export function go<Data>(phase: string, data: Data): TransitionCommand {
   return { kind: "go", phase, data }
 }

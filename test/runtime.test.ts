@@ -6,7 +6,6 @@ import { z } from "zod"
 import {
   cancel,
   type ChildHandle,
-  checkpoint,
   child,
   type CommitActivationInput,
   type CommitActivationsResult,
@@ -335,7 +334,7 @@ function makeWorkflowSuite(counters = { reminders: 0, processed: 0 }) {
               return `${data.items[data.cursor]}!`
             })
 
-            return checkpoint({
+            return stay({
               cursor: data.cursor + 1,
               processed: [...data.processed, value],
             })
@@ -1274,7 +1273,7 @@ describe("durable workflow PoC", () => {
     expect((await provider.listSignals())[0].consumedBySequence).toBe(2)
   })
 
-  it("uses checkpoint() for the bounded unbound-loop pattern", async () => {
+  it("uses stay() for the bounded unbound-loop pattern", async () => {
     const path = await storePath()
     const clock = manualClock()
     const { counters, workflows, TestWorkflow } = makeWorkflowSuite()
