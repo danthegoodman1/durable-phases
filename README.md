@@ -71,23 +71,20 @@ The Compose file defaults to the pinned official image
 
 `PostgresDurabilityProvider.create(...)` accepts a connection string or shared
 `pg.Pool`, schema name, pool size, statement/lock timeouts,
-`physicalPartitions`, and optional observability sinks. The provider uses
-explicit transactions, row locks, `FOR UPDATE SKIP LOCKED`, conflict-aware
-upserts, shard-epoch task ownership, partial hot-path indexes, and an advisory
-transaction lock for concurrent schema initialization. Current projections live
-in `workflow_state`, compact execution records append to `workflow_history`, and
-live `tasks` rows carry execution snapshots so shard-local claims do not need a
-follow-up state read on the normal hot path. Cross-shard child workflow work is
-represented with idempotent `outbox`/`inbox` rows: checkpoint child starts,
-child completions, and child cancellations are materialized by the owning
-target shard rather than by direct cross-shard state writes.
+`physicalPartitions`, and optional observability sinks. The provider uses the
+same shared append/replay shard engine as SQLite: each logical shard has a
+current in-memory projection, durable journal rows, and periodic snapshots.
+Shard-owner mutations row-lock that shard's head, catch up from the journal,
+apply the shared engine mutation, and append one fenced journal entry. Postgres
+is no longer used as the task scheduler in this path.
 
 `physicalPartitions` is fixed when a schema is created and is persisted in
-provider metadata. Hot workflow/run tables are manually suffixed
-(`workflow_state_p00`, `workflow_history_p00`, `tasks_p00`, `inbox_p00`,
-`outbox_p00`, and so on), while dispatch shards remain logical worker leases.
-The runtime API does not change; the provider routes each workflow/run to its
-physical table set internally.
+provider metadata. Shard journals, shard heads, and snapshots are manually
+suffixed (`shard_journal_p00`, `shard_heads_p00`, `shard_snapshots_p00`, and so
+on), while dispatch shards remain logical worker leases. Local child workflow
+IDs are shard-affine by default. Explicit cross-shard local child IDs are
+rejected in this provider until distributed child placement is reintroduced
+deliberately.
 
 ## Benchmarks
 
@@ -100,6 +97,7 @@ npm run benchmark:sqlite -- --shard-files --workflows 1000 --workers 16 --shards
 npm run benchmark:sqlite -- --mode signal --profile-queries --json
 npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
+npm run benchmark:postgres:processes -- --processes 4 --workflows 4000 --json
 npm run benchmark:null -- --workflows 1000 --mode mixed --json
 npm run benchmark:null -- --workflows 10000 --mode bare --json
 npm run benchmark:null:processes -- --processes 4 --workflows 4000 --mode mixed --json
@@ -119,26 +117,32 @@ and aggregates throughput to show whether the ceiling scales with Node process
 count.
 
 Fresh rows from this pass, measured on this workspace with zero artificial
-activity delay. SQLite uses file-backed WAL/FULL durability:
+activity delay. SQLite uses file-backed WAL/FULL durability; Postgres uses the
+append-store shard engine with `synchronous_commit=on`:
 
-| Provider | workload | workers/shards | activation concurrency | prefetch / drain batch | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
+| Provider | workload | shape | activation concurrency | prefetch / drain batch | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null in-memory | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 14,230 | 16,406 | 26,249 |
-| Null in-memory | bare, 10k workflows | 4/4 | 4 | 32 / 32 | 4,558 | 15,232 | 15,232 |
-| SQLite WAL/FULL single file | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 2,253 | 2,472 | 3,955 |
-| SQLite WAL/FULL single file | mixed, 1k workflows | 16/16 | 4 | 32 / 32 | 5,475 | 7,018 | 11,229 |
-| SQLite WAL/FULL shard files | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 2,200 | 2,488 | 3,980 |
-| SQLite WAL/FULL shard files | mixed, 1k workflows | 16/16 | 4 | 32 / 32 | 4,329 | 7,122 | 11,395 |
+| Null in-memory | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 15,010 | 17,421 | 27,873 |
+| Null in-memory | bare, 10k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 4,659 | 15,940 | 15,940 |
+| SQLite WAL/FULL single file | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 2,268 | 2,489 | 3,983 |
+| SQLite WAL/FULL shard files | mixed, 1k workflows | 16 workers / 16 shards | 4 | 32 / 32 | 4,165 | 7,474 | 11,958 |
+| SQLite WAL/FULL shard files | mixed, 4k workflows | 4 processes / 16 shards | 4 | 32 / 32 | 6,130 | 10,128 | 16,205 |
+| Postgres append store | mixed, 1k workflows | 4 workers / 4 shards / 1 partition | 4 | 32 / 32 | 827 | 1,762 | 2,820 |
+| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 1 partition | 4 | 32 / 32 | 1,184 | 5,674 | 9,078 |
+| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 4 partitions | 4 | 32 / 32 | 1,145 | 5,457 | 8,731 |
+| Postgres append store | mixed, 1k workflows | 32 workers / 32 shards / 4 partitions | 4 | 32 / 32 | 1,223 | 5,990 | 9,585 |
+| Postgres append store | mixed, 4k workflows | 4 processes / 16 shards / 4 partitions | 4 | 32 / 32 | 2,384 | 6,632 | 10,611 |
 
 SQLite profiling on the 100-workflow mixed workload reported about `1.15`
-processing SQL statements per activation. The processing hot path was journal
-catch-up, journal append, and shard lease updates; it did not use SQL joins or
-ready-table scans.
+processing SQL statements per activation. Postgres profiling on the 1k mixed
+workload with 16 workers, 16 shards, and 4 physical partitions reported about
+`2.96` processing SQL statements per activation. Both processing hot paths were
+journal catch-up, journal append, snapshot/head maintenance, and shard lease
+updates; neither used SQL task-discovery joins or ready-table scans.
 
-Postgres remains on the existing shard-session SQL provider path until the next
-gated milestone ports it to the same append-store contract. Use the Postgres
-commands above to measure your local Docker setup, but the table intentionally
-does not claim a Postgres gain from this SQLite/null architecture pass.
+Postgres uses the same append-store shard engine as SQLite. Use
+`benchmark:postgres:processes` to measure multiple Node processes against one
+shared Postgres schema with disjoint shard ranges.
 
 ## Provider conformance
 

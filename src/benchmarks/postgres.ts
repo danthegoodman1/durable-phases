@@ -4,7 +4,12 @@ import { pathToFileURL } from "node:url"
 import { randomUUID } from "node:crypto"
 import { setTimeout as sleep } from "node:timers/promises"
 import type { Pool as PgPool, PoolClient, PoolConfig } from "pg"
-import { DurableRuntime, PostgresDurabilityProvider } from "../durable.js"
+import {
+  DurableRuntime,
+  PostgresDurabilityProvider,
+  workflowPartitionShard,
+  type PersistedInstance,
+} from "../durable.js"
 import {
   activityCount,
   createBenchmarkCounters,
@@ -24,8 +29,11 @@ export type PostgresBenchmarkOptions = {
   physicalPartitions: number
   poolSize: number
   workflows: number
+  workflowOffset: number
   workers: number
   shards: number
+  dispatchShardIds?: number[]
+  workflowShardIds?: number[]
   activationConcurrency: number
   activationPrefetchLimit: number
   activityDelayMs: number
@@ -133,6 +141,7 @@ const defaultOptions: PostgresBenchmarkOptions = {
   physicalPartitions: 1,
   poolSize: 24,
   workflows: 250,
+  workflowOffset: 0,
   workers: 4,
   shards: 4,
   activationConcurrency: 4,
@@ -166,6 +175,8 @@ async function main(): Promise<void> {
 export async function runPostgresBenchmark(
   options: PostgresBenchmarkOptions,
 ): Promise<PostgresBenchmarkResult> {
+  assertShardListInRange(options.dispatchShardIds, options.shards, "dispatchShardIds")
+  assertShardListInRange(options.workflowShardIds, options.shards, "workflowShardIds")
   const counters = createBenchmarkCounters()
   const workload = createNullBenchmarkWorkload(options.mode, counters, {
     activityDelayMs: options.activityDelayMs,
@@ -222,6 +233,7 @@ export async function runPostgresBenchmark(
             workerIndex,
             options.workers,
             options.shards,
+            options.dispatchShardIds,
           ),
           maxConcurrentActivations: options.activationConcurrency,
           activationPrefetchLimit: options.activationPrefetchLimit,
@@ -231,11 +243,13 @@ export async function runPostgresBenchmark(
       )
     }
 
-    for (let index = 0; index < options.workflows; index += 1) {
+    for (let localIndex = 0; localIndex < options.workflows; localIndex += 1) {
+      const index = options.workflowOffset + localIndex
+      const workflowId = benchmarkWorkflowId(options, index, localIndex)
       const ref = await runtimes[0]!.start(
         workload.RootWorkflow,
         { index },
-        { workflowId: `${options.mode}-bench-${index}` },
+        { workflowId },
       )
       counters.workflowStarts += 1
       if (workload.appendFinishSignal) {
@@ -289,17 +303,19 @@ export async function runPostgresBenchmark(
       )
     }
 
-    const instances = await providers[0]!.listInstances()
-    const completedWorkflows = instances.filter(
-      (instance) => instance.workflowName === workload.RootWorkflow.name && instance.status === "completed",
-    ).length
+    const instances = normalizeBenchmarkInstanceIds(await providers[0]!.listInstances())
+    const completedWorkflows = countExpectedCompletedRootWorkflows(
+      instances,
+      workload.RootWorkflow.name,
+      options,
+    )
     if (completedWorkflows !== options.workflows) {
       throw new Error(
         `Benchmark did not complete: ${completedWorkflows}/${options.workflows} workflows finished after ${rounds} rounds`,
       )
     }
 
-    workload.verify(instances, options.workflows, 0)
+    workload.verify(instances, options.workflows, options.workflowOffset)
     const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
@@ -382,10 +398,16 @@ export function parsePostgresBenchmarkArgs(args: string[]): PostgresBenchmarkOpt
       options.poolSize = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--workflows") {
       options.workflows = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--workflow-offset") {
+      options.workflowOffset = parseNonNegativeInteger(nextValue(), flag)
     } else if (flag === "--workers") {
       options.workers = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--shards") {
       options.shards = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--dispatch-shards") {
+      options.dispatchShardIds = parseShardList(nextValue(), flag)
+    } else if (flag === "--workflow-shards") {
+      options.workflowShardIds = parseShardList(nextValue(), flag)
     } else if (flag === "--activation-concurrency") {
       options.activationConcurrency = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--activation-prefetch-limit") {
@@ -453,6 +475,25 @@ function parseNonNegativeInteger(value: string, flag: string): number {
   return parsed
 }
 
+function parseShardList(value: string, flag: string): number[] {
+  const parsed = value.split(",").filter(Boolean).map((entry) => Number(entry))
+  if (parsed.length === 0 || parsed.some((entry) => !Number.isInteger(entry) || entry < 0)) {
+    throw new Error(`${flag} must be a comma-separated list of non-negative shard ids`)
+  }
+  return [...new Set(parsed)].sort((left, right) => left - right)
+}
+
+function assertShardListInRange(shards: number[] | undefined, shardCount: number, name: string): void {
+  if (!shards) {
+    return
+  }
+  for (const shardId of shards) {
+    if (shardId >= shardCount) {
+      throw new Error(`${name} contains shard ${shardId}, but shard count is ${shardCount}`)
+    }
+  }
+}
+
 function printHelp(): void {
   process.stdout.write(`Postgres durability benchmark
 
@@ -468,8 +509,14 @@ Options:
                     Manual physical table partitions for hot provider tables. Default: ${defaultOptions.physicalPartitions}
   --pool-size <n>   Shared pg pool size. Default: ${defaultOptions.poolSize}
   --workflows <n>   Parent workflow count. Default: ${defaultOptions.workflows}
+  --workflow-offset <n>
+                    Starting workflow index. Default: ${defaultOptions.workflowOffset}
   --workers <n>     Logical in-process worker count. Default: ${defaultOptions.workers}
   --shards <n>      Dispatch shard count. Default: ${defaultOptions.shards}
+  --dispatch-shards <ids>
+                    Optional shard ids this process may claim, e.g. 0,1,2,3.
+  --workflow-shards <ids>
+                    Optional shard ids to place started workflows on.
   --activation-concurrency <n>
                     Max concurrent activations per worker. Default: ${defaultOptions.activationConcurrency}
   --activation-prefetch-limit <n>
@@ -495,9 +542,12 @@ function printResult(result: PostgresBenchmarkResult): void {
   process.stdout.write(`Postgres durability benchmark
   mode: ${result.mode}
   workflows: ${result.options.workflows}
+  workflow offset: ${result.options.workflowOffset}
   workers: ${result.options.workers} logical in-process workers
   active workers: ${result.activeWorkers}
   shards: ${result.options.shards}
+  dispatch shards: ${result.options.dispatchShardIds?.join(",") ?? "all"}
+  workflow shards: ${result.options.workflowShardIds?.join(",") ?? "all"}
   activation concurrency: ${result.options.activationConcurrency} per worker
   activation prefetch limit: ${result.options.activationPrefetchLimit}
   physical partitions: ${result.options.physicalPartitions}
@@ -562,14 +612,64 @@ function dispatchShardIdsForWorker(
   workerIndex: number,
   workerCount: number,
   shardCount: number,
+  allowedShardIds?: number[],
 ): number[] {
   const shardIds: number[] = []
-  for (let shardId = 0; shardId < shardCount; shardId += 1) {
-    if (shardId % workerCount === workerIndex) {
+  const candidates = allowedShardIds ?? Array.from({ length: shardCount }, (_value, shardId) => shardId)
+  for (const [offset, shardId] of candidates.entries()) {
+    if (offset % workerCount === workerIndex) {
       shardIds.push(shardId)
     }
   }
   return shardIds
+}
+
+function benchmarkWorkflowId(
+  options: PostgresBenchmarkOptions,
+  index: number,
+  localIndex: number,
+): string {
+  const base = `${options.mode}-bench-${index}`
+  const targetShards = options.workflowShardIds
+  if (!targetShards || targetShards.length === 0) {
+    return base
+  }
+  const targetShard = targetShards[localIndex % targetShards.length]!
+  if (workflowPartitionShard(base, "run-1", options.shards) === targetShard) {
+    return base
+  }
+  for (let attempt = 1; attempt <= 10_000; attempt += 1) {
+    const candidate = `${base}__shard_${attempt}`
+    if (workflowPartitionShard(candidate, "run-1", options.shards) === targetShard) {
+      return candidate
+    }
+  }
+  throw new Error(`Could not find benchmark workflow id for shard ${targetShard}`)
+}
+
+function normalizeBenchmarkInstanceIds(instances: PersistedInstance[]): PersistedInstance[] {
+  return instances.map((instance) => ({
+    ...instance,
+    workflowId: instance.workflowId.replace(/__shard_\d+$/, ""),
+  }))
+}
+
+function countExpectedCompletedRootWorkflows(
+  instances: PersistedInstance[],
+  workflowName: string,
+  options: PostgresBenchmarkOptions,
+): number {
+  const expectedWorkflowIds = new Set(
+    Array.from({ length: options.workflows }, (_value, localIndex) =>
+      `${options.mode}-bench-${options.workflowOffset + localIndex}`,
+    ),
+  )
+  return instances.filter(
+    (instance) =>
+      instance.workflowName === workflowName &&
+      instance.status === "completed" &&
+      expectedWorkflowIds.has(instance.workflowId),
+  ).length
 }
 
 function redactConnectionString(connectionString: string): string {

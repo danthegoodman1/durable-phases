@@ -256,6 +256,10 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     }))
   }
 
+  clearShardLease(shardId: number): void {
+    this.shardLeases.delete(shardId)
+  }
+
   openShard(input: OpenShardInput): ShardDurabilitySession {
     return new ShardMemorySession(this, input)
   }
@@ -634,16 +638,16 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       activationId: input.activationId,
       ownerId: input.workerId,
     })
-    const task = this.findClaimedTask(input.activationId, input.workerId, input.now)
-    if (!task) {
-      throw new Error(`Lost activation lease: ${input.activationId}`)
-    }
     const existing = this.effectFor(input.activationId, input.key)
     if (existing?.status === "completed") {
       return { status: "completed", result: this.clone(existing.result ?? null) }
     }
     if (existing?.status === "failed") {
       return { status: "failed", error: this.clone(existing.error ?? { message: "Activity failed" }) }
+    }
+    const task = this.findClaimedTask(input.activationId, input.workerId, input.now)
+    if (!task) {
+      throw new Error(`Lost activation lease: ${input.activationId}`)
     }
     const options = normalizeEffectOptions(input)
     const now = input.now

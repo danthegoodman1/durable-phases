@@ -46,6 +46,12 @@ import type { ChildHandle, InstanceRef } from "./workflow.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import { countDurable, logDurable } from "./observability.js"
 import {
+  applyJournalOperation,
+  applyJournalOperationSync,
+  operationTime,
+  type JournalOperation,
+} from "./shard-journal.js"
+import {
   ShardMemoryDurabilityProvider,
   type ShardMemorySnapshot,
 } from "./shard-engine.js"
@@ -80,25 +86,6 @@ export type SqliteDurabilityProviderOptions = DurableObservability & {
     durationMs: number
   }) => void
 }
-
-type JournalOperation =
-  | { op: "claimShard"; input: ClaimDispatchShardInput }
-  | { op: "heartbeatDispatchShard"; input: HeartbeatDispatchShardInput }
-  | { op: "releaseDispatchShard"; input: ReleaseDispatchShardInput }
-  | { op: "createInstance"; input: CreateInstanceInput }
-  | { op: "createChildInstance"; input: CreateChildInstanceInput }
-  | { op: "cancelChild"; input: CancelChildInput }
-  | { op: "appendSignal"; input: AppendSignalInput }
-  | { op: "claimReadyActivations"; input: ClaimReadyActivationsInput }
-  | { op: "claimShardTasks"; session: OpenShardInput; input: ClaimShardTasksInput }
-  | { op: "heartbeatActivations"; input: HeartbeatActivationsInput }
-  | { op: "releaseActivations"; input: ReleaseActivationsInput }
-  | { op: "getOrReserveEffect"; input: ReserveEffectInput }
-  | { op: "heartbeatEffect"; input: HeartbeatEffectInput }
-  | { op: "completeEffect"; input: CompleteEffectInput }
-  | { op: "failEffect"; input: FailEffectInput }
-  | { op: "commitActivations"; input: CommitActivationInput[] }
-  | { op: "recordActivationFailures"; input: RecordActivationFailureInput[] }
 
 type JournalRow = {
   entry_id: number
@@ -633,69 +620,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private async applyJournalOperation(operation: JournalOperation): Promise<void> {
-    await this.store.engine.replay(() => this.applyJournalOperationAsync(operation))
+    await applyJournalOperation(this.store.engine, operation)
   }
 
   private applyJournalOperationSync(operation: JournalOperation): void {
-    this.store.engine.replaySync(() => {
-      void this.applyJournalOperationAsync(operation)
-    })
-  }
-
-  private async applyJournalOperationAsync(operation: JournalOperation): Promise<void> {
-    switch (operation.op) {
-      case "claimShard":
-        await this.store.engine.claimShard(operation.input)
-        return
-      case "heartbeatDispatchShard":
-        await this.store.engine.heartbeatDispatchShard(operation.input)
-        return
-      case "releaseDispatchShard":
-        await this.store.engine.releaseDispatchShard(operation.input)
-        return
-      case "createInstance":
-        await this.store.engine.createInstance(operation.input)
-        return
-      case "createChildInstance":
-        await this.store.engine.createChildInstance(operation.input)
-        return
-      case "cancelChild":
-        await this.store.engine.cancelChild(operation.input)
-        return
-      case "appendSignal":
-        await this.store.engine.appendSignal(operation.input)
-        return
-      case "claimReadyActivations":
-        await this.store.engine.claimReadyActivations(operation.input)
-        return
-      case "claimShardTasks":
-        await this.store.engine.openShard(operation.session).claimTasks(operation.input)
-        return
-      case "heartbeatActivations":
-        await this.store.engine.heartbeatActivations(operation.input)
-        return
-      case "releaseActivations":
-        await this.store.engine.releaseActivations(operation.input)
-        return
-      case "getOrReserveEffect":
-        await this.store.engine.getOrReserveEffect(operation.input)
-        return
-      case "heartbeatEffect":
-        await this.store.engine.heartbeatEffect(operation.input)
-        return
-      case "completeEffect":
-        await this.store.engine.completeEffect(operation.input)
-        return
-      case "failEffect":
-        await this.store.engine.failEffect(operation.input)
-        return
-      case "commitActivations":
-        await this.store.engine.commitActivations(operation.input)
-        return
-      case "recordActivationFailures":
-        await this.store.engine.recordActivationFailures(operation.input)
-        return
-    }
+    applyJournalOperationSync(this.store.engine, operation)
   }
 
   private providerLog(
@@ -965,20 +894,6 @@ function requireRow<T>(value: unknown): T {
     throw new Error("Expected SQLite row")
   }
   return value as T
-}
-
-function operationTime(operation: JournalOperation): string {
-  const input = "input" in operation ? operation.input : undefined
-  if (input && typeof input === "object" && "now" in input && typeof input.now === "string") {
-    return input.now
-  }
-  if (input && typeof input === "object" && "receivedAt" in input && typeof input.receivedAt === "string") {
-    return input.receivedAt
-  }
-  if (Array.isArray(input) && input[0] && typeof input[0] === "object" && "now" in input[0]) {
-    return String(input[0].now)
-  }
-  return new Date().toISOString()
 }
 
 function addMs(isoValue: string, ms: number): string {

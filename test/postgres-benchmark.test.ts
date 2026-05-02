@@ -6,6 +6,10 @@ import {
   runPostgresBenchmark,
   type PostgresBenchmarkOptions,
 } from "../src/benchmarks/postgres.js"
+import {
+  parsePostgresMultiProcessBenchmarkArgs,
+  runPostgresMultiProcessBenchmark,
+} from "../src/benchmarks/postgres-processes.js"
 
 const { Pool } = pg
 
@@ -22,6 +26,7 @@ function benchmarkOptions(
     physicalPartitions: 1,
     poolSize: 8,
     workflows: 6,
+    workflowOffset: 0,
     workers: 2,
     shards: 2,
     activationConcurrency: 2,
@@ -90,6 +95,18 @@ describeIfPostgres("Postgres benchmark", () => {
   it("supports feature-isolation modes and validates mode flags", async () => {
     expect(() => parsePostgresBenchmarkArgs(["--mode", "fast"]))
       .toThrow("--mode must be mixed, bare, activity, signal, timer, or child")
+    expect(parsePostgresBenchmarkArgs([
+      "--workflow-offset",
+      "5",
+      "--dispatch-shards",
+      "0,1",
+      "--workflow-shards",
+      "1",
+    ])).toMatchObject({
+      workflowOffset: 5,
+      dispatchShardIds: [0, 1],
+      workflowShardIds: [1],
+    })
 
     const result = await runPostgresBenchmark(
       benchmarkOptions({
@@ -102,5 +119,33 @@ describeIfPostgres("Postgres benchmark", () => {
     expect(result.completedWorkflows).toBe(4)
     expect(result.expectedActivations).toBe(4)
     expect(result.activations).toBe(4)
+  })
+
+  it("aggregates multi-process benchmark results", async () => {
+    const result = await runPostgresMultiProcessBenchmark(
+      parsePostgresMultiProcessBenchmarkArgs([
+        "--mode",
+        "bare",
+        "--workflows",
+        "4",
+        "--processes",
+        "2",
+        "--workers-per-process",
+        "1",
+        "--shards-per-process",
+        "1",
+        "--pool-size-per-process",
+        "4",
+        "--max-rounds",
+        "50",
+        "--connection-string",
+        connectionString!,
+      ]),
+    )
+    expect(result.backend).toBe("postgres-multiprocess")
+    expect(result.mode).toBe("bare")
+    expect(result.completedWorkflows).toBe(4)
+    expect(result.activations).toBe(4)
+    expect(result.processResults).toHaveLength(2)
   })
 })

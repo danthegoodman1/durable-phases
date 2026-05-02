@@ -1091,33 +1091,23 @@ checkpoint commit. A future SQLite shard-file outbox/inbox handoff could relax
 that restriction.
 
 The TypeScript Postgres provider uses a pooled `pg` client, explicit
-transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
-conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
-pending/ready paths, statement and lock timeouts, and an advisory transaction
-lock for concurrent schema initialization. Current projections live in
-`workflow_state`, compact execution records are appended to `workflow_history`,
-and ready work is stored in a denormalized live `tasks` table with execution
-snapshots and shard-epoch ownership. The normal claim path can return
-execution-ready snapshots without a follow-up state read and without
-per-activation heartbeats on the checkpoint-local path.
-Successful checkpoint commits delete the old sequence's live tasks and insert
-only the next live tasks. Provider startup must not rebuild or rewrite live
-ready indexes; readiness is maintained transactionally by instance creation,
-signal append, child completion/cancel, failure retry recording, and checkpoint
-commits.
+transactions, row locks, JSONB journal/snapshot payloads, statement and lock
+timeouts, and shard-epoch ownership. It uses the same shared shard-owned
+append/replay engine as SQLite: each logical shard has a current in-memory
+projection, a durable `shard_journal`, and periodic `shard_snapshots`. Shard
+mutations lock the shard head row, catch up from the journal, apply the shared
+engine mutation, append one fenced journal entry, and optionally write a
+snapshot. Postgres is not the task scheduler in this mode; the hot path does
+not depend on SQL ready scans, task joins, or activation-lease writes for normal
+checkpoint-local work.
 
 Future shard-native providers, including Cassandra, FoundationDB, or a richer
-SQLite shard-file handoff layer, should keep each shard's hot state local and
-use durable outbox/inbox handoff for cross-shard work instead of relying on
-cross-shard transactions in the hot path.
-
-Postgres also maintains shard-routed `outbox` and `inbox` tables. Child-start
-messages are appended with the parent commit and delivered idempotently to the
-target shard inbox. Checkpoint child starts do not write target child
-`workflow_state` or `tasks` directly; the target shard owner materializes the
-child from the inbox record. Child completion and child cancellation also flow
-through outbox/inbox messages, so cross-shard child work stays shard-local and
-idempotent. Existing local child APIs remain unchanged.
+SQLite/Postgres distributed child handoff layer, should keep each shard's hot
+state local and use durable outbox/inbox handoff for cross-shard work instead
+of relying on cross-shard transactions in the hot path. The current TypeScript
+append-store providers keep local child workflow IDs shard-affine by default
+and reject explicit cross-shard local child IDs until that handoff is added
+deliberately.
 
 ### Shard task claiming
 
