@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { SqliteDurabilityProvider } from "../src/durable.js"
+import { SqliteDurabilityProvider, SqliteShardFileDurabilityProvider } from "../src/durable.js"
 import { describeDurabilityProviderConformance } from "../src/testing/conformance.js"
 
 describeDurabilityProviderConformance({
@@ -12,6 +12,28 @@ describeDurabilityProviderConformance({
     return {
       createProvider() {
         const provider = new SqliteDurabilityProvider(path)
+        return {
+          provider,
+          close: () => provider.close(),
+        }
+      },
+      async cleanup() {
+        await rm(dir, { force: true, maxRetries: 3, recursive: true, retryDelay: 10 })
+      },
+    }
+  },
+})
+
+describeDurabilityProviderConformance({
+  name: "SqliteShardFileDurabilityProvider",
+  async createStore() {
+    const dir = await mkdtemp(join(tmpdir(), "durable-poc-conformance-"))
+    return {
+      createProvider() {
+        const provider = new SqliteShardFileDurabilityProvider({
+          directory: join(dir, "shards"),
+          shardCount: 1,
+        })
         return {
           provider,
           close: () => provider.close(),

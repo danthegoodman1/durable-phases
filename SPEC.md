@@ -1066,13 +1066,27 @@ owner.
 Small or embedded providers may omit explicit shard leasing and poll directly.
 They must still preserve equivalent claim fencing and checkpoint-CAS invariants.
 
-The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`,
+The TypeScript SQLite providers use WAL mode, foreign keys, `busy_timeout`,
 and `synchronous=FULL`. File-backed SQLite stores are the crash-durable SQLite
 mode. In-memory SQLite stores may be useful for tests and local experiments, but
-they are not crash-durable. Its normal hot path uses shard-owned live `tasks`,
-`dispatch_shards.lease_epoch`, compact `workflow_history`, and batched task
-claim/commit transactions; the older ready-event/activation-lease tables are
-compatibility/debug support rather than the primary work-discovery path.
+they are not crash-durable.
+
+The default `SqliteDurabilityProvider` stores all dispatch shards in one SQLite
+file. `SqliteShardFileDurabilityProvider` stores each dispatch shard in its own
+SQLite file under one provider directory, so separate workers or Node processes
+can own disjoint shard ranges and write different files concurrently. Both
+SQLite providers use shard-owned live `tasks`, `dispatch_shards.lease_epoch`,
+compact `workflow_history`, and batched task claim/commit transactions; the
+older ready-event/activation-lease tables are compatibility/debug support rather
+than the primary work-discovery path.
+
+Because SQLite shard files do not have cross-file transactions, checkpoint-local
+child starts must remain on the parent shard in `SqliteShardFileDurabilityProvider`.
+The runtime's default child workflow IDs are deterministic and shard-affine for
+the configured shard count. If a caller supplies an explicit local child
+workflow ID that hashes to a different shard, the shard-file provider rejects the
+checkpoint commit. A future SQLite shard-file outbox/inbox handoff could relax
+that restriction.
 
 The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
@@ -1090,9 +1104,9 @@ ready indexes; readiness is maintained transactionally by instance creation,
 signal append, child completion/cancel, failure retry recording, and checkpoint
 commits.
 
-Future shard-native providers, including a true shard-file SQLite mode,
-Cassandra, or FoundationDB, should keep each shard's hot state local and use
-durable outbox/inbox handoff for cross-shard work instead of relying on
+Future shard-native providers, including Cassandra, FoundationDB, or a richer
+SQLite shard-file handoff layer, should keep each shard's hot state local and
+use durable outbox/inbox handoff for cross-shard work instead of relying on
 cross-shard transactions in the hot path.
 
 Postgres also maintains shard-routed `outbox` and `inbox` tables. Child-start

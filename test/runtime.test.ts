@@ -21,6 +21,7 @@ import {
   phase,
   query,
   signal,
+  SqliteShardFileDurabilityProvider,
   SqliteDurabilityProvider,
   start,
   stay,
@@ -669,6 +670,16 @@ function dispatchShardIdsForWorker(
   return shardIds
 }
 
+function workflowIdForDifferentShard(prefix: string, excludedShard: number, shardCount: number): string {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const workflowId = `${prefix}-${attempt}`
+    if (workflowPartitionShard(workflowId, "run-1", shardCount) !== excludedShard) {
+      return workflowId
+    }
+  }
+  throw new Error(`Could not find workflow id outside shard ${excludedShard}`)
+}
+
 describe("durable workflow PoC", () => {
   it("emits runtime and provider observability without high-cardinality metric tags", async () => {
     const path = await storePath()
@@ -1013,6 +1024,141 @@ describe("durable workflow PoC", () => {
     expect(sqlitePragma(provider, "synchronous")).toBe(2)
     expect(sqlitePragma(provider, "fullfsync")).toBe(0)
     expect(sqlitePragma(provider, "checkpoint_fullfsync")).toBe(0)
+  })
+
+  it("keeps default checkpoint children shard-local with SQLite shard files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "durable-poc-shard-files-"))
+    testStoreDirs.add(dir)
+    const provider = new SqliteShardFileDurabilityProvider({
+      directory: join(dir, "shards"),
+      shardCount: 4,
+    })
+
+    const ChildWorkflow = defineWorkflow({
+      name: "sqlite_shard_file_default_child",
+      version: 1,
+      input: z.object({ value: z.number() }),
+      output: z.object({ value: z.number() }),
+      common: z.object({ value: z.number() }),
+      initial(input) {
+        return start({ common: { value: input.value }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: ({ common }) => complete({ value: common.value }),
+        }),
+      },
+    })
+
+    const ParentWorkflow = defineWorkflow({
+      name: "sqlite_shard_file_default_parent",
+      version: 1,
+      input: z.object({ value: z.number() }),
+      output: z.object({ childWorkflowId: z.string() }),
+      common: z.object({ value: z.number() }),
+      initial(input) {
+        return start({ common: { value: input.value }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            const handle = await ctx.child.start("child", ChildWorkflow, { value: common.value })
+            return go("waiting", { handle })
+          },
+        }),
+        waiting: phase({
+          state: z.object({ handle: z.any() }),
+          on: {
+            child_done: child(
+              ({ data }) => data.handle,
+              ({ data }) => complete({ childWorkflowId: data.handle.workflowId }),
+            ),
+          },
+        }),
+      },
+    })
+
+    try {
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "sqlite-shard-file-worker",
+        shardCount: 4,
+        dispatchShardIds: [0, 1, 2, 3],
+      })
+      const ref = await runtime.start(ParentWorkflow, { value: 7 }, { workflowId: "sqlite-shard-file-parent" })
+      await runtime.drain({ maxActivations: 8 })
+      const parent = await provider.loadInstance(ref)
+      expect(parent).toMatchObject({ status: "completed" })
+      const output = parent?.output as { childWorkflowId?: string } | undefined
+      expect(output?.childWorkflowId).toBeDefined()
+      expect(workflowPartitionShard(output!.childWorkflowId!, "run-1", 4)).toBe(
+        workflowPartitionShard(ref.workflowId, ref.runId, 4),
+      )
+    } finally {
+      provider.close()
+    }
+  })
+
+  it("rejects explicit cross-shard checkpoint children with SQLite shard files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "durable-poc-shard-files-"))
+    testStoreDirs.add(dir)
+    const provider = new SqliteShardFileDurabilityProvider({
+      directory: join(dir, "shards"),
+      shardCount: 4,
+    })
+
+    const ChildWorkflow = defineWorkflow({
+      name: "sqlite_shard_file_cross_child",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: () => complete({ ok: true }),
+        }),
+      },
+    })
+
+    const ParentWorkflow = defineWorkflow({
+      name: "sqlite_shard_file_cross_parent",
+      version: 1,
+      input: z.object({ childWorkflowId: z.string() }),
+      output: z.object({ ok: z.boolean() }),
+      initial(input) {
+        return start({ phase: "run", data: { childWorkflowId: input.childWorkflowId } })
+      },
+      phases: {
+        run: phase({
+          state: z.object({ childWorkflowId: z.string() }),
+          run: async ({ ctx, data }) => {
+            await ctx.child.start("child", ChildWorkflow, {}, { workflowId: data.childWorkflowId })
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+
+    try {
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "sqlite-shard-file-cross-worker",
+        shardCount: 4,
+        dispatchShardIds: [0, 1, 2, 3],
+      })
+      const parentWorkflowId = "sqlite-shard-file-cross-parent"
+      const parentShard = workflowPartitionShard(parentWorkflowId, "run-1", 4)
+      const childWorkflowId = workflowIdForDifferentShard("sqlite-shard-file-cross-child", parentShard, 4)
+      await runtime.start(ParentWorkflow, { childWorkflowId }, { workflowId: parentWorkflowId })
+
+      await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow(
+        "SQLite shard-file provider requires local child workflows to stay on parent shard",
+      )
+    } finally {
+      provider.close()
+    }
   })
 
   it("validates activation concurrency and activation limits", async () => {

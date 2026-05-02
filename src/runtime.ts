@@ -1705,7 +1705,15 @@ export class DurableRuntime {
           const startCommand = childWorkflow.initial(parsedInput)
           const now = activationTime
           const childWorkflowId =
-            options.workflowId ?? `${instance.workflowId}__${instance.sequence}__${safeId(key)}`
+            options.workflowId ??
+            defaultChildWorkflowId(
+              instance.workflowId,
+              instance.runId,
+              instance.sequence,
+              key,
+              this.shardCount,
+              instance.partitionShard,
+            )
           const childInstance = this.initialInstance(
             childWorkflow,
             childWorkflowId,
@@ -2779,6 +2787,27 @@ function errorFromSerialized(error: { message: string; name?: string; stack?: st
 
 function addMs(isoValue: string, ms: number): string {
   return new Date(new Date(isoValue).getTime() + ms).toISOString()
+}
+
+function defaultChildWorkflowId(
+  parentWorkflowId: string,
+  parentRunId: string,
+  sequence: number,
+  key: string,
+  shardCount: number,
+  parentShard: number,
+): string {
+  const base = `${parentWorkflowId}__${sequence}__${safeId(key)}`
+  if (workflowPartitionShard(base, "run-1", shardCount) === parentShard) {
+    return base
+  }
+  for (let attempt = 1; attempt <= 10_000; attempt += 1) {
+    const candidate = `${base}__shard_${attempt}`
+    if (workflowPartitionShard(candidate, "run-1", shardCount) === parentShard) {
+      return candidate
+    }
+  }
+  throw new Error(`Could not find shard-affine child workflow id for ${parentWorkflowId}/${parentRunId}/${key}`)
 }
 
 function earliestIso(...values: Array<string | undefined>): string | undefined {
