@@ -76,7 +76,13 @@ describeIfPostgres("Postgres benchmark", () => {
       ...(result.queryProfile?.topByCount ?? []),
       ...(result.queryProfile?.topByTotal ?? []),
     ].map((entry) => entry.sql).join("\n")
+    const processingSql = [
+      ...(result.queryProfile?.topProcessingByCount ?? []),
+      ...(result.queryProfile?.topProcessingByTotal ?? []),
+    ].map((entry) => entry.sql)
     expect(profileSql).not.toContain("SELECT input.activation_id, i.*")
+    expect(processingSql).not.toContain("BEGIN")
+    expect(processingSql).not.toContain("COMMIT")
     expect(result.diagnostics?.sampleCount).toBeGreaterThan(0)
     expect(result.diagnostics?.databaseDelta?.xact_commit).toBeGreaterThan(0)
 

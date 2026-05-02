@@ -85,6 +85,11 @@ type SnapshotRow = {
   snapshot_json: unknown
 }
 
+type AppendFence = {
+  workerId: string
+  now: string
+}
+
 type DispatchShardRow = {
   owner_id: string | null
   lease_until: Date | string | null
@@ -102,6 +107,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   private readonly observability: DurableObservability
   private readonly projections = new Map<number, ShardProjection>()
   private readonly shardLocks = new Map<number, Promise<void>>()
+  private readonly ensuredShardHeads = new Set<number>()
   private closed = false
 
   private constructor(options: PostgresDurabilityProviderOptions = {}) {
@@ -149,46 +155,43 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null> {
     this.assertOpen()
-    const lease = await this.withTransaction(async (client) => {
-      await this.ensureShardHead(client, input.shardId)
-      const leaseUntil = addMs(input.now, input.leaseMs)
-      const result = await client.query<{
-        owner_id: string
-        lease_until: Date | string
-        lease_epoch: string | number
-      }>(
-        `
-        INSERT INTO ${this.qSchema()}.dispatch_shards (shard_id, owner_id, lease_until, lease_epoch)
-        VALUES ($1, $2, $3::timestamptz, 1)
-        ON CONFLICT (shard_id) DO UPDATE SET
-          owner_id = EXCLUDED.owner_id,
-          lease_until = EXCLUDED.lease_until,
-          lease_epoch = CASE
-            WHEN ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
-              AND ${this.qSchema()}.dispatch_shards.lease_until IS NOT NULL
-              AND ${this.qSchema()}.dispatch_shards.lease_until > $4::timestamptz
-            THEN ${this.qSchema()}.dispatch_shards.lease_epoch
-            ELSE ${this.qSchema()}.dispatch_shards.lease_epoch + 1
-          END
-        WHERE ${this.qSchema()}.dispatch_shards.owner_id IS NULL
-          OR ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
-          OR ${this.qSchema()}.dispatch_shards.lease_until IS NULL
-          OR ${this.qSchema()}.dispatch_shards.lease_until <= $5::timestamptz
-        RETURNING owner_id, lease_until, lease_epoch
-        `,
-        [input.shardId, input.ownerId, leaseUntil, input.now, input.now],
-      )
-      const row = result.rows[0]
-      if (!row || row.owner_id !== input.ownerId) {
-        return null
-      }
-      return {
-        shardId: input.shardId,
-        ownerId: input.ownerId,
-        leaseUntil: iso(row.lease_until),
-        leaseEpoch: Number(row.lease_epoch),
-      } satisfies ShardLease
-    })
+    await this.ensureShardHeadForShard(input.shardId)
+    const leaseUntil = addMs(input.now, input.leaseMs)
+    const result = await this.query<{
+      owner_id: string
+      lease_until: Date | string
+      lease_epoch: string | number
+    }>(
+      `
+      INSERT INTO ${this.qSchema()}.dispatch_shards (shard_id, owner_id, lease_until, lease_epoch)
+      VALUES ($1, $2, $3::timestamptz, 1)
+      ON CONFLICT (shard_id) DO UPDATE SET
+        owner_id = EXCLUDED.owner_id,
+        lease_until = EXCLUDED.lease_until,
+        lease_epoch = CASE
+          WHEN ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
+            AND ${this.qSchema()}.dispatch_shards.lease_until IS NOT NULL
+            AND ${this.qSchema()}.dispatch_shards.lease_until > $4::timestamptz
+          THEN ${this.qSchema()}.dispatch_shards.lease_epoch
+          ELSE ${this.qSchema()}.dispatch_shards.lease_epoch + 1
+        END
+      WHERE ${this.qSchema()}.dispatch_shards.owner_id IS NULL
+        OR ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
+        OR ${this.qSchema()}.dispatch_shards.lease_until IS NULL
+        OR ${this.qSchema()}.dispatch_shards.lease_until <= $5::timestamptz
+      RETURNING owner_id, lease_until, lease_epoch
+      `,
+      [input.shardId, input.ownerId, leaseUntil, input.now, input.now],
+    )
+    const row = result.rows[0]
+    const lease = !row || row.owner_id !== input.ownerId
+      ? null
+      : {
+          shardId: input.shardId,
+          ownerId: input.ownerId,
+          leaseUntil: iso(row.lease_until),
+          leaseEpoch: Number(row.lease_epoch),
+        } satisfies ShardLease
     if (lease) {
       this.projectionForShard(input.shardId).engine.setShardLease(lease)
       this.providerLog("debug", "provider.shard.claim", {
@@ -475,20 +478,33 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     input: ClaimShardTasksInput
   }): Promise<ClaimShardTasksResult> {
     return this.withShardLock(input.shardId, async () => {
-      await this.withTransaction(async (client) => {
-        await this.ensureShardHead(client, input.shardId)
-        await this.catchUpShardInClient(client, input.shardId, this.projectionForShard(input.shardId))
-      })
       try {
-        const result = await this.projectionForShard(input.shardId).engine.openShard({
+        const projection = this.projectionForShard(input.shardId)
+        if (!projection.loaded) {
+          await this.catchUpShardUnlocked(input.shardId, { syncLease: true })
+        }
+        const first = await projection.engine.openShard({
           shardId: input.shardId,
           ownerId: input.workerId,
           leaseEpoch: input.leaseEpoch,
         }).claimTasks(input.input)
-        if (result.claims.length > 0) {
+        const claimed = [...first.claims]
+        let nextWakeAt = first.nextWakeAt
+        if (claimed.length < input.input.limit) {
+          await this.catchUpShardUnlocked(input.shardId, { syncLease: false })
+          const remaining = input.input.limit - claimed.length
+          const second = await projection.engine.openShard({
+            shardId: input.shardId,
+            ownerId: input.workerId,
+            leaseEpoch: input.leaseEpoch,
+          }).claimTasks({ ...input.input, limit: remaining })
+          claimed.push(...second.claims)
+          nextWakeAt = earliestIso(nextWakeAt, second.nextWakeAt)
+        }
+        if (claimed.length > 0) {
           this.providerLog("debug", "provider.activation.claim", {
             workerId: input.workerId,
-            count: result.claims.length,
+            count: claimed.length,
             status: "success",
           })
           this.providerCount("durable.provider.activation", {
@@ -496,7 +512,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
             status: "claimed",
           })
         }
-        return result
+        return nextWakeAt ? { claims: claimed, nextWakeAt } : { claims: claimed }
       } catch (error) {
         if (error instanceof Error && /Lost shard lease/.test(error.message)) {
           return { claims: [] }
@@ -507,20 +523,18 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   }
 
   async heartbeatShard(input: HeartbeatDispatchShardInput): Promise<void> {
-    const row = await this.withTransaction(async (client) => {
-      const result = await client.query<DispatchShardRow>(
-        `
-        UPDATE ${this.qSchema()}.dispatch_shards
-        SET lease_until = $1::timestamptz
-        WHERE shard_id = $2
-          AND owner_id = $3
-          AND lease_until >= $4::timestamptz
-        RETURNING owner_id, lease_until, lease_epoch
-        `,
-        [addMs(input.now, input.leaseMs), input.shardId, input.ownerId, input.now],
-      )
-      return result.rows[0]
-    })
+    const result = await this.query<DispatchShardRow>(
+      `
+      UPDATE ${this.qSchema()}.dispatch_shards
+      SET lease_until = $1::timestamptz
+      WHERE shard_id = $2
+        AND owner_id = $3
+        AND lease_until >= $4::timestamptz
+      RETURNING owner_id, lease_until, lease_epoch
+      `,
+      [addMs(input.now, input.leaseMs), input.shardId, input.ownerId, input.now],
+    )
+    const row = result.rows[0]
     if (!row) {
       this.projectionForShard(input.shardId).engine.clearShardLease(input.shardId)
       throw new Error(`Lost dispatch shard lease: ${input.shardId}`)
@@ -534,16 +548,14 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   }
 
   async releaseShard(input: ReleaseDispatchShardInput): Promise<void> {
-    await this.withTransaction(async (client) => {
-      await client.query(
-        `
-        UPDATE ${this.qSchema()}.dispatch_shards
-        SET owner_id = NULL, lease_until = NULL
-        WHERE shard_id = $1 AND owner_id = $2
-        `,
-        [input.shardId, input.ownerId],
-      )
-    })
+    await this.query(
+      `
+      UPDATE ${this.qSchema()}.dispatch_shards
+      SET owner_id = NULL, lease_until = NULL
+      WHERE shard_id = $1 AND owner_id = $2
+      `,
+      [input.shardId, input.ownerId],
+    )
     this.projectionForShard(input.shardId).engine.clearShardLease(input.shardId)
   }
 
@@ -745,66 +757,93 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     options: { shouldAppend?: (result: T) => boolean } = {},
   ): Promise<T> {
     return this.withShardLock(shardId, async () => {
-      try {
-        return await this.withTransaction(async (client) => {
-          await this.ensureShardHead(client, shardId)
-          const head = await this.lockShardHead(client, shardId)
-          const projection = this.projectionForShard(shardId)
-          await this.catchUpShardInClient(client, shardId, projection)
-          if (projection.appliedEntryId !== head) {
-            throw new Error(
-              `Postgres shard ${shardId} projection is inconsistent: head=${head} applied=${projection.appliedEntryId}`,
-            )
-          }
-          const result = await apply()
-          if (options.shouldAppend?.(result) ?? true) {
-            const nextEntryId = head + 1
-            await client.query(
-              `
-              INSERT INTO ${this.journalTableForShard(shardId)}
-                (shard_id, entry_id, operation_json, created_at)
-              VALUES ($1, $2, $3::jsonb, $4::timestamptz)
-              `,
-              [shardId, nextEntryId, encodeJson(operation), operationTime(operation)],
-            )
-            await client.query(
-              `
-              UPDATE ${this.headTableForShard(shardId)}
-              SET last_entry_id = $2, updated_at = $3::timestamptz
-              WHERE shard_id = $1
-              `,
-              [shardId, nextEntryId, operationTime(operation)],
-            )
-            projection.appliedEntryId = nextEntryId
-            if (
-              this.snapshotInterval > 0 &&
-              nextEntryId > 0 &&
-              nextEntryId % this.snapshotInterval === 0
-            ) {
-              await this.writeSnapshot(client, shardId, projection)
-            }
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const projection = this.projectionForShard(shardId)
+        if (!projection.loaded) {
+          await this.catchUpShardUnlocked(shardId, { syncLease: true })
+        }
+        const baseEntryId = projection.appliedEntryId
+        let result: T
+        try {
+          result = await apply()
+        } catch (error) {
+          throw error
+        }
+        if (!(options.shouldAppend?.(result) ?? true)) {
+          return result
+        }
+        const append = await this.appendJournalCas(
+          shardId,
+          baseEntryId,
+          operation,
+          appendFence(operation),
+        ).catch((error) => {
+          this.resetProjection(shardId)
+          throw error
+        })
+        if (append.appended) {
+          projection.appliedEntryId = append.entryId
+          if (
+            this.snapshotInterval > 0 &&
+            append.entryId > 0 &&
+            append.entryId % this.snapshotInterval === 0
+          ) {
+            await this.writeSnapshotForShard(shardId, projection)
           }
           return result
-        })
-      } catch (error) {
-        throw error
+        }
+        this.resetProjection(shardId)
       }
+      await this.catchUpShardUnlocked(shardId, { syncLease: true })
+      const projection = this.projectionForShard(shardId)
+      const baseEntryId = projection.appliedEntryId
+      const result = await apply()
+      if (!(options.shouldAppend?.(result) ?? true)) {
+        return result
+      }
+      const append = await this.appendJournalCas(shardId, baseEntryId, operation, appendFence(operation))
+      if (!append.appended) {
+        this.resetProjection(shardId)
+        throw new Error(`Postgres shard ${shardId} append conflicted after retry`)
+      }
+      projection.appliedEntryId = append.entryId
+      if (
+        this.snapshotInterval > 0 &&
+        append.entryId > 0 &&
+        append.entryId % this.snapshotInterval === 0
+      ) {
+        await this.writeSnapshotForShard(shardId, projection)
+      }
+      return result
     })
   }
 
   private async catchUpShard(shardId: number): Promise<void> {
     await this.withShardLock(shardId, async () => {
+      await this.catchUpShardUnlocked(shardId, { syncLease: true })
+    })
+  }
+
+  private async catchUpShardUnlocked(
+    shardId: number,
+    options: { syncLease?: boolean } = {},
+  ): Promise<void> {
+    if (this.needsLocalSettings()) {
       await this.withTransaction(async (client) => {
         await this.ensureShardHead(client, shardId)
-        await this.catchUpShardInClient(client, shardId, this.projectionForShard(shardId))
+        await this.catchUpShardInClient(client, shardId, this.projectionForShard(shardId), options)
       })
-    })
+      return
+    }
+    await this.ensureShardHead(this.pool, shardId)
+    await this.catchUpShardInClient(this.pool, shardId, this.projectionForShard(shardId), options)
   }
 
   private async catchUpShardInClient(
     client: Queryable,
     shardId: number,
     projection: ShardProjection,
+    options: { syncLease?: boolean } = {},
   ): Promise<void> {
     if (!projection.loaded) {
       projection.engine.close()
@@ -838,7 +877,61 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       await applyJournalOperation(projection.engine, decodeJson<JournalOperation>(row.operation_json))
       projection.appliedEntryId = Number(row.entry_id)
     }
-    await this.syncShardLease(client, shardId, projection)
+    if (options.syncLease ?? true) {
+      await this.syncShardLease(client, shardId, projection)
+    }
+  }
+
+  private async appendJournalCas(
+    shardId: number,
+    expectedEntryId: number,
+    operation: JournalOperation,
+    fence?: AppendFence,
+  ): Promise<{ appended: boolean; entryId: number }> {
+    const entryId = expectedEntryId + 1
+    const createdAt = operationTime(operation)
+    const params: unknown[] = [
+      shardId,
+      expectedEntryId,
+      entryId,
+      encodeJson(operation),
+      createdAt,
+    ]
+    const fenceSql = fence
+      ? `AND EXISTS (
+          SELECT 1
+          FROM ${this.qSchema()}.dispatch_shards ds
+          WHERE ds.shard_id = $1
+            AND ds.owner_id = $6
+            AND ds.lease_until >= $7::timestamptz
+        )`
+      : ""
+    if (fence) {
+      params.push(fence.workerId, fence.now)
+    }
+    const append = await this.query<{ entry_id: string | number }>(
+      `
+      WITH updated_head AS (
+        UPDATE ${this.headTableForShard(shardId)}
+        SET last_entry_id = $3, updated_at = $5::timestamptz
+        WHERE shard_id = $1
+          AND last_entry_id = $2
+          ${fenceSql}
+        RETURNING last_entry_id
+      ),
+      inserted AS (
+        INSERT INTO ${this.journalTableForShard(shardId)}
+          (shard_id, entry_id, operation_json, created_at)
+        SELECT $1, $3, $4::jsonb, $5::timestamptz
+        FROM updated_head
+        RETURNING entry_id
+      )
+      SELECT entry_id FROM inserted
+      `,
+      params,
+    )
+    const result = append.rows[0]
+    return result ? { appended: true, entryId: Number(result.entry_id) } : { appended: false, entryId }
   }
 
   private async catchUpAllShards(): Promise<void> {
@@ -952,6 +1045,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   }
 
   private async ensureShardHead(client: Queryable, shardId: number): Promise<void> {
+    if (this.ensuredShardHeads.has(shardId)) {
+      return
+    }
     await client.query(
       `
       INSERT INTO ${this.headTableForShard(shardId)} (shard_id, last_entry_id, updated_at)
@@ -960,23 +1056,22 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `,
       [shardId],
     )
+    this.ensuredShardHeads.add(shardId)
   }
 
-  private async lockShardHead(client: PoolClient, shardId: number): Promise<number> {
-    const result = await client.query<{ last_entry_id: string | number }>(
+  private async ensureShardHeadForShard(shardId: number): Promise<void> {
+    if (this.ensuredShardHeads.has(shardId)) {
+      return
+    }
+    await this.query(
       `
-      SELECT last_entry_id
-      FROM ${this.headTableForShard(shardId)}
-      WHERE shard_id = $1
-      FOR UPDATE
+      INSERT INTO ${this.headTableForShard(shardId)} (shard_id, last_entry_id, updated_at)
+      VALUES ($1, 0, now())
+      ON CONFLICT (shard_id) DO NOTHING
       `,
       [shardId],
     )
-    const row = result.rows[0]
-    if (!row) {
-      throw new Error(`Missing shard head: ${shardId}`)
-    }
-    return Number(row.last_entry_id)
+    this.ensuredShardHeads.add(shardId)
   }
 
   private async writeSnapshot(
@@ -996,6 +1091,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `,
       [shardId, projection.appliedEntryId, encodeJson(projection.engine.snapshot())],
     )
+  }
+
+  private async writeSnapshotForShard(shardId: number, projection: ShardProjection): Promise<void> {
+    if (this.needsLocalSettings()) {
+      await this.withTransaction(async (client) => {
+        await this.writeSnapshot(client, shardId, projection)
+      })
+      return
+    }
+    await this.writeSnapshot(this.pool, shardId, projection)
   }
 
   private async syncShardLease(
@@ -1063,6 +1168,20 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     } finally {
       client.release()
     }
+  }
+
+  private async query<T extends pg.QueryResultRow = pg.QueryResultRow>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<pg.QueryResult<T>> {
+    if (!this.needsLocalSettings()) {
+      return this.pool.query<T>(sql, params)
+    }
+    return this.withTransaction((client) => client.query<T>(sql, params))
+  }
+
+  private needsLocalSettings(): boolean {
+    return this.statementTimeoutMs !== undefined || this.lockTimeoutMs !== undefined
   }
 
   private async withShardLock<T>(shardId: number, fn: () => Promise<T>): Promise<T> {
@@ -1257,6 +1376,29 @@ function normalizeSchemaName(value: string): string {
     throw new Error("PostgresDurabilityProvider schema must be a valid identifier")
   }
   return value
+}
+
+function appendFence(operation: JournalOperation): AppendFence | undefined {
+  switch (operation.op) {
+    case "commitActivations": {
+      const first = operation.input[0]
+      return first ? { workerId: first.workerId, now: first.now } : undefined
+    }
+    case "recordActivationFailures": {
+      const first = operation.input[0]
+      return first ? { workerId: first.workerId, now: first.now } : undefined
+    }
+    case "getOrReserveEffect":
+    case "heartbeatEffect":
+    case "completeEffect":
+    case "failEffect":
+    case "cancelChild":
+      return { workerId: operation.input.workerId, now: operation.input.now }
+    case "createChildInstance":
+      return { workerId: operation.input.workerId, now: operation.input.leaseNow }
+    default:
+      return undefined
+  }
 }
 
 function quoteIdentifier(value: string): string {

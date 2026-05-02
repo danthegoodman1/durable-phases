@@ -1090,16 +1090,16 @@ workflow ID that hashes to a different shard, the shard-file provider rejects th
 checkpoint commit. A future SQLite shard-file outbox/inbox handoff could relax
 that restriction.
 
-The TypeScript Postgres provider uses a pooled `pg` client, explicit
-transactions, row locks, JSONB journal/snapshot payloads, statement and lock
+The TypeScript Postgres provider uses a pooled `pg` client, atomic fenced
+append statements, JSONB journal payloads, text snapshots, statement and lock
 timeouts, and shard-epoch ownership. It uses the same shared shard-owned
 append/replay engine as SQLite: each logical shard has a current in-memory
 projection, a durable `shard_journal`, and periodic `shard_snapshots`. Shard
-mutations lock the shard head row, catch up from the journal, apply the shared
-engine mutation, append one fenced journal entry, and optionally write a
-snapshot. Postgres is not the task scheduler in this mode; the hot path does
-not depend on SQL ready scans, task joins, or activation-lease writes for normal
-checkpoint-local work.
+mutations normally apply against the warm in-memory projection and persist with
+a compare-and-swap append against the shard head; if another writer advanced
+the head, the provider catches up from the journal and retries. Postgres is not
+the task scheduler in this mode; the hot path does not depend on SQL ready
+scans, task joins, or activation-lease writes for normal checkpoint-local work.
 
 Future shard-native providers, including Cassandra, FoundationDB, or a richer
 SQLite/Postgres distributed child handoff layer, should keep each shard's hot

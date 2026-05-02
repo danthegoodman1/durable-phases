@@ -74,9 +74,10 @@ The Compose file defaults to the pinned official image
 `physicalPartitions`, and optional observability sinks. The provider uses the
 same shared append/replay shard engine as SQLite: each logical shard has a
 current in-memory projection, durable journal rows, and periodic snapshots.
-Shard-owner mutations row-lock that shard's head, catch up from the journal,
-apply the shared engine mutation, and append one fenced journal entry. Postgres
-is no longer used as the task scheduler in this path.
+Warm shard-owner mutations apply in memory and persist with one fenced
+compare-and-swap append against the shard head; if another writer advanced the
+head, the provider catches up from the journal and retries. Postgres is no
+longer used as the task scheduler in this path.
 
 `physicalPartitions` is fixed when a schema is created and is persisted in
 provider metadata. Shard journals, shard heads, and snapshots are manually
@@ -122,21 +123,21 @@ append-store shard engine with `synchronous_commit=on`:
 
 | Provider | workload | shape | activation concurrency | prefetch / drain batch | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null in-memory | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 15,010 | 17,421 | 27,873 |
-| Null in-memory | bare, 10k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 4,659 | 15,940 | 15,940 |
-| SQLite WAL/FULL single file | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 2,268 | 2,489 | 3,983 |
-| SQLite WAL/FULL shard files | mixed, 1k workflows | 16 workers / 16 shards | 4 | 32 / 32 | 4,165 | 7,474 | 11,958 |
-| SQLite WAL/FULL shard files | mixed, 4k workflows | 4 processes / 16 shards | 4 | 32 / 32 | 6,130 | 10,128 | 16,205 |
-| Postgres append store | mixed, 1k workflows | 4 workers / 4 shards / 1 partition | 4 | 32 / 32 | 827 | 1,762 | 2,820 |
-| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 1 partition | 4 | 32 / 32 | 1,184 | 5,674 | 9,078 |
-| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 4 partitions | 4 | 32 / 32 | 1,145 | 5,457 | 8,731 |
-| Postgres append store | mixed, 1k workflows | 32 workers / 32 shards / 4 partitions | 4 | 32 / 32 | 1,223 | 5,990 | 9,585 |
-| Postgres append store | mixed, 4k workflows | 4 processes / 16 shards / 4 partitions | 4 | 32 / 32 | 2,384 | 6,632 | 10,611 |
+| Null in-memory | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 14,951 | 17,343 | 27,748 |
+| Null in-memory | bare, 10k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 4,675 | 16,772 | 16,772 |
+| SQLite WAL/FULL single file | mixed, 1k workflows | 4 workers / 4 shards | 4 | 32 / 32 | 2,248 | 2,457 | 3,932 |
+| SQLite WAL/FULL shard files | mixed, 1k workflows | 16 workers / 16 shards | 4 | 32 / 32 | 5,061 | 7,560 | 12,096 |
+| SQLite WAL/FULL shard files | mixed, 4k workflows | 4 processes / 16 shards | 4 | 32 / 32 | 6,358 | 9,997 | 15,995 |
+| Postgres append store | mixed, 1k workflows | 4 workers / 4 shards / 1 partition | 4 | 32 / 32 | 1,321 | 2,000 | 3,200 |
+| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 1 partition | 4 | 32 / 32 | 2,554 | 7,582 | 12,131 |
+| Postgres append store | mixed, 1k workflows | 16 workers / 16 shards / 4 partitions | 4 | 32 / 32 | 2,518 | 7,329 | 11,726 |
+| Postgres append store | mixed, 1k workflows | 32 workers / 32 shards / 4 partitions | 4 | 32 / 32 | 2,612 | 9,667 | 15,468 |
+| Postgres append store | mixed, 4k workflows | 4 processes / 16 shards / 4 partitions | 4 | 32 / 32 | 4,073 | 8,882 | 14,212 |
 
-SQLite profiling on the 100-workflow mixed workload reported about `1.15`
+SQLite profiling on the 100-workflow mixed workload reported about `1.09`
 processing SQL statements per activation. Postgres profiling on the 1k mixed
 workload with 16 workers, 16 shards, and 4 physical partitions reported about
-`2.96` processing SQL statements per activation. Both processing hot paths were
+`0.81` processing SQL statements per activation. Both processing hot paths were
 journal catch-up, journal append, snapshot/head maintenance, and shard lease
 updates; neither used SQL task-discovery joins or ready-table scans.
 

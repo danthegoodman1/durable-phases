@@ -398,7 +398,6 @@ export class DurableRuntime {
     let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
     try {
       if (shardSessions.length > 0) {
-        await this.heartbeatShardSessions(shardSessions)
         dispatchHeartbeat = this.startDispatchShardHeartbeat(shardSessions)
         dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
           kind: "dispatch_heartbeat_failed",
@@ -828,7 +827,6 @@ export class DurableRuntime {
           if (shardSessions.length === 0) {
             shardSessions = await this.claimShardSessions()
             if (shardSessions.length > 0) {
-              await this.heartbeatShardSessions(shardSessions)
               dispatchHeartbeat = this.startDispatchShardHeartbeat(shardSessions)
               dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
                 kind: "dispatch_heartbeat_failed",
