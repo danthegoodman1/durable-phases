@@ -88,6 +88,9 @@ export class NullDurabilityProvider implements DurabilityProvider {
   private readonly signals = new Map<string, SignalRecord>()
   private readonly children = new Map<string, ChildRecord>()
   private readonly tasks = new Map<string, MemoryTask>()
+  private readonly taskIdsByRef = new Map<RefKey, Set<string>>()
+  private readonly taskIdsByShard = new Map<number, Set<string>>()
+  private readonly taskIdsByActivation = new Map<string, Set<string>>()
   private readonly effectsByActivation = new Map<string, EffectRecord[]>()
   private readonly claimedSequenceEpochs = new Map<string, number>()
   private readonly shardLeases = new Map<number, MemoryShardLease>()
@@ -99,6 +102,9 @@ export class NullDurabilityProvider implements DurabilityProvider {
     this.signals.clear()
     this.children.clear()
     this.tasks.clear()
+    this.taskIdsByRef.clear()
+    this.taskIdsByShard.clear()
+    this.taskIdsByActivation.clear()
     this.effectsByActivation.clear()
     this.claimedSequenceEpochs.clear()
     this.shardLeases.clear()
@@ -330,8 +336,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
       throw new Error(`Lost shard lease: ${session.shardId}`)
     }
 
-    const candidates = [...this.tasks.values()]
-      .filter((task) => task.partitionShard === session.shardId)
+    const candidates = [...this.tasksForShard(session.shardId)]
       .filter((task) => task.readyAt <= input.now)
       .filter((task) => !task.blockedUntil || task.blockedUntil <= input.now)
       .filter((task) => {
@@ -360,7 +365,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
       this.claimedSequenceEpochs.set(sequenceKey, lease.leaseEpoch)
       const instance = this.instances.get(refKey(task))
       if (!instance || instance.status !== "running" || instance.sequence !== task.sequence) {
-        this.tasks.delete(task.taskId)
+        this.deleteTask(task.taskId)
         continue
       }
       claims.push({
@@ -619,16 +624,13 @@ export class NullDurabilityProvider implements DurabilityProvider {
   }
 
   private refreshSignalTasksForInstance(instance: PersistedInstance): void {
-    for (const [taskId, task] of this.tasks) {
+    for (const task of this.tasksForRef(instance.workflowId, instance.runId)) {
       if (
-        task.workflowId === instance.workflowId &&
-        task.runId === instance.runId &&
         task.sequence === instance.sequence &&
         task.kind === "event" &&
         task.event?.kind === "signal"
       ) {
-        this.claimedSequenceEpochs.delete(sequenceKeyForTask(task))
-        this.tasks.delete(taskId)
+        this.deleteTask(task.taskId)
       }
     }
     for (const wait of instance.waits) {
@@ -747,7 +749,8 @@ export class NullDurabilityProvider implements DurabilityProvider {
       input.eventId,
     )
     const taskId = input.taskSuffix ? `${activationId}/${input.taskSuffix}` : activationId
-    this.tasks.set(taskId, {
+    this.deleteTask(taskId)
+    const task = {
       taskId,
       activationId,
       workflowName: instance.workflowName,
@@ -762,16 +765,30 @@ export class NullDurabilityProvider implements DurabilityProvider {
       event: clone(input.event),
       readyAt: input.readyAt,
       sortKey: input.sortKey,
-    })
+    }
+    this.tasks.set(taskId, task)
+    addSetValue(this.taskIdsByRef, refKey(task), taskId)
+    addSetValue(this.taskIdsByShard, task.partitionShard, taskId)
+    addSetValue(this.taskIdsByActivation, activationId, taskId)
   }
 
   private deleteTasksForRef(workflowId: string, runId: string): void {
-    for (const [taskId, task] of this.tasks) {
-      if (task.workflowId === workflowId && task.runId === runId) {
-        this.claimedSequenceEpochs.delete(sequenceKeyForTask(task))
-        this.tasks.delete(taskId)
-      }
+    const taskIds = [...(this.taskIdsByRef.get(refKey({ workflowId, runId })) ?? [])]
+    for (const taskId of taskIds) {
+      this.deleteTask(taskId)
     }
+  }
+
+  private deleteTask(taskId: string): void {
+    const task = this.tasks.get(taskId)
+    if (!task) {
+      return
+    }
+    this.claimedSequenceEpochs.delete(sequenceKeyForTask(task))
+    this.tasks.delete(taskId)
+    deleteSetValue(this.taskIdsByRef, refKey(task), taskId)
+    deleteSetValue(this.taskIdsByShard, task.partitionShard, taskId)
+    deleteSetValue(this.taskIdsByActivation, task.activationId, taskId)
   }
 
   private findClaimedTask(
@@ -779,7 +796,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
     workerId: string,
     now: string,
   ): MemoryTask | undefined {
-    return [...this.tasks.values()].find((task) =>
+    return this.tasksForActivation(activationId).find((task) =>
       task.activationId === activationId &&
       task.claimOwnerId === workerId &&
       task.leaseUntil !== undefined &&
@@ -806,10 +823,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
     workflows: Record<string, { version: number }>,
   ): string | undefined {
     const wakeTimes: string[] = []
-    for (const task of this.tasks.values()) {
-      if (task.partitionShard !== shardId) {
-        continue
-      }
+    for (const task of this.tasksForShard(shardId)) {
       const workflow = workflows[task.workflowName]
       if (!workflow || task.workflowVersion > workflow.version) {
         continue
@@ -821,6 +835,24 @@ export class NullDurabilityProvider implements DurabilityProvider {
       }
     }
     return wakeTimes.sort()[0]
+  }
+
+  private tasksForShard(shardId: number): MemoryTask[] {
+    return [...(this.taskIdsByShard.get(shardId) ?? [])]
+      .map((taskId) => this.tasks.get(taskId))
+      .filter((task): task is MemoryTask => task !== undefined)
+  }
+
+  private tasksForRef(workflowId: string, runId: string): MemoryTask[] {
+    return [...(this.taskIdsByRef.get(refKey({ workflowId, runId })) ?? [])]
+      .map((taskId) => this.tasks.get(taskId))
+      .filter((task): task is MemoryTask => task !== undefined)
+  }
+
+  private tasksForActivation(activationId: string): MemoryTask[] {
+    return [...(this.taskIdsByActivation.get(activationId) ?? [])]
+      .map((taskId) => this.tasks.get(taskId))
+      .filter((task): task is MemoryTask => task !== undefined)
   }
 
   private validateChildStarts(input: {
@@ -1242,6 +1274,26 @@ function compareTasks(left: MemoryTask, right: MemoryTask): number {
 
 function refKey(ref: { workflowId: string; runId: string }): RefKey {
   return `${ref.workflowId}\0${ref.runId}`
+}
+
+function addSetValue<K>(map: Map<K, Set<string>>, key: K, value: string): void {
+  const existing = map.get(key)
+  if (existing) {
+    existing.add(value)
+  } else {
+    map.set(key, new Set([value]))
+  }
+}
+
+function deleteSetValue<K>(map: Map<K, Set<string>>, key: K, value: string): void {
+  const existing = map.get(key)
+  if (!existing) {
+    return
+  }
+  existing.delete(value)
+  if (existing.size === 0) {
+    map.delete(key)
+  }
 }
 
 function sequenceKeyForTask(task: Pick<MemoryTask, "workflowId" | "runId" | "sequence">): string {

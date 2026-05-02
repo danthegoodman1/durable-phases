@@ -134,7 +134,8 @@ describe("Null durability benchmark", () => {
       batch: 7,
       json: true,
     })
-    expect(() => parseNullBenchmarkArgs(["--mode", "fast"])).toThrow("--mode must be mixed or bare")
+    expect(() => parseNullBenchmarkArgs(["--mode", "fast"]))
+      .toThrow("--mode must be mixed, bare, activity, signal, timer, or child")
     expect(() => parseNullBenchmarkArgs(["--workflows", "0"])).toThrow("--workflows must be a positive integer")
     expect(() => parseNullBenchmarkArgs(["--workflow-offset", "-1"])).toThrow("--workflow-offset must be a non-negative integer")
     expect(() => parseNullBenchmarkArgs(["--wat"])).toThrow("Unknown benchmark option")
@@ -158,6 +159,23 @@ describe("Null durability benchmark", () => {
     expect(result.counters.workflowStarts).toBe(7)
     expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
   })
+
+  it.each(["activity", "signal", "timer", "child"] as const)(
+    "runs %s feature isolation mode",
+    async (mode) => {
+      const result = await runNullBenchmark(benchmarkOptions({
+        mode,
+        workflows: 4,
+        workflowOffset: 10,
+      }))
+
+      expect(result.backend).toBe("null")
+      expect(result.mode).toBe(mode)
+      expect(result.completedWorkflows).toBe(4)
+      expect(result.activations).toBe(result.expectedActivations)
+      expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
+    },
+  )
 
   it("parses multi-process benchmark options and rejects invalid flags", () => {
     expect(parseNullMultiProcessBenchmarkArgs([
@@ -192,7 +210,7 @@ describe("Null durability benchmark", () => {
     expect(() => parseNullMultiProcessBenchmarkArgs(["--processes", "0"]))
       .toThrow("--processes must be a positive integer")
     expect(() => parseNullMultiProcessBenchmarkArgs(["--mode", "wat"]))
-      .toThrow("--mode must be mixed or bare")
+      .toThrow("--mode must be mixed, bare, activity, signal, timer, or child")
   })
 
   it("requires shard ownership before claiming tasks", async () => {

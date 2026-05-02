@@ -313,10 +313,17 @@ function aggregateCounters(counters: BenchmarkCounters[]): BenchmarkCounters {
 }
 
 function parseMode(value: string, flag: string): NullBenchmarkMode {
-  if (value === "mixed" || value === "bare") {
+  if (
+    value === "mixed" ||
+    value === "bare" ||
+    value === "activity" ||
+    value === "signal" ||
+    value === "timer" ||
+    value === "child"
+  ) {
     return value
   }
-  throw new Error(`${flag} must be mixed or bare`)
+  throw new Error(`${flag} must be mixed, bare, activity, signal, timer, or child`)
 }
 
 function parsePositiveInteger(value: string, flag: string): number {
@@ -346,7 +353,7 @@ Launches multiple subprocesses running the benchmark-only null provider and
 aggregates their throughput.
 
 Options:
-  --mode <mixed|bare>
+  --mode <mixed|bare|activity|signal|timer|child>
                     Workload mode. Default: ${defaultOptions.mode}
   --workflows <n>   Total root workflow count split across processes. Default: ${defaultOptions.workflows}
   --processes <n>   Subprocess count. Default: ${defaultOptions.processes}

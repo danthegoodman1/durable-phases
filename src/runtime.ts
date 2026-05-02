@@ -192,10 +192,15 @@ class ActivationCommitBatcher {
       return
     }
     this.scheduled = true
-    const timer = setTimeout(() => {
+    const flush = () => {
       this.scheduled = false
       void this.flush()
-    }, this.maxDelayMs)
+    }
+    if (this.maxDelayMs === 0) {
+      queueMicrotask(flush)
+      return
+    }
+    setTimeout(flush, this.maxDelayMs)
   }
 
   private async flush(): Promise<void> {

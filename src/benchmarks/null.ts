@@ -3,10 +3,15 @@ import { pathToFileURL } from "node:url"
 import { z } from "zod"
 import { DurableRuntime } from "../runtime.js"
 import {
+  child,
   complete,
   defineWorkflow,
+  go,
   phase,
+  signal,
   start,
+  timer,
+  type AnyWorkflow,
   type JsonValue,
 } from "../workflow.js"
 import type { PersistedInstance } from "../interface.js"
@@ -21,7 +26,7 @@ import {
 } from "./workload.js"
 import { NullDurabilityProvider } from "./null-provider.js"
 
-export type NullBenchmarkMode = "mixed" | "bare"
+export type NullBenchmarkMode = "mixed" | "bare" | "activity" | "signal" | "timer" | "child"
 
 export type NullBenchmarkOptions = {
   mode: NullBenchmarkMode
@@ -94,12 +99,9 @@ export async function runNullBenchmark(
 ): Promise<NullBenchmarkResult> {
   const counters = createBenchmarkCounters()
   const provider = new NullDurabilityProvider()
-  const workload = options.mode === "mixed"
-    ? (() => {
-        const mixed = createBenchmarkWorkflows(counters, { activityDelayMs: options.activityDelayMs })
-        return { RootWorkflow: mixed.ParentWorkflow, workflows: mixed.workflows }
-      })()
-    : createBareBenchmarkWorkflows()
+  const workload = createNullBenchmarkWorkload(options.mode, counters, {
+    activityDelayMs: options.activityDelayMs,
+  })
   let now = new Date("2026-01-01T00:00:00.000Z")
   const clock = () => now
   const runtimes = Array.from({ length: options.workers }, (_value, workerIndex) =>
@@ -120,7 +122,7 @@ export async function runNullBenchmark(
 
   let rounds = 0
   let activations = 0
-  const expectedActivations = options.workflows * (options.mode === "mixed" ? 5 : 1)
+  const expectedActivations = options.workflows * workload.activationsPerWorkflow
   const activeWorkers = new Set<string>()
   const setupStartedAt = performance.now()
   let setupFinishedAt = setupStartedAt
@@ -136,7 +138,7 @@ export async function runNullBenchmark(
         { workflowId: `${options.mode}-bench-${index}` },
       )
       counters.workflowStarts += 1
-      if (options.mode === "mixed") {
+      if (workload.appendFinishSignal) {
         await runtimes[0]!.signal(
           workload.RootWorkflow,
           ref,
@@ -189,19 +191,9 @@ export async function runNullBenchmark(
       )
     }
 
-    if (options.mode === "mixed") {
-      verifyBenchmarkOutputsForPrefix(
-        instances,
-        options.workflows,
-        options.workflowOffset,
-        "mixed-bench",
-      )
-      verifyBenchmarkCounters(counters, options.workflows)
-    } else {
-      verifyBareBenchmarkOutputs(instances, options.workflows, options.workflowOffset)
-    }
+    workload.verify(instances, options.workflows, options.workflowOffset)
 
-    const mixedActions = options.mode === "mixed" ? mixedActionCount(counters) : activations
+    const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
     const processingMs = processingFinishedAt - processingStartedAt
@@ -285,7 +277,204 @@ export function parseNullBenchmarkArgs(args: string[]): NullBenchmarkOptions {
   return options
 }
 
-function createBareBenchmarkWorkflows() {
+type NullWorkload = {
+  RootWorkflow: AnyWorkflow
+  workflows: AnyWorkflow[]
+  activationsPerWorkflow: number
+  appendFinishSignal: boolean
+  verify(instances: PersistedInstance[], expected: number, offset: number): void
+  actionCount(counters: BenchmarkCounters, activations: number): number
+}
+
+function createNullBenchmarkWorkload(
+  mode: NullBenchmarkMode,
+  counters: BenchmarkCounters,
+  options: { activityDelayMs: number },
+): NullWorkload {
+  if (mode === "mixed") {
+    const mixed = createBenchmarkWorkflows(counters, { activityDelayMs: options.activityDelayMs })
+    return {
+      RootWorkflow: mixed.ParentWorkflow,
+      workflows: mixed.workflows,
+      activationsPerWorkflow: 5,
+      appendFinishSignal: true,
+      verify: (instances, expected, offset) =>
+        verifyBenchmarkOutputsForPrefix(instances, expected, offset, "mixed-bench"),
+      actionCount: (currentCounters) => mixedActionCount(currentCounters),
+    }
+  }
+
+  if (mode === "activity") {
+    const RootWorkflow = defineWorkflow({
+      name: "bench_activity",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number(), activity: z.boolean() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            await ctx.activity("activity", async () => {
+              counters.bootActivities += 1
+              return true
+            })
+            return complete({ index: common.index, activity: true })
+          },
+        }),
+      },
+    })
+    return {
+      RootWorkflow,
+      workflows: [RootWorkflow],
+      activationsPerWorkflow: 1,
+      appendFinishSignal: false,
+      verify: (instances, expected, offset) =>
+        verifySimpleOutputs(instances, expected, offset, "bench_activity", "activity-bench"),
+      actionCount: (currentCounters, activations) => activations + currentCounters.bootActivities,
+    }
+  }
+
+  if (mode === "signal") {
+    const RootWorkflow = defineWorkflow({
+      name: "bench_signal",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number(), signalValue: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({}),
+          on: {
+            finish: signal(z.object({ signalValue: z.number() }), ({ common, event }) =>
+              complete({ index: common.index, signalValue: event.signalValue }),
+            ),
+          },
+        }),
+      },
+    })
+    return {
+      RootWorkflow,
+      workflows: [RootWorkflow],
+      activationsPerWorkflow: 1,
+      appendFinishSignal: true,
+      verify: (instances, expected, offset) =>
+        verifySignalOutputs(instances, expected, offset),
+      actionCount: (currentCounters, activations) => activations + currentCounters.signals,
+    }
+  }
+
+  if (mode === "timer") {
+    const RootWorkflow = defineWorkflow({
+      name: "bench_timer",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number(), fired: z.boolean() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({
+          common: { index: input.index },
+          phase: "waiting",
+          data: { fireAt: "2026-01-01T00:00:00.000Z" },
+        })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ fireAt: z.string() }),
+          on: {
+            due: timer(
+              ({ data }) => data.fireAt,
+              ({ common }) => {
+                counters.timerHandlers += 1
+                return complete({ index: common.index, fired: true })
+              },
+            ),
+          },
+        }),
+      },
+    })
+    return {
+      RootWorkflow,
+      workflows: [RootWorkflow],
+      activationsPerWorkflow: 1,
+      appendFinishSignal: false,
+      verify: (instances, expected, offset) =>
+        verifySimpleOutputs(instances, expected, offset, "bench_timer", "timer-bench"),
+      actionCount: (currentCounters, activations) => activations + currentCounters.timerHandlers,
+    }
+  }
+
+  if (mode === "child") {
+    const ChildWorkflow = defineWorkflow({
+      name: "bench_child_only_child",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ childValue: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: ({ common }) => complete({ childValue: common.index * 10 }),
+        }),
+      },
+    })
+    const RootWorkflow = defineWorkflow({
+      name: "bench_child_only_parent",
+      version: 1,
+      input: z.object({ index: z.number() }),
+      output: z.object({ index: z.number(), childValue: z.number() }),
+      common: z.object({ index: z.number() }),
+      initial(input) {
+        return start({ common: { index: input.index }, phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx, common }) => {
+            const handle = await ctx.child.start("child", ChildWorkflow, { index: common.index })
+            counters.childStarts += 1
+            return go("waiting_child", { handle })
+          },
+        }),
+        waiting_child: phase({
+          state: z.object({ handle: z.any() }),
+          on: {
+            child_done: child(
+              ({ data }) => data.handle,
+              ({ common, event }) => {
+                counters.childCompletions += 1
+                return complete({
+                  index: common.index,
+                  childValue: event.ok ? event.output.childValue : -1,
+                })
+              },
+            ),
+          },
+        }),
+      },
+    })
+    return {
+      RootWorkflow,
+      workflows: [RootWorkflow, ChildWorkflow],
+      activationsPerWorkflow: 3,
+      appendFinishSignal: false,
+      verify: (instances, expected, offset) =>
+        verifyChildOutputs(instances, expected, offset),
+      actionCount: (currentCounters, activations) =>
+        activations + currentCounters.childStarts + currentCounters.childCompletions,
+    }
+  }
+
+  return createBareBenchmarkWorkload()
+}
+
+function createBareBenchmarkWorkload(): NullWorkload {
   const RootWorkflow = defineWorkflow({
     name: "bench_bare",
     version: 1,
@@ -305,6 +494,10 @@ function createBareBenchmarkWorkflows() {
   return {
     RootWorkflow,
     workflows: [RootWorkflow],
+    activationsPerWorkflow: 1,
+    appendFinishSignal: false,
+    verify: verifyBareBenchmarkOutputs,
+    actionCount: (_counters, activations) => activations,
   }
 }
 
@@ -352,6 +545,65 @@ function verifyBenchmarkOutputsForPrefix(
   verifyBenchmarkOutputs(rewritten, expected)
 }
 
+function verifySimpleOutputs(
+  instances: PersistedInstance[],
+  expected: number,
+  offset: number,
+  workflowName: string,
+  workflowIdPrefix: string,
+): void {
+  for (let localIndex = 0; localIndex < expected; localIndex += 1) {
+    const index = offset + localIndex
+    const instance = instances.find((record) => record.workflowId === `${workflowIdPrefix}-${index}`)
+    if (!instance) {
+      throw new Error(`Missing ${workflowName} workflow ${index}`)
+    }
+    if (instance.workflowName !== workflowName || instance.status !== "completed") {
+      throw new Error(`Expected ${workflowName} workflow ${index} to be completed`)
+    }
+    const output = instance.output as { index?: number } | undefined
+    if (output?.index !== index) {
+      throw new Error(`Unexpected output for ${workflowName} workflow ${index}: ${JSON.stringify(output)}`)
+    }
+  }
+}
+
+function verifySignalOutputs(
+  instances: PersistedInstance[],
+  expected: number,
+  offset: number,
+): void {
+  for (let localIndex = 0; localIndex < expected; localIndex += 1) {
+    const index = offset + localIndex
+    const instance = instances.find((record) => record.workflowId === `signal-bench-${index}`)
+    if (!instance || instance.status !== "completed") {
+      throw new Error(`Expected signal workflow ${index} to be completed`)
+    }
+    const output = instance.output as { index?: number; signalValue?: number } | undefined
+    if (output?.index !== index || output.signalValue !== index + 1_000) {
+      throw new Error(`Unexpected signal output ${index}: ${JSON.stringify(output)}`)
+    }
+  }
+}
+
+function verifyChildOutputs(
+  instances: PersistedInstance[],
+  expected: number,
+  offset: number,
+): void {
+  for (let localIndex = 0; localIndex < expected; localIndex += 1) {
+    const index = offset + localIndex
+    const instance = instances.find((record) => record.workflowId === `child-bench-${index}`)
+    if (!instance || instance.status !== "completed") {
+      throw new Error(`Expected child parent workflow ${index} to be completed`)
+    }
+    const output = instance.output as { index?: number; childValue?: number } | undefined
+    if (output?.index !== index || output.childValue !== index * 10) {
+      throw new Error(`Unexpected child output ${index}: ${JSON.stringify(output)}`)
+    }
+  }
+}
+
 function rewriteBenchmarkOutput(output: JsonValue | undefined, offset: number): JsonValue | undefined {
   if (!isObject(output)) {
     return output
@@ -369,10 +621,17 @@ function rewriteBenchmarkOutput(output: JsonValue | undefined, offset: number): 
 }
 
 function parseMode(value: string, flag: string): NullBenchmarkMode {
-  if (value === "mixed" || value === "bare") {
+  if (
+    value === "mixed" ||
+    value === "bare" ||
+    value === "activity" ||
+    value === "signal" ||
+    value === "timer" ||
+    value === "child"
+  ) {
     return value
   }
-  throw new Error(`${flag} must be mixed or bare`)
+  throw new Error(`${flag} must be mixed, bare, activity, signal, timer, or child`)
 }
 
 function parsePositiveInteger(value: string, flag: string): number {
@@ -397,7 +656,7 @@ function printHelp(): void {
 Runs real TypeScript workflows against a benchmark-only in-memory shard provider.
 
 Options:
-  --mode <mixed|bare>
+  --mode <mixed|bare|activity|signal|timer|child>
                     Workload mode. Default: ${defaultOptions.mode}
   --workflows <n>   Root workflow count. Default: ${defaultOptions.workflows}
   --workflow-offset <n>
