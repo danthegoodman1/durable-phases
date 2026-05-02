@@ -29,6 +29,7 @@ function benchmarkOptions(overrides: Partial<NullBenchmarkOptions> = {}): NullBe
     activityDelayMs: 0,
     batch: 4,
     maxRounds: 100,
+    unsafeNoClone: false,
     json: true,
     ...overrides,
   }
@@ -48,6 +49,7 @@ function multiProcessOptions(
     activityDelayMs: 0,
     batch: 4,
     maxRounds: 100,
+    unsafeNoClone: false,
     json: true,
     ...overrides,
   }
@@ -122,6 +124,7 @@ describe("Null durability benchmark", () => {
       "9",
       "--batch",
       "7",
+      "--unsafe-no-clone",
       "--json",
     ])).toMatchObject({
       mode: "bare",
@@ -132,6 +135,7 @@ describe("Null durability benchmark", () => {
       activationConcurrency: 5,
       activationPrefetchLimit: 9,
       batch: 7,
+      unsafeNoClone: true,
       json: true,
     })
     expect(() => parseNullBenchmarkArgs(["--mode", "fast"]))
@@ -195,6 +199,7 @@ describe("Null durability benchmark", () => {
       "16",
       "--batch",
       "12",
+      "--unsafe-no-clone",
       "--json",
     ])).toMatchObject({
       mode: "mixed",
@@ -205,6 +210,7 @@ describe("Null durability benchmark", () => {
       activationConcurrency: 8,
       activationPrefetchLimit: 16,
       batch: 12,
+      unsafeNoClone: true,
       json: true,
     })
     expect(() => parseNullMultiProcessBenchmarkArgs(["--processes", "0"]))

@@ -661,6 +661,13 @@ buffers the child start until the parent activation checkpoint commits. If the
 worker crashes before that checkpoint, the child was never durably started and
 the retried activation will produce the same handle. Repeated starts with the
 same activation key are resolved locally by `conflictPolicy`.
+Shard-native providers may materialize the child asynchronously after the
+parent checkpoint through durable outbox/inbox handoff. In that case the parent
+child record and handoff message are atomic with the parent checkpoint, while
+the target child state and initial task are created by the target shard owner.
+An explicit child workflow id conflict is reported back to the parent as a
+failed child completion event, for example with `error.name =
+"ChildStartConflict"`.
 
 Use `durability: "eager"` when the child must be created in the durable store
 immediately and DB-side conflicts should be observed before the parent
@@ -718,7 +725,7 @@ When a signal arrives:
 ```text
 validate envelope
 append to durable signal inbox
-wake any instances with matching current waits
+wake any workflow runs with matching current waits
 ```
 
 When an unconsumed signal, timer, or child result is ready:
@@ -1068,11 +1075,12 @@ The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
 conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
 pending/ready paths, statement and lock timeouts, and an advisory transaction
-lock for concurrent schema initialization. Its ready work is stored in a
-denormalized live `activation_tasks` table with execution snapshots and
-shard-epoch ownership, so the normal claim path can return execution-ready
-snapshots without a follow-up instance read and without per-activation
-heartbeats on the checkpoint-local path.
+lock for concurrent schema initialization. Current projections live in
+`workflow_state`, compact execution records are appended to `workflow_history`,
+and ready work is stored in a denormalized live `tasks` table with execution
+snapshots and shard-epoch ownership. The normal claim path can return
+execution-ready snapshots without a follow-up state read and without
+per-activation heartbeats on the checkpoint-local path.
 Successful checkpoint commits delete the old sequence's live tasks and insert
 only the next live tasks. Provider startup must not rebuild or rewrite live
 ready indexes; readiness is maintained transactionally by instance creation,
@@ -1083,6 +1091,14 @@ Future shard-native providers, including a true shard-file SQLite mode,
 Cassandra, or FoundationDB, should keep each shard's hot state local and use
 durable outbox/inbox handoff for cross-shard work instead of relying on
 cross-shard transactions in the hot path.
+
+Postgres also maintains shard-routed `outbox` and `inbox` tables. Child-start
+messages are appended with the parent commit and delivered idempotently to the
+target shard inbox. Checkpoint child starts do not write target child
+`workflow_state` or `tasks` directly; the target shard owner materializes the
+child from the inbox record. Child completion and child cancellation also flow
+through outbox/inbox messages, so cross-shard child work stays shard-local and
+idempotent. Existing local child APIs remain unchanged.
 
 ### Shard task claiming
 
@@ -1297,9 +1313,11 @@ Signal and child consumption must be committed with the checkpoint. If the
 checkpoint fails, the signal or child completion remains unconsumed and
 checkpoint-durable effect mutations from that completion must not be written.
 Checkpoint-durable child starts are also all-or-nothing with the parent
-checkpoint. Child start conflicts that cannot be retried, such as a requested
-child workflow id already existing, must be reported as non-retryable commit
-failures so workers do not spin on the same activation.
+checkpoint. Providers that create checkpoint children directly may report
+non-retryable child start conflicts at commit time. Message-driven providers
+should commit the parent checkpoint and report target-side child start
+conflicts asynchronously as failed child completion events. Eager child starts
+must preserve immediate conflict semantics.
 
 `recordActivationFailures(...)` records shard-task-scoped checkpoint activity
 failures that do not advance workflow sequence, such as retry-scheduled local

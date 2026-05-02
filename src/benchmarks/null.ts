@@ -39,6 +39,7 @@ export type NullBenchmarkOptions = {
   activityDelayMs: number
   batch: number
   maxRounds: number
+  unsafeNoClone: boolean
   json: boolean
 }
 
@@ -76,6 +77,7 @@ const defaultOptions: NullBenchmarkOptions = {
   activityDelayMs: 0,
   batch: 32,
   maxRounds: 10_000,
+  unsafeNoClone: false,
   json: false,
 }
 
@@ -98,7 +100,7 @@ export async function runNullBenchmark(
   options: NullBenchmarkOptions,
 ): Promise<NullBenchmarkResult> {
   const counters = createBenchmarkCounters()
-  const provider = new NullDurabilityProvider()
+  const provider = new NullDurabilityProvider({ unsafeNoClone: options.unsafeNoClone })
   const workload = createNullBenchmarkWorkload(options.mode, counters, {
     activityDelayMs: options.activityDelayMs,
   })
@@ -268,6 +270,8 @@ export function parseNullBenchmarkArgs(args: string[]): NullBenchmarkOptions {
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--unsafe-no-clone") {
+      options.unsafeNoClone = true
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -277,7 +281,7 @@ export function parseNullBenchmarkArgs(args: string[]): NullBenchmarkOptions {
   return options
 }
 
-type NullWorkload = {
+export type NullWorkload = {
   RootWorkflow: AnyWorkflow
   workflows: AnyWorkflow[]
   activationsPerWorkflow: number
@@ -286,7 +290,7 @@ type NullWorkload = {
   actionCount(counters: BenchmarkCounters, activations: number): number
 }
 
-function createNullBenchmarkWorkload(
+export function createNullBenchmarkWorkload(
   mode: NullBenchmarkMode,
   counters: BenchmarkCounters,
   options: { activityDelayMs: number },
@@ -671,6 +675,7 @@ Options:
                     Async delay inside each mixed-workload activity. Default: ${defaultOptions.activityDelayMs}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
+  --unsafe-no-clone Diagnostic only: skip null-provider defensive cloning.
   --json            Print machine-readable JSON.
 `)
 }
@@ -688,6 +693,7 @@ function printResult(result: NullBenchmarkResult): void {
   activation prefetch limit: ${result.options.activationPrefetchLimit}
   activity delay: ${formatMs(result.options.activityDelayMs)}
   batch: ${result.options.batch}
+  unsafe no-clone: ${result.options.unsafeNoClone ? "yes" : "no"}
   rounds: ${result.rounds}
   elapsed: ${formatMs(result.elapsedMs)} (${formatMs(result.setupMs)} setup, ${formatMs(result.processingMs)} processing, ${formatMs(result.verifyMs)} verify)
 

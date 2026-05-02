@@ -4,8 +4,11 @@ import { describe, expect, it } from "vitest"
 import {
   DurableRuntime,
   PostgresDurabilityProvider,
+  cancel,
+  child,
   complete,
   defineWorkflow,
+  go,
   phase,
   start,
 } from "../src/durable.js"
@@ -139,7 +142,7 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
           SELECT count(*)::int
           FROM information_schema.columns
           WHERE table_schema = $1
-            AND table_name = 'activation_tasks_p00'
+            AND table_name = 'tasks_p00'
             AND column_name LIKE 'instance_%'
           `,
           [schema],
@@ -162,12 +165,59 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
           schema,
           `
           SELECT instance_common_json->>'value'
-          FROM {schema}.activation_tasks_p00
+          FROM {schema}.tasks_p00
           WHERE workflow_id = $1 AND run_id = $2
           `,
           ["pg-snapshot-task", "run-1"],
         ),
       ).resolves.toBe("42")
+    })
+  })
+
+  it("creates append-first state, task, history, inbox, and outbox tables", async () => {
+    await withProvider(async (provider, schema) => {
+      await expect(
+        scalar<number>(
+          schema,
+          `
+          SELECT count(*)::int
+          FROM information_schema.tables
+          WHERE table_schema = $1
+            AND table_name IN (
+              'workflow_state_p00',
+              'workflow_history_p00',
+              'tasks_p00',
+              'inbox_p00',
+              'outbox_p00'
+            )
+          `,
+          [schema],
+        ),
+      ).resolves.toBe(5)
+
+      await provider.createInstance({
+        workflowName: "pg_history_create",
+        workflowVersion: 1,
+        workflowId: "pg-history-create",
+        runId: "run-1",
+        partitionShard: 0,
+        common: {},
+        phase: { name: "run", data: {} },
+        waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+        now: "2026-01-01T00:00:00.000Z",
+      })
+
+      await expect(
+        scalar<string>(
+          schema,
+          `
+          SELECT event_type
+          FROM {schema}.workflow_history_p00
+          WHERE workflow_id = $1 AND run_id = $2
+          `,
+          ["pg-history-create", "run-1"],
+        ),
+      ).resolves.toBe("instance_created")
     })
   })
 
@@ -245,7 +295,7 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
         await expect(
           scalar<number>(
             schema,
-            `SELECT count(*)::int FROM {schema}.instances_${parentSuffix} WHERE workflow_id = $1 AND run_id = $2`,
+            `SELECT count(*)::int FROM {schema}.workflow_state_${parentSuffix} WHERE workflow_id = $1 AND run_id = $2`,
             [parent.workflowId, parent.runId],
           ),
         ).resolves.toBe(1)
@@ -273,7 +323,7 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
         await expect(
           scalar<number>(
             schema,
-            `SELECT count(*)::int FROM {schema}.activation_tasks_${parentSuffix} WHERE workflow_id = $1 AND run_id = $2`,
+            `SELECT count(*)::int FROM {schema}.tasks_${parentSuffix} WHERE workflow_id = $1 AND run_id = $2`,
             [parent.workflowId, parent.runId],
           ),
         ).resolves.toBeGreaterThan(0)
@@ -287,13 +337,370 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
         await expect(
           scalar<number>(
             schema,
-            `SELECT count(*)::int FROM {schema}.instances_${childSuffix} WHERE workflow_id = $1 AND run_id = $2`,
+            `SELECT count(*)::int FROM {schema}.workflow_state_${childSuffix} WHERE workflow_id = $1 AND run_id = $2`,
             [child.workflowId, child.runId],
           ),
         ).resolves.toBe(1)
       },
       { physicalPartitions: 4 },
     )
+  })
+
+  it("delivers checkpoint child starts through idempotent outbox and inbox rows", async () => {
+    await withProvider(async (provider, schema) => {
+      const ChildWorkflow = defineWorkflow({
+        name: "pg_outbox_child",
+        version: 1,
+        input: z.object({ value: z.number() }),
+        output: z.object({ value: z.number() }),
+        common: z.object({ value: z.number() }),
+        initial(input) {
+          return start({ common: input, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: ({ common }) => complete({ value: common.value }),
+          }),
+        },
+      })
+      const ParentWorkflow = defineWorkflow({
+        name: "pg_outbox_parent",
+        version: 1,
+        input: z.object({ value: z.number() }),
+        output: z.object({ ok: z.boolean() }),
+        common: z.object({ value: z.number() }),
+        initial(input) {
+          return start({ common: input, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async ({ ctx, common }) => {
+              await ctx.child.start("child", ChildWorkflow, { value: common.value })
+              return complete({ ok: true })
+            },
+          }),
+        },
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "pg-outbox-worker",
+        shardCount: 1,
+      })
+
+      const ref = await runtime.start(ParentWorkflow, { value: 7 }, { workflowId: "pg-outbox-parent" })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.workflow_state_p00 WHERE workflow_id LIKE 'pg-outbox-parent__%'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.tasks_p00 WHERE workflow_id LIKE 'pg-outbox-parent__%'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.children_p00 WHERE parent_workflow_id = $1 AND parent_run_id = $2`,
+          [ref.workflowId, ref.runId],
+        ),
+      ).resolves.toBe(1)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type = 'child_start'`,
+        ),
+      ).resolves.toBe(1)
+
+      await expect(runtime.drain()).resolves.toMatchObject({ activations: 1 })
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type = 'child_start'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.inbox_p00 WHERE message_type = 'child_start'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.workflow_state_p00 WHERE workflow_id LIKE 'pg-outbox-parent__%'`,
+        ),
+      ).resolves.toBe(1)
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({
+        status: "completed",
+        output: { ok: true },
+      })
+    })
+  })
+
+  it("delivers child completion back to the parent through outbox and inbox rows", async () => {
+    await withProvider(async (provider, schema) => {
+      const ChildWorkflow = defineWorkflow({
+        name: "pg_completion_child",
+        version: 1,
+        input: z.object({ value: z.number() }),
+        output: z.object({ value: z.number() }),
+        common: z.object({ value: z.number() }),
+        initial(input) {
+          return start({ common: input, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: ({ common }) => complete({ value: common.value + 1 }),
+          }),
+        },
+      })
+      const ParentWorkflow = defineWorkflow({
+        name: "pg_completion_parent",
+        version: 1,
+        input: z.object({ value: z.number() }),
+        output: z.object({ value: z.number() }),
+        common: z.object({ value: z.number() }),
+        initial(input) {
+          return start({ common: input, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async ({ ctx, common }) => {
+              const handle = await ctx.child.start("child", ChildWorkflow, { value: common.value })
+              return go("waiting", { handle })
+            },
+          }),
+          waiting: phase({
+            state: z.object({ handle: z.any() }),
+            on: {
+              done: child(
+                ({ data }) => data.handle,
+                async ({ event }) => complete({ value: event.ok ? event.output.value : -1 }),
+              ),
+            },
+          }),
+        },
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "pg-completion-worker",
+        shardCount: 1,
+      })
+
+      const ref = await runtime.start(ParentWorkflow, { value: 9 }, { workflowId: "pg-completion-parent" })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(
+        scalar<string>(
+          schema,
+          `SELECT status FROM {schema}.children_p00 WHERE parent_workflow_id = $1 AND parent_run_id = $2`,
+          [ref.workflowId, ref.runId],
+        ),
+      ).resolves.toBe("started")
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type = 'child_completed'`,
+        ),
+      ).resolves.toBe(1)
+
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({
+        status: "completed",
+        output: { value: 10 },
+      })
+      await expect(
+        scalar<string>(
+          schema,
+          `SELECT status FROM {schema}.children_p00 WHERE parent_workflow_id = $1 AND parent_run_id = $2`,
+          [ref.workflowId, ref.runId],
+        ),
+      ).resolves.toBe("completed")
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.inbox_p00 WHERE message_type = 'child_completed'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type = 'child_completed'`,
+        ),
+      ).resolves.toBe(0)
+    })
+  })
+
+  it("reports checkpoint child explicit workflow id conflicts asynchronously", async () => {
+    await withProvider(async (provider) => {
+      const ChildWorkflow = defineWorkflow({
+        name: "pg_conflict_child",
+        version: 1,
+        input: z.object({ value: z.number() }),
+        output: z.object({ value: z.number() }),
+        common: z.object({ value: z.number() }),
+        initial(input) {
+          return start({ common: input, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: ({ common }) => complete({ value: common.value }),
+          }),
+        },
+      })
+      const ParentWorkflow = defineWorkflow({
+        name: "pg_conflict_parent",
+        version: 1,
+        input: z.object({}),
+        output: z.object({ errorName: z.string() }),
+        common: z.object({}),
+        initial() {
+          return start({ common: {}, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async ({ ctx }) => {
+              const handle = await ctx.child.start(
+                "child",
+                ChildWorkflow,
+                { value: 1 },
+                { workflowId: "pg-conflicting-child" },
+              )
+              return go("waiting", { handle })
+            },
+          }),
+          waiting: phase({
+            state: z.object({ handle: z.any() }),
+            on: {
+              done: child(
+                ({ data }) => data.handle,
+                async ({ event }) =>
+                  complete({
+                    errorName: event.ok ? "none" : (event.error.name ?? "Error"),
+                  }),
+              ),
+            },
+          }),
+        },
+      })
+      await provider.createInstance({
+        workflowName: ChildWorkflow.name,
+        workflowVersion: ChildWorkflow.version,
+        workflowId: "pg-conflicting-child",
+        runId: "run-1",
+        partitionShard: 0,
+        common: { value: 99 },
+        phase: { name: "run", data: {} },
+        waits: [],
+        now: "2026-01-01T00:00:00.000Z",
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "pg-conflict-worker",
+        shardCount: 1,
+      })
+
+      const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "pg-conflict-parent" })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 0 })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({
+        status: "completed",
+        output: { errorName: "ChildStartConflict" },
+      })
+    })
+  })
+
+  it("cancels not-yet-materialized checkpoint children through child_cancel messages", async () => {
+    await withProvider(async (provider, schema) => {
+      const ChildWorkflow = defineWorkflow({
+        name: "pg_cancel_message_child",
+        version: 1,
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        common: z.object({}),
+        initial() {
+          return start({ common: {}, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: () => complete({ ok: true }),
+          }),
+        },
+      })
+      const ParentWorkflow = defineWorkflow({
+        name: "pg_cancel_message_parent",
+        version: 1,
+        input: z.object({}),
+        output: z.object({}),
+        common: z.object({}),
+        initial() {
+          return start({ common: {}, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async ({ ctx }) => {
+              await ctx.child.start("child", ChildWorkflow, {})
+              return cancel("stop")
+            },
+          }),
+        },
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [ParentWorkflow, ChildWorkflow],
+        workerId: "pg-cancel-message-worker",
+        shardCount: 1,
+      })
+
+      const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "pg-cancel-message-parent" })
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 1 })
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({
+        status: "canceled",
+        cancelReason: "stop",
+      })
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.workflow_state_p00 WHERE workflow_id LIKE 'pg-cancel-message-parent__%'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type IN ('child_start', 'child_cancel')`,
+        ),
+      ).resolves.toBe(2)
+
+      await expect(runtime.drain({ maxActivations: 1 })).resolves.toMatchObject({ activations: 0 })
+      await expect(
+        scalar<string>(
+          schema,
+          `SELECT status FROM {schema}.workflow_state_p00 WHERE workflow_id LIKE 'pg-cancel-message-parent__%'`,
+        ),
+      ).resolves.toBe("canceled")
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.tasks_p00 WHERE workflow_id LIKE 'pg-cancel-message-parent__%'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.inbox_p00 WHERE message_type = 'child_cancel'`,
+        ),
+      ).resolves.toBe(0)
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.outbox_p00 WHERE message_type IN ('child_start', 'child_cancel')`,
+        ),
+      ).resolves.toBe(0)
+    })
   })
 
   it("claims ready activations in canonical order across physical partitions", async () => {
@@ -707,7 +1114,7 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
       await expect(
         scalar<number>(
           schema,
-          `SELECT count(*)::int FROM {schema}.activation_tasks_${suffix} WHERE workflow_id = $1 AND run_id = $2`,
+          `SELECT count(*)::int FROM {schema}.tasks_${suffix} WHERE workflow_id = $1 AND run_id = $2`,
           [ref.workflowId, ref.runId],
         ),
       ).resolves.toBe(0)

@@ -8,16 +8,17 @@ import { DurableRuntime, PostgresDurabilityProvider } from "../durable.js"
 import {
   activityCount,
   createBenchmarkCounters,
-  createBenchmarkWorkflows,
-  mixedActionCount,
-  verifyBenchmarkCounters,
-  verifyBenchmarkOutputs,
   type BenchmarkCounters,
 } from "./workload.js"
+import {
+  createNullBenchmarkWorkload,
+  type NullBenchmarkMode,
+} from "./null.js"
 
 const { Pool } = pg
 
 export type PostgresBenchmarkOptions = {
+  mode: NullBenchmarkMode
   connectionString: string
   schema: string
   physicalPartitions: number
@@ -68,6 +69,8 @@ export type PostgresQueryProfile = {
   }>
   topByTotal: QueryProfileEntry[]
   topByCount: QueryProfileEntry[]
+  topProcessingByTotal: QueryProfileEntry[]
+  topProcessingByCount: QueryProfileEntry[]
 }
 
 export type PostgresBenchmarkDiagnostics = {
@@ -97,6 +100,7 @@ export type PostgresBenchmarkDiagnostics = {
 
 export type PostgresBenchmarkResult = {
   backend: "postgres"
+  mode: NullBenchmarkMode
   options: Omit<PostgresBenchmarkOptions, "connectionString"> & {
     connectionString: string
   }
@@ -122,6 +126,7 @@ export type PostgresBenchmarkResult = {
 }
 
 const defaultOptions: PostgresBenchmarkOptions = {
+  mode: "mixed",
   connectionString:
     process.env.DURABLE_POSTGRES_URL ?? "postgresql://durable:durable@127.0.0.1:55432/durable",
   schema: `durable_bench_${randomUUID().replaceAll("-", "_")}`,
@@ -144,10 +149,10 @@ const defaultOptions: PostgresBenchmarkOptions = {
 }
 
 async function main(): Promise<void> {
-  const options = parseArgs(process.argv.slice(2))
+  const options = parsePostgresBenchmarkArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running Postgres durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, physical partitions ${options.physicalPartitions}, pool size ${options.poolSize}, synchronous_commit ${options.synchronousCommit}, schema ${options.schema}...\n\n`,
+      `Running Postgres durability benchmark with ${options.workflows} workflows, ${options.mode} mode, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, physical partitions ${options.physicalPartitions}, pool size ${options.poolSize}, synchronous_commit ${options.synchronousCommit}, schema ${options.schema}...\n\n`,
     )
   }
   const result = await runPostgresBenchmark(options)
@@ -162,7 +167,7 @@ export async function runPostgresBenchmark(
   options: PostgresBenchmarkOptions,
 ): Promise<PostgresBenchmarkResult> {
   const counters = createBenchmarkCounters()
-  const { ParentWorkflow, workflows } = createBenchmarkWorkflows(counters, {
+  const workload = createNullBenchmarkWorkload(options.mode, counters, {
     activityDelayMs: options.activityDelayMs,
   })
   const pool = new Pool(poolConfig(options.connectionString, options.poolSize, options.synchronousCommit))
@@ -187,7 +192,7 @@ export async function runPostgresBenchmark(
 
   let rounds = 0
   let activations = 0
-  const expectedActivations = options.workflows * 5
+  const expectedActivations = options.workflows * workload.activationsPerWorkflow
   const setupStartedAt = performance.now()
   let setupFinishedAt = setupStartedAt
   let processingStartedAt = setupStartedAt
@@ -210,7 +215,7 @@ export async function runPostgresBenchmark(
       runtimes.push(
         new DurableRuntime(provider, {
           clock,
-          workflows,
+          workflows: workload.workflows,
           workerId: `bench-worker-${workerIndex}`,
           shardCount: options.shards,
           dispatchShardIds: dispatchShardIdsForWorker(
@@ -228,18 +233,20 @@ export async function runPostgresBenchmark(
 
     for (let index = 0; index < options.workflows; index += 1) {
       const ref = await runtimes[0]!.start(
-        ParentWorkflow,
+        workload.RootWorkflow,
         { index },
-        { workflowId: `bench-parent-${index}` },
+        { workflowId: `${options.mode}-bench-${index}` },
       )
       counters.workflowStarts += 1
-      await runtimes[0]!.signal(
-        ParentWorkflow,
-        ref,
-        "finish",
-        { signalValue: index + 1_000 },
-      )
-      counters.signals += 1
+      if (workload.appendFinishSignal) {
+        await runtimes[0]!.signal(
+          workload.RootWorkflow,
+          ref,
+          "finish",
+          { signalValue: index + 1_000 },
+        )
+        counters.signals += 1
+      }
     }
 
     setupFinishedAt = performance.now()
@@ -284,7 +291,7 @@ export async function runPostgresBenchmark(
 
     const instances = await providers[0]!.listInstances()
     const completedWorkflows = instances.filter(
-      (instance) => instance.workflowName === ParentWorkflow.name && instance.status === "completed",
+      (instance) => instance.workflowName === workload.RootWorkflow.name && instance.status === "completed",
     ).length
     if (completedWorkflows !== options.workflows) {
       throw new Error(
@@ -292,9 +299,8 @@ export async function runPostgresBenchmark(
       )
     }
 
-    verifyBenchmarkOutputs(instances, options.workflows)
-    verifyBenchmarkCounters(counters, options.workflows)
-    const mixedActions = mixedActionCount(counters)
+    workload.verify(instances, options.workflows, 0)
+    const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
     const processingMs = processingFinishedAt - processingStartedAt
@@ -305,6 +311,7 @@ export async function runPostgresBenchmark(
 
     const result: PostgresBenchmarkResult = {
       backend: "postgres",
+      mode: options.mode,
       options: {
         ...options,
         connectionString: redactConnectionString(options.connectionString),
@@ -344,7 +351,7 @@ export async function runPostgresBenchmark(
   }
 }
 
-function parseArgs(args: string[]): PostgresBenchmarkOptions {
+export function parsePostgresBenchmarkArgs(args: string[]): PostgresBenchmarkOptions {
   const options = { ...defaultOptions }
   for (let index = 0; index < args.length; index += 1) {
     const raw = args[index]
@@ -363,6 +370,8 @@ function parseArgs(args: string[]): PostgresBenchmarkOptions {
     if (flag === "--help" || flag === "-h") {
       printHelp()
       process.exit(0)
+    } else if (flag === "--mode") {
+      options.mode = parseMode(nextValue(), flag)
     } else if (flag === "--connection-string") {
       options.connectionString = nextValue()
     } else if (flag === "--schema") {
@@ -407,6 +416,20 @@ function parseArgs(args: string[]): PostgresBenchmarkOptions {
   return options
 }
 
+function parseMode(value: string, flag: string): NullBenchmarkMode {
+  if (
+    value === "mixed" ||
+    value === "bare" ||
+    value === "activity" ||
+    value === "signal" ||
+    value === "timer" ||
+    value === "child"
+  ) {
+    return value
+  }
+  throw new Error(`${flag} must be mixed, bare, activity, signal, timer, or child`)
+}
+
 function parsePositiveInteger(value: string, flag: string): number {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed <= 0) {
@@ -436,6 +459,8 @@ function printHelp(): void {
 Runs the shared real workflow benchmark against the Postgres durability provider.
 
 Options:
+  --mode <mixed|bare|activity|signal|timer|child>
+                    Workload mode. Default: ${defaultOptions.mode}
   --connection-string <url>
                     Postgres connection string. Default: DURABLE_POSTGRES_URL or local Docker.
   --schema <name>   Isolated schema to create/drop. Default: generated durable_bench_* schema.
@@ -468,6 +493,7 @@ Options:
 function printResult(result: PostgresBenchmarkResult): void {
   const activityTotal = activityCount(result.counters)
   process.stdout.write(`Postgres durability benchmark
+  mode: ${result.mode}
   workflows: ${result.options.workflows}
   workers: ${result.options.workers} logical in-process workers
   active workers: ${result.activeWorkers}
@@ -505,12 +531,15 @@ Action breakdown:
 `)
 
   if (result.queryProfile) {
+    const processingTop = result.queryProfile.topProcessingByTotal.slice(0, 5)
     process.stdout.write(`
 Query profile:
   total queries: ${result.queryProfile.totalQueries}
   queries/activation: ${result.queryProfile.queriesPerActivation.toFixed(1)}
   avg query: ${formatMs(result.queryProfile.avgQueryMs)}
   pool connect waits: ${result.queryProfile.poolWait.connectCount} waits, ${formatMs(result.queryProfile.poolWait.totalWaitMs)} total, ${formatMs(result.queryProfile.poolWait.maxWaitMs)} max
+  top processing SQL by total time:
+${processingTop.length === 0 ? "    none" : processingTop.map((entry) => `    ${entry.count}x ${formatMs(entry.totalMs)} total, ${formatMs(entry.avgMs)} avg: ${entry.sql}`).join("\n")}
 `)
   }
   if (result.diagnostics) {
@@ -930,6 +959,14 @@ function installPostgresQueryProfiler(
           .sort((left, right) => right.totalMs - left.totalMs)
           .slice(0, 25),
         topByCount: [...entries]
+          .sort((left, right) => right.count - left.count)
+          .slice(0, 25),
+        topProcessingByTotal: entries
+          .filter((entry) => entry.phase === "processing")
+          .sort((left, right) => right.totalMs - left.totalMs)
+          .slice(0, 25),
+        topProcessingByCount: entries
+          .filter((entry) => entry.phase === "processing")
           .sort((left, right) => right.count - left.count)
           .slice(0, 25),
       }

@@ -47,6 +47,7 @@ import type {
   ShardDurabilitySession,
   ShardLease,
   SignalRecord,
+  ConflictPolicy,
 } from "./interface.js"
 import type {
   ChildHandle,
@@ -77,6 +78,7 @@ export type PostgresDurabilityProviderOptions = DurableObservability & {
   pool?: Pool
   schema?: string
   physicalPartitions?: number
+  messageBatchSize?: number
   poolSize?: number
   statementTimeoutMs?: number
   lockTimeoutMs?: number
@@ -124,12 +126,78 @@ type ChildRow = {
   workflow_version: number
   workflow_id: string
   run_id: string
+  partition_shard: number
   status: "started" | "completed" | "failed" | "abandoned"
   parent_close_policy: "cancel" | "abandon"
   completed_at: Date | string | null
   output_json: unknown
   error_json: unknown
   delivered_by_sequence: number | null
+}
+
+type MessageRow = {
+  message_id: string
+  source_shard: number
+  target_shard: number
+  target_workflow_id: string
+  target_run_id: string
+  message_type: string
+  payload_json: unknown
+  created_at: Date | string
+}
+
+type OutboxMessageInput = {
+  messageId: string
+  sourceWorkflowId: string
+  sourceRunId: string
+  sourceShard: number
+  targetWorkflowId: string
+  targetRunId: string
+  targetShard: number
+  messageType: string
+  payload: JsonValue
+  createdAt: string
+}
+
+type ChildStartMessagePayload = {
+  childRecordId: string
+  parentWorkflowId: string
+  parentRunId: string
+  activationId: string
+  key: string
+  workflowName: string
+  workflowVersion: number
+  workflowId: string
+  runId: string
+  partitionShard: number
+  common: JsonObject
+  phase: { name: string; data: JsonValue }
+  waits: DurableWait[]
+  parentClosePolicy: "cancel" | "abandon"
+  conflictPolicy: ConflictPolicy
+  createdAt: string
+}
+
+type ChildCompletedMessagePayload = {
+  childRecordId: string
+  parentWorkflowId: string
+  parentRunId: string
+  workflowId: string
+  runId: string
+  status: "completed" | "failed"
+  output: JsonValue | null
+  error: SerializedError | null
+  completedAt: string
+}
+
+type ChildCancelMessagePayload = {
+  childRecordId: string
+  parentWorkflowId: string
+  parentRunId: string
+  workflowId: string
+  runId: string
+  reason: SerializedError
+  canceledAt: string
 }
 
 type EffectRow = {
@@ -351,8 +419,11 @@ type SelectedReadyCandidateRow = {
 
 type PartitionedTableName =
   | "instances"
+  | "workflow_history"
   | "signals"
   | "children"
+  | "inbox"
+  | "outbox"
   | "activation_tasks"
   | "effects"
   | "activity_deadlines"
@@ -370,6 +441,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   private readonly partitionSuffixWidth: number
   private readonly statementTimeoutMs: number
   private readonly lockTimeoutMs: number
+  private readonly messageBatchSize: number
   private readonly observability: DurableObservability
   private closed = false
 
@@ -385,6 +457,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       "statementTimeoutMs",
     )
     this.lockTimeoutMs = positiveInteger(options.lockTimeoutMs ?? 5_000, "lockTimeoutMs")
+    this.messageBatchSize = positiveInteger(options.messageBatchSize ?? 256, "messageBatchSize")
     this.observability = { logger: options.logger, metrics: options.metrics }
     if (options.pool) {
       this.pool = options.pool
@@ -495,6 +568,21 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           createdAt: input.now,
           updatedAt: input.now,
         }),
+      })
+      await this.appendWorkflowHistory(client, {
+        workflowId: input.workflowId,
+        runId: input.runId,
+        partitionShard: input.partitionShard,
+        sequence: 0,
+        activationId: null,
+        eventType: "instance_created",
+        payload: {
+          workflowName: input.workflowName,
+          workflowVersion: input.workflowVersion,
+          status: "running",
+          waits: input.waits,
+        },
+        createdAt: input.now,
       })
 
       this.log("info", "provider.instance.create", {
@@ -837,17 +925,23 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     limit: number,
     shardEpochs: Map<number, number>,
   ): Promise<ClaimReadyActivationsResult> {
+    await this.flushShardMessages(
+      client,
+      input.workerId,
+      input.shardIds,
+      input.shardCount,
+      input.now,
+    )
     await this.expireActivityTimeouts(client, input.now, {
       shardIds: input.shardIds,
       shardCount: input.shardCount,
     })
-    const claims = await this.claimIndexedReadyActivations(
+    let claims = await this.claimIndexedReadyActivations(
       client,
       input,
       limit,
       shardEpochs,
     )
-
     if (claims.length < limit) {
       const remaining = limit - claims.length
       const candidates = await this.migrationReadyCandidates(
@@ -1449,8 +1543,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           runId: input.parentRunId,
         })} (
           child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-          workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', $10)
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          status, parent_close_policy
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'started', $11)
         `,
         [
           childRecordId,
@@ -1462,6 +1557,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input.workflowVersion,
           input.workflowId,
           input.runId,
+          input.partitionShard,
           parentClosePolicy,
         ],
       )
@@ -1519,32 +1615,24 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         workerId: input.workerId,
         now: input.now,
       })
-      const childInstance = await this.instanceRow(client, input)
-      if (!childInstance) {
-        throw new Error(`Unknown child workflow: ${input.workflowId}/${input.runId}`)
-      }
-      if (
-        childInstance.parent_workflow_id !== input.parentWorkflowId ||
-        childInstance.parent_run_id !== input.parentRunId ||
-        !childInstance.parent_child_record_id
-      ) {
-        throw new Error(`Child workflow is not owned by this parent: ${input.workflowId}/${input.runId}`)
-      }
       const childRecord = await this.one<ChildRow>(
         client,
         `
         SELECT * FROM ${this.partitionedTable("children", {
-          workflowId: childInstance.parent_workflow_id,
-          runId: childInstance.parent_run_id,
+          workflowId: input.parentWorkflowId,
+          runId: input.parentRunId,
         })}
-        WHERE child_record_id = $1
+        WHERE parent_workflow_id = $1
+          AND parent_run_id = $2
+          AND workflow_id = $3
+          AND run_id = $4
         LIMIT 1
         FOR UPDATE
         `,
-        [childInstance.parent_child_record_id],
+        [input.parentWorkflowId, input.parentRunId, input.workflowId, input.runId],
       )
       if (!childRecord) {
-        throw new Error(`Unknown child record: ${childInstance.parent_child_record_id}`)
+        throw new Error(`Unknown child workflow: ${input.workflowId}/${input.runId}`)
       }
       await this.cancelStartedChild(client, childRecord, input.now, {
         deliverToParent: true,
@@ -1689,10 +1777,13 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
        AND d.owner_id = input.worker_id
        AND d.lease_epoch = a.claim_epoch
        AND d.lease_until >= input.now
-       AND NOT EXISTS (
+       AND (
+         NOT a.has_effects
+         OR NOT EXISTS (
          SELECT 1 FROM ${this.partitionedTable("activity_deadlines", partitionRef)} d
          WHERE d.activation_id = input.activation_id
            AND d.deadline_at <= input.now
+         )
        )
       FOR UPDATE OF a
       `,
@@ -1839,12 +1930,31 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     }
 
     await this.writeCheckpointEffectMutationsForBatch(client, successes.map((success) => success.input))
-    await this.writeCheckpointChildStartsForBatch(client, successes.map((success) => success.input))
+    await this.writeCheckpointChildStartsForBatch(client, successes)
     await this.writeNextInstancesForBatch(client, successes)
+    await this.appendWorkflowHistoryForBatch(
+      client,
+      successes.map((success) => ({
+        workflowId: success.input.workflowId,
+        runId: success.input.runId,
+        partitionShard: success.instance.partition_shard,
+        sequence: success.nextSequence,
+        activationId: success.input.activationId,
+        eventType: "activation_committed",
+        payload: {
+          status: success.input.next.status,
+          consumeSignalId: success.input.consumeSignalId ?? null,
+          consumeChildRecordId: success.input.consumeChildRecordId ?? null,
+          childStarts: (success.input.childStarts ?? []).length,
+          effects: (success.input.effects ?? []).length,
+        },
+        createdAt: success.input.now,
+      })),
+    )
     await this.consumeSignalsForBatch(client, successes)
     await this.consumeChildrenForBatch(client, successes)
 
-    await this.updateParentChildRecordsForBatch(client, successes)
+    await this.writeChildCompletionOutboxForBatch(client, successes)
     const runningReadyStates: ReadyEventInstanceState[] = []
     for (const success of successes) {
       await this.applyParentClosePolicy(client, success.instance, success.input, success.nextSequence)
@@ -2034,6 +2144,22 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       await this.writeCheckpointEffectMutations(client, input)
       await this.writeCheckpointChildStarts(client, input)
       await this.writeNextInstance(client, input, nextSequence)
+      await this.appendWorkflowHistory(client, {
+        workflowId: input.workflowId,
+        runId: input.runId,
+        partitionShard: instance.partition_shard,
+        sequence: nextSequence,
+        activationId: input.activationId,
+        eventType: "activation_committed",
+        payload: {
+          status: input.next.status,
+          consumeSignalId: input.consumeSignalId ?? null,
+          consumeChildRecordId: input.consumeChildRecordId ?? null,
+          childStarts: (input.childStarts ?? []).length,
+          effects: (input.effects ?? []).length,
+        },
+        createdAt: input.now,
+      })
       if (signalToConsume) {
         await client.query(
           `UPDATE ${this.partitionedTable("signals", input)} SET consumed_by_sequence = $1 WHERE signal_id = $2`,
@@ -2047,7 +2173,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         )
       }
 
-      await this.updateParentChildRecord(client, instance, input, nextSequence)
+      await this.writeChildCompletionOutbox(client, instance, input)
       await this.applyParentClosePolicy(client, instance, input, nextSequence)
       if (input.next.status === "running") {
         await this.insertReadyEventsForStates(client, [{
@@ -2111,6 +2237,22 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           input,
           latestRetryBlockedUntil(input.effects),
         )
+        const instance = await this.instanceRow(client, input)
+        if (instance) {
+          await this.appendWorkflowHistory(client, {
+            workflowId: input.workflowId,
+            runId: input.runId,
+            partitionShard: instance.partition_shard,
+            sequence: instance.sequence,
+            activationId: input.activationId,
+            eventType: "activation_failure_recorded",
+            payload: {
+              effects: input.effects.length,
+              releaseActivation: input.releaseActivation ?? false,
+            },
+            createdAt: input.now,
+          })
+        }
         if (input.releaseActivation) {
           await client.query(
             `
@@ -2209,6 +2351,18 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         PRIMARY KEY (workflow_id, run_id)
       );
 
+      CREATE TABLE IF NOT EXISTS ${this.partitionedTable("workflow_history", partition)} (
+        history_id BIGSERIAL PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        partition_shard INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        activation_id TEXT,
+        event_type TEXT NOT NULL,
+        payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS ${this.partitionedTable("signals", partition)} (
         signal_id TEXT PRIMARY KEY,
         workflow_id TEXT NOT NULL,
@@ -2229,6 +2383,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         workflow_version INTEGER NOT NULL,
         workflow_id TEXT NOT NULL,
         run_id TEXT NOT NULL,
+        partition_shard INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed', 'abandoned')),
         parent_close_policy TEXT NOT NULL DEFAULT 'cancel' CHECK (parent_close_policy IN ('cancel', 'abandon')),
         completed_at TIMESTAMPTZ,
@@ -2236,6 +2391,28 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         error_json JSONB,
         delivered_by_sequence INTEGER,
         UNIQUE(parent_workflow_id, parent_run_id, activation_id, key)
+      );
+
+      CREATE TABLE IF NOT EXISTS ${this.partitionedTable("inbox", partition)} (
+        message_id TEXT PRIMARY KEY,
+        source_shard INTEGER NOT NULL,
+        target_shard INTEGER NOT NULL,
+        target_workflow_id TEXT NOT NULL,
+        target_run_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        payload_json JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ${this.partitionedTable("outbox", partition)} (
+        message_id TEXT PRIMARY KEY,
+        source_shard INTEGER NOT NULL,
+        target_shard INTEGER NOT NULL,
+        target_workflow_id TEXT NOT NULL,
+        target_run_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        payload_json JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS ${this.partitionedTable("effects", partition)} (
@@ -2337,6 +2514,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         WHERE delivered_by_sequence IS NULL AND status IN ('completed', 'failed');
       CREATE INDEX IF NOT EXISTS ${this.index(`children_child_instance_${suffix}`)}
         ON ${this.partitionedTable("children", partition)}(workflow_id, run_id, status, delivered_by_sequence);
+      CREATE INDEX IF NOT EXISTS ${this.index(`inbox_materialize_${suffix}`)}
+        ON ${this.partitionedTable("inbox", partition)}(target_shard, created_at, message_id);
+      CREATE INDEX IF NOT EXISTS ${this.index(`outbox_deliver_${suffix}`)}
+        ON ${this.partitionedTable("outbox", partition)}(source_shard, created_at, message_id);
       CREATE INDEX IF NOT EXISTS ${this.index(`effects_activation_key_${suffix}`)}
         ON ${this.partitionedTable("effects", partition)}(workflow_id, run_id, activation_id, key);
       CREATE INDEX IF NOT EXISTS ${this.index(`effects_activation_pending_${suffix}`)}
@@ -2370,6 +2551,911 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       CREATE INDEX IF NOT EXISTS ${this.index(`activation_tasks_instance_${suffix}`)}
         ON ${this.partitionedTable("activation_tasks", partition)}(workflow_id, run_id, sequence);
     `
+  }
+
+  private async appendWorkflowHistory(
+    client: Queryable,
+    input: {
+      workflowId: string
+      runId: string
+      partitionShard: number
+      sequence: number
+      activationId: string | null
+      eventType: string
+      payload: JsonValue
+      createdAt: string
+    },
+  ): Promise<void> {
+    await client.query(
+      `
+      INSERT INTO ${this.partitionedTable("workflow_history", input)} (
+        workflow_id, run_id, partition_shard, sequence, activation_id,
+        event_type, payload_json, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz)
+      `,
+      [
+        input.workflowId,
+        input.runId,
+        input.partitionShard,
+        input.sequence,
+        input.activationId,
+        input.eventType,
+        encodeJson(input.payload),
+        input.createdAt,
+      ],
+    )
+  }
+
+  private async appendWorkflowHistoryForBatch(
+    client: Queryable,
+    inputs: Array<{
+      workflowId: string
+      runId: string
+      partitionShard: number
+      sequence: number
+      activationId: string | null
+      eventType: string
+      payload: JsonValue
+      createdAt: string
+    }>,
+  ): Promise<void> {
+    for (const group of this.groupByPhysicalPartition(inputs)) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS h(
+            workflow_id text,
+            run_id text,
+            partition_shard integer,
+            sequence integer,
+            activation_id text,
+            event_type text,
+            payload_json jsonb,
+            created_at timestamptz
+          )
+        )
+        INSERT INTO ${this.partitionedTable("workflow_history", group.partition)} (
+          workflow_id, run_id, partition_shard, sequence, activation_id,
+          event_type, payload_json, created_at
+        )
+        SELECT workflow_id, run_id, partition_shard, sequence, activation_id,
+          event_type, payload_json, created_at
+        FROM input
+        `,
+        [encodeJson(group.items.map((item) => ({
+          workflow_id: item.workflowId,
+          run_id: item.runId,
+          partition_shard: item.partitionShard,
+          sequence: item.sequence,
+          activation_id: item.activationId,
+          event_type: item.eventType,
+          payload_json: item.payload,
+          created_at: item.createdAt,
+        })))],
+      )
+    }
+  }
+
+  private async writeOutboxMessage(
+    client: Queryable,
+    input: OutboxMessageInput,
+  ): Promise<void> {
+    await client.query(
+      `
+      INSERT INTO ${this.partitionedTable("outbox", {
+        workflowId: input.sourceWorkflowId,
+        runId: input.sourceRunId,
+      })} (
+        message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+        message_type, payload_json, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz)
+      ON CONFLICT (message_id) DO NOTHING
+      `,
+      [
+        input.messageId,
+        input.sourceShard,
+        input.targetShard,
+        input.targetWorkflowId,
+        input.targetRunId,
+        input.messageType,
+        encodeJson(input.payload),
+        input.createdAt,
+      ],
+    )
+  }
+
+  private async writeOutboxMessages(
+    client: Queryable,
+    inputs: OutboxMessageInput[],
+  ): Promise<void> {
+    if (inputs.length === 0) {
+      return
+    }
+    const groups = new Map<number, typeof inputs>()
+    for (const input of inputs) {
+      const partition = this.physicalPartitionFor(input.sourceWorkflowId, input.sourceRunId)
+      const group = groups.get(partition) ?? []
+      group.push(input)
+      groups.set(partition, group)
+    }
+    for (const [partition, group] of groups) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS m(
+            message_id text,
+            source_shard integer,
+            target_shard integer,
+            target_workflow_id text,
+            target_run_id text,
+            message_type text,
+            payload_json jsonb,
+            created_at timestamptz
+          )
+        )
+        INSERT INTO ${this.partitionedTable("outbox", partition)} (
+          message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+          message_type, payload_json, created_at
+        )
+        SELECT message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+          message_type, payload_json, created_at
+        FROM input
+        ON CONFLICT (message_id) DO NOTHING
+        `,
+        [
+          encodeJson(
+            group.map((input) => ({
+              message_id: input.messageId,
+              source_shard: input.sourceShard,
+              target_shard: input.targetShard,
+              target_workflow_id: input.targetWorkflowId,
+              target_run_id: input.targetRunId,
+              message_type: input.messageType,
+              payload_json: input.payload,
+              created_at: input.createdAt,
+            })),
+          ),
+        ],
+      )
+    }
+  }
+
+  private async flushShardMessages(
+    client: PoolClient,
+    workerId: string,
+    shardIds: number[],
+    shardCount: number | undefined,
+    now: string,
+  ): Promise<void> {
+    if (shardIds.length === 0) {
+      return
+    }
+    const physicalPartitions = this.physicalPartitionsForShardIds(shardIds, shardCount)
+    await this.deliverOutboxMessages(client, workerId, shardIds, physicalPartitions, now)
+    await this.materializeInboxMessages(client, workerId, shardIds, physicalPartitions, now)
+  }
+
+  private async deliverOutboxMessages(
+    client: PoolClient,
+    workerId: string,
+    shardIds: number[],
+    physicalPartitions: number[],
+    now: string,
+  ): Promise<void> {
+    for (const partition of physicalPartitions) {
+      const rows = await this.rows<MessageRow>(
+        client,
+        `
+        SELECT message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+          message_type, payload_json, created_at
+        FROM ${this.partitionedTable("outbox", partition)}
+        WHERE source_shard = ANY($1::int[])
+        ORDER BY created_at, message_id
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        `,
+        [shardIds, this.messageBatchSize],
+      )
+      if (rows.length === 0) {
+        continue
+      }
+      for (const group of this.groupMessagesByPhysicalPartition(rows, "target")) {
+        await client.query(
+          `
+          INSERT INTO ${this.partitionedTable("inbox", {
+            workflowId: group.items[0]!.target_workflow_id,
+            runId: group.items[0]!.target_run_id,
+          })} (
+            message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+            message_type, payload_json, created_at
+          )
+          SELECT message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+            message_type, payload_json, created_at
+          FROM jsonb_to_recordset($1::jsonb) AS m(
+            message_id text,
+            source_shard integer,
+            target_shard integer,
+            target_workflow_id text,
+            target_run_id text,
+            message_type text,
+            payload_json jsonb,
+            created_at timestamptz
+          )
+          ON CONFLICT (message_id) DO NOTHING
+          `,
+          [encodeJson(group.items.map((row) => messageRowJson(row)))],
+        )
+      }
+      await client.query(
+        `
+        DELETE FROM ${this.partitionedTable("outbox", partition)}
+        WHERE message_id = ANY($1::text[])
+        `,
+        [rows.map((row) => row.message_id)],
+      )
+      for (const row of rows) {
+        this.log("debug", "provider.outbox.deliver", {
+          workerId,
+          messageId: row.message_id,
+          messageType: row.message_type,
+          shardId: row.source_shard,
+          targetShard: row.target_shard,
+        })
+        this.count("durable.provider.message", {
+          status: "delivered",
+          reason: row.message_type,
+          shardId: row.source_shard,
+        })
+      }
+    }
+  }
+
+  private async materializeInboxMessages(
+    client: PoolClient,
+    workerId: string,
+    shardIds: number[],
+    physicalPartitions: number[],
+    now: string,
+  ): Promise<void> {
+    for (const partition of physicalPartitions) {
+      const rows = await this.rows<MessageRow>(
+        client,
+        `
+        SELECT message_id, source_shard, target_shard, target_workflow_id, target_run_id,
+          message_type, payload_json, created_at
+        FROM ${this.partitionedTable("inbox", partition)}
+        WHERE target_shard = ANY($1::int[])
+        ORDER BY created_at,
+          CASE message_type
+            WHEN 'child_start' THEN 0
+            WHEN 'child_cancel' THEN 1
+            WHEN 'child_completed' THEN 2
+            ELSE 3
+          END,
+          message_id
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+        `,
+        [shardIds, this.messageBatchSize],
+      )
+      if (rows.length === 0) {
+        continue
+      }
+      const childStartRows = rows.filter((row) => row.message_type === "child_start")
+      if (childStartRows.length > 0) {
+        await this.materializeChildStartMessages(client, childStartRows, now)
+      }
+      const childCancelRows = rows.filter((row) => row.message_type === "child_cancel")
+      if (childCancelRows.length > 0) {
+        await this.materializeChildCancelMessages(client, childCancelRows, now)
+      }
+      const childCompletedRows = rows.filter((row) => row.message_type === "child_completed")
+      if (childCompletedRows.length > 0) {
+        await this.materializeChildCompletedMessages(client, childCompletedRows, now)
+      }
+      await client.query(
+        `
+        DELETE FROM ${this.partitionedTable("inbox", partition)}
+        WHERE message_id = ANY($1::text[])
+        `,
+        [rows.map((row) => row.message_id)],
+      )
+      for (const row of rows) {
+        this.log("debug", "provider.inbox.materialize", {
+          workerId,
+          messageId: row.message_id,
+          messageType: row.message_type,
+          shardId: row.target_shard,
+        })
+        this.count("durable.provider.message", {
+          status: "materialized",
+          reason: row.message_type,
+          shardId: row.target_shard,
+        })
+      }
+    }
+  }
+
+  private groupMessagesByPhysicalPartition(
+    rows: MessageRow[],
+    side: "source" | "target",
+  ): Array<{ partition: number; items: MessageRow[] }> {
+    const groups = new Map<number, MessageRow[]>()
+    for (const row of rows) {
+      const partition = this.physicalPartitionFor(
+        side === "source" ? "" : row.target_workflow_id,
+        side === "source" ? "" : row.target_run_id,
+      )
+      const group = groups.get(partition) ?? []
+      group.push(row)
+      groups.set(partition, group)
+    }
+    return [...groups.entries()].map(([partition, items]) => ({ partition, items }))
+  }
+
+  private groupChildStartPayloadsByPhysicalPartition(
+    payloads: ChildStartMessagePayload[],
+    side: "parent" | "child",
+  ): Array<{ partition: number; items: ChildStartMessagePayload[] }> {
+    const groups = new Map<number, ChildStartMessagePayload[]>()
+    for (const payload of payloads) {
+      const partition = this.physicalPartitionFor(
+        side === "parent" ? payload.parentWorkflowId : payload.workflowId,
+        side === "parent" ? payload.parentRunId : payload.runId,
+      )
+      const group = groups.get(partition) ?? []
+      group.push(payload)
+      groups.set(partition, group)
+    }
+    return [...groups.entries()].map(([partition, items]) => ({ partition, items }))
+  }
+
+  private async materializeChildStartMessages(
+    client: PoolClient,
+    rows: MessageRow[],
+    now: string,
+  ): Promise<void> {
+    const payloads = rows.map((row) => childStartPayloadFromMessage(row))
+    const payloadRefs = new Set<string>()
+    const hasDuplicatePayloadRef = payloads.some((payload) => {
+      const key = `${payload.workflowId}\0${payload.runId}`
+      if (payloadRefs.has(key)) {
+        return true
+      }
+      payloadRefs.add(key)
+      return false
+    })
+    if (
+      hasDuplicatePayloadRef ||
+      payloads.some((payload) => payload.conflictPolicy === "terminate_existing")
+    ) {
+      for (const row of rows) {
+        await this.materializeChildStartMessage(client, row, now)
+      }
+      return
+    }
+
+    const existingRows: Array<{ workflow_id: string; run_id: string }> = []
+    for (const group of this.groupChildStartPayloadsByPhysicalPartition(payloads, "child")) {
+      existingRows.push(
+        ...(await this.rows<{ workflow_id: string; run_id: string }>(
+          client,
+          `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS c(workflow_id text, run_id text)
+          )
+          SELECT i.workflow_id, i.run_id
+          FROM ${this.partitionedTable("instances", group.partition)} i
+          JOIN input
+            ON input.workflow_id = i.workflow_id
+           AND input.run_id = i.run_id
+          FOR UPDATE OF i
+          `,
+          [encodeJson(group.items.map((payload) => childStartPayloadJson(payload)))],
+        )),
+      )
+    }
+    if (existingRows.length > 0) {
+      for (const row of rows) {
+        await this.materializeChildStartMessage(client, row, now)
+      }
+      return
+    }
+
+    for (const group of this.groupChildStartPayloadsByPhysicalPartition(payloads, "child")) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS c(
+            child_record_id text,
+            parent_workflow_id text,
+            parent_run_id text,
+            workflow_name text,
+            workflow_version integer,
+            workflow_id text,
+            run_id text,
+            partition_shard integer,
+            common_json jsonb,
+            phase_name text,
+            phase_data_json jsonb,
+            waits_json jsonb,
+            created_at timestamptz
+          )
+        )
+        INSERT INTO ${this.partitionedTable("instances", group.partition)} (
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          sequence, status, common_json, phase_name, phase_data_json, output_json,
+          error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
+          parent_child_record_id, created_at, updated_at
+        )
+        SELECT
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          0, 'running', common_json, phase_name, phase_data_json, NULL,
+          NULL, NULL, waits_json, parent_workflow_id, parent_run_id,
+          child_record_id, created_at, created_at
+        FROM input
+        `,
+        [encodeJson(group.items.map((payload) => childStartPayloadJson(payload)))],
+      )
+    }
+
+    const readyStates = payloads.map((payload): ReadyEventInstanceState => ({
+      workflowName: payload.workflowName,
+      workflowVersion: payload.workflowVersion,
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+      partitionShard: payload.partitionShard,
+      sequence: 0,
+      status: "running",
+      waits: payload.waits,
+      updatedAt: payload.createdAt,
+      snapshot: readyEventSnapshotFromRunningState({
+        common: payload.common,
+        phase: payload.phase,
+        waits: payload.waits,
+        parentWorkflowId: payload.parentWorkflowId,
+        parentRunId: payload.parentRunId,
+        parentChildRecordId: payload.childRecordId,
+        createdAt: payload.createdAt,
+        updatedAt: payload.createdAt,
+      }),
+    }))
+    await this.insertReadyEventsForStates(client, readyStates)
+    await this.appendWorkflowHistoryForBatch(
+      client,
+      rows.map((row, index) => {
+        const payload = payloads[index]!
+        return {
+          workflowId: payload.workflowId,
+          runId: payload.runId,
+          partitionShard: payload.partitionShard,
+          sequence: 0,
+          activationId: null,
+          eventType: "child_start_materialized",
+          payload: { messageId: row.message_id, parentWorkflowId: payload.parentWorkflowId },
+          createdAt: now,
+        }
+      }),
+    )
+  }
+
+  private async materializeChildStartMessage(
+    client: PoolClient,
+    row: MessageRow,
+    now: string,
+  ): Promise<void> {
+    const payload = childStartPayloadFromMessage(row)
+    const existing = await this.instanceRow(client, {
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+    }, true)
+    if (existing) {
+      if (
+        existing.parent_workflow_id === payload.parentWorkflowId &&
+        existing.parent_run_id === payload.parentRunId &&
+        existing.parent_child_record_id === payload.childRecordId
+      ) {
+        return
+      }
+      if (payload.conflictPolicy === "terminate_existing") {
+        await this.deleteInstanceRecords(client, payload.workflowId, payload.runId)
+      } else {
+        await this.writeOutboxMessage(client, {
+          messageId: childCompletedMessageId(payload.childRecordId),
+          sourceWorkflowId: payload.workflowId,
+          sourceRunId: payload.runId,
+          sourceShard: payload.partitionShard,
+          targetWorkflowId: payload.parentWorkflowId,
+          targetRunId: payload.parentRunId,
+          targetShard: row.source_shard,
+          messageType: "child_completed",
+          payload: childCompletedMessagePayload({
+            childRecordId: payload.childRecordId,
+            parentWorkflowId: payload.parentWorkflowId,
+            parentRunId: payload.parentRunId,
+            workflowId: payload.workflowId,
+            runId: payload.runId,
+            status: "failed",
+            output: null,
+            error: {
+              name: "ChildStartConflict",
+              message: `Child start ${payload.key} failed: existing child instance (${payload.workflowId}/${payload.runId})`,
+            },
+            completedAt: now,
+          }),
+          createdAt: now,
+        })
+        return
+      }
+    }
+
+    await client.query(
+      `
+      INSERT INTO ${this.partitionedTable("instances", payload)} (
+        workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+        sequence, status, common_json, phase_name, phase_data_json, output_json,
+        error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
+        parent_child_record_id, created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, 0, 'running', $6::jsonb, $7, $8::jsonb,
+        NULL, NULL, NULL, $9::jsonb, $10, $11, $12, $13::timestamptz, $13::timestamptz
+      )
+      `,
+      [
+        payload.workflowName,
+        payload.workflowVersion,
+        payload.workflowId,
+        payload.runId,
+        payload.partitionShard,
+        encodeJson(payload.common),
+        payload.phase.name,
+        encodeJson(payload.phase.data),
+        encodeJson(payload.waits),
+        payload.parentWorkflowId,
+        payload.parentRunId,
+        payload.childRecordId,
+        payload.createdAt,
+      ],
+    )
+    await this.insertReadyEventsForState(client, {
+      workflowName: payload.workflowName,
+      workflowVersion: payload.workflowVersion,
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+      partitionShard: payload.partitionShard,
+      sequence: 0,
+      status: "running",
+      waits: payload.waits,
+      updatedAt: payload.createdAt,
+      snapshot: readyEventSnapshotFromRunningState({
+        common: payload.common,
+        phase: payload.phase,
+        waits: payload.waits,
+        parentWorkflowId: payload.parentWorkflowId,
+        parentRunId: payload.parentRunId,
+        parentChildRecordId: payload.childRecordId,
+        createdAt: payload.createdAt,
+        updatedAt: payload.createdAt,
+      }),
+    })
+    await this.appendWorkflowHistory(client, {
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+      partitionShard: payload.partitionShard,
+      sequence: 0,
+      activationId: null,
+      eventType: "child_start_materialized",
+      payload: { messageId: row.message_id, parentWorkflowId: payload.parentWorkflowId },
+      createdAt: now,
+    })
+  }
+
+  private async materializeChildCancelMessages(
+    client: PoolClient,
+    rows: MessageRow[],
+    now: string,
+  ): Promise<void> {
+    for (const row of rows) {
+      await this.materializeChildCancelMessage(client, row, now)
+    }
+  }
+
+  private async materializeChildCancelMessage(
+    client: PoolClient,
+    row: MessageRow,
+    now: string,
+  ): Promise<void> {
+    const payload = childCancelPayloadFromMessage(row)
+    const instance = await this.instanceRow(client, {
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+    }, true)
+    if (!instance || instance.status !== "running") {
+      return
+    }
+    if (
+      instance.parent_workflow_id !== payload.parentWorkflowId ||
+      instance.parent_run_id !== payload.parentRunId ||
+      instance.parent_child_record_id !== payload.childRecordId
+    ) {
+      return
+    }
+
+    const nextSequence = instance.sequence + 1
+    await client.query(
+      `
+      UPDATE ${this.partitionedTable("instances", payload)}
+      SET sequence = sequence + 1, status = 'canceled',
+        common_json = NULL, phase_name = NULL, phase_data_json = NULL,
+        output_json = NULL, error_json = NULL, cancel_reason = $1,
+        waits_json = $2::jsonb, updated_at = $3::timestamptz
+      WHERE workflow_id = $4 AND run_id = $5 AND status = 'running'
+      `,
+      [payload.reason.message, encodeJson([]), now, payload.workflowId, payload.runId],
+    )
+    await client.query(
+      `
+      DELETE FROM ${this.partitionedTable("activation_tasks", payload)}
+      WHERE workflow_id = $1 AND run_id = $2
+      `,
+      [payload.workflowId, payload.runId],
+    )
+    await this.appendWorkflowHistory(client, {
+      workflowId: payload.workflowId,
+      runId: payload.runId,
+      partitionShard: instance.partition_shard,
+      sequence: nextSequence,
+      activationId: null,
+      eventType: "child_cancel_materialized",
+      payload: { messageId: row.message_id, parentWorkflowId: payload.parentWorkflowId },
+      createdAt: now,
+    })
+    await this.closeStartedChildren(
+      client,
+      payload.workflowId,
+      payload.runId,
+      now,
+      nextSequence,
+      "canceled",
+    )
+  }
+
+  private async materializeChildCompletedMessages(
+    client: PoolClient,
+    rows: MessageRow[],
+    now: string,
+  ): Promise<void> {
+    const payloads = rows.map((row) => childCompletedPayloadFromMessage(row))
+    const updatedRows: Array<{
+      message_id: string
+      parent_workflow_id: string
+      parent_run_id: string
+      child_record_id: string
+      workflow_id: string
+      run_id: string
+      status: "completed" | "failed"
+    }> = []
+    const byParentPartition = new Map<number, Array<ChildCompletedMessagePayload & { messageId: string }>>()
+    for (const [index, payload] of payloads.entries()) {
+      const partition = this.physicalPartitionFor(payload.parentWorkflowId, payload.parentRunId)
+      const group = byParentPartition.get(partition) ?? []
+      group.push({ ...payload, messageId: rows[index]!.message_id })
+      byParentPartition.set(partition, group)
+    }
+
+    for (const [partition, group] of byParentPartition) {
+      updatedRows.push(
+        ...(await this.rows<{
+          message_id: string
+          parent_workflow_id: string
+          parent_run_id: string
+          child_record_id: string
+          workflow_id: string
+          run_id: string
+          status: "completed" | "failed"
+        }>(
+          client,
+          `
+          WITH input AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS c(
+              message_id text,
+              child_record_id text,
+              parent_workflow_id text,
+              parent_run_id text,
+              workflow_id text,
+              run_id text,
+              status text,
+              completed_at timestamptz,
+              output_json jsonb,
+              error_json jsonb
+            )
+          )
+          UPDATE ${this.partitionedTable("children", partition)} target
+          SET status = input.status,
+            completed_at = input.completed_at,
+            output_json = input.output_json,
+            error_json = input.error_json
+          FROM input
+          WHERE target.child_record_id = input.child_record_id
+            AND target.parent_workflow_id = input.parent_workflow_id
+            AND target.parent_run_id = input.parent_run_id
+            AND target.status = 'started'
+          RETURNING input.message_id, target.parent_workflow_id, target.parent_run_id,
+            target.child_record_id, target.workflow_id, target.run_id, target.status
+          `,
+          [
+            encodeJson(
+              group.map((payload) => ({
+                message_id: payload.messageId,
+                child_record_id: payload.childRecordId,
+                parent_workflow_id: payload.parentWorkflowId,
+                parent_run_id: payload.parentRunId,
+                workflow_id: payload.workflowId,
+                run_id: payload.runId,
+                status: payload.status,
+                completed_at: payload.completedAt,
+                output_json: payload.output,
+                error_json: payload.error,
+              })),
+            ),
+          ],
+        )),
+      )
+    }
+
+    if (updatedRows.length === 0) {
+      return
+    }
+
+    const parentRefs = new Map<string, WorkflowRunRef>()
+    for (const row of updatedRows) {
+      const key = `${row.parent_workflow_id}\0${row.parent_run_id}`
+      parentRefs.set(key, { workflowId: row.parent_workflow_id, runId: row.parent_run_id })
+    }
+
+    const parents: InstanceRow[] = []
+    for (const group of this.groupByPhysicalPartition([...parentRefs.values()])) {
+      await client.query(
+        `
+        WITH wanted AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS w(workflow_id text, run_id text)
+        )
+        DELETE FROM ${this.partitionedTable("activation_tasks", group.partition)} target
+        USING wanted
+        WHERE target.workflow_id = wanted.workflow_id
+          AND target.run_id = wanted.run_id
+          AND target.claim_owner_id IS NULL
+          AND target.completed_by_sequence IS NULL
+        `,
+        [
+          encodeJson(
+            group.items.map((ref) => ({
+              workflow_id: ref.workflowId,
+              run_id: ref.runId,
+            })),
+          ),
+        ],
+      )
+      parents.push(
+        ...(await this.rows<InstanceRow>(
+          client,
+          `
+          WITH wanted AS (
+            SELECT *
+            FROM jsonb_to_recordset($1::jsonb) AS w(workflow_id text, run_id text)
+          )
+          SELECT i.*
+          FROM ${this.partitionedTable("instances", group.partition)} i
+          JOIN wanted
+            ON wanted.workflow_id = i.workflow_id
+           AND wanted.run_id = i.run_id
+          FOR UPDATE OF i
+          `,
+          [
+            encodeJson(
+              group.items.map((ref) => ({
+                workflow_id: ref.workflowId,
+                run_id: ref.runId,
+              })),
+            ),
+          ],
+        )),
+      )
+    }
+    await this.insertReadyEventsForStates(
+      client,
+      parents.map((parent) => readyEventStateFromInstanceRow(parent)),
+    )
+
+    const parentByKey = new Map(parents.map((parent) => [`${parent.workflow_id}\0${parent.run_id}`, parent]))
+    await this.appendWorkflowHistoryForBatch(
+      client,
+      updatedRows.flatMap((row) => {
+        const parent = parentByKey.get(`${row.parent_workflow_id}\0${row.parent_run_id}`)
+        if (!parent) {
+          return []
+        }
+        return [{
+          workflowId: row.parent_workflow_id,
+          runId: row.parent_run_id,
+          partitionShard: parent.partition_shard,
+          sequence: parent.sequence,
+          activationId: null,
+          eventType: "child_completed_materialized",
+          payload: {
+            messageId: row.message_id,
+            childRecordId: row.child_record_id,
+            childWorkflowId: row.workflow_id,
+            childRunId: row.run_id,
+            status: row.status,
+          },
+          createdAt: now,
+        }]
+      }),
+    )
+  }
+
+  private async materializeChildCompletedMessage(
+    client: PoolClient,
+    row: MessageRow,
+    now: string,
+  ): Promise<void> {
+    const payload = childCompletedPayloadFromMessage(row)
+    const parentRef = {
+      workflowId: payload.parentWorkflowId,
+      runId: payload.parentRunId,
+    }
+    const updated = await this.one<ChildRow>(
+      client,
+      `
+      UPDATE ${this.partitionedTable("children", parentRef)}
+      SET status = $1, completed_at = $2::timestamptz,
+        output_json = $3::jsonb, error_json = $4::jsonb
+      WHERE child_record_id = $5
+        AND parent_workflow_id = $6
+        AND parent_run_id = $7
+        AND status = 'started'
+      RETURNING *
+      `,
+      [
+        payload.status,
+        payload.completedAt,
+        encodeJson(payload.output),
+        encodeJson(payload.error),
+        payload.childRecordId,
+        payload.parentWorkflowId,
+        payload.parentRunId,
+      ],
+    )
+    if (!updated) {
+      return
+    }
+    const parent = await this.instanceRow(client, parentRef, true)
+    if (parent) {
+      await this.replaceReadyEventsForState(client, readyEventStateFromInstanceRow(parent))
+      await this.appendWorkflowHistory(client, {
+        workflowId: payload.parentWorkflowId,
+        runId: payload.parentRunId,
+        partitionShard: parent.partition_shard,
+        sequence: parent.sequence,
+        activationId: null,
+        eventType: "child_completed_materialized",
+        payload: {
+          messageId: row.message_id,
+          childRecordId: payload.childRecordId,
+          childWorkflowId: payload.workflowId,
+          childRunId: payload.runId,
+          status: payload.status,
+        },
+        createdAt: now,
+      })
+    }
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -2408,7 +3494,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (!Number.isInteger(partition) || partition < 0 || partition >= this.physicalPartitions) {
       throw new Error(`Invalid physical partition ${partition}`)
     }
-    return this.table(`${name}_${this.partitionSuffix(partition)}`)
+    return this.table(`${this.physicalTableName(name)}_${this.partitionSuffix(partition)}`)
   }
 
   private partitionedTables(name: PartitionedTableName): string[] {
@@ -2422,6 +3508,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       .map((table) => selectTemplate.replaceAll("{table}", table))
       .join("\nUNION ALL\n")
     return suffix ? `${union}\n${suffix}` : union
+  }
+
+  private physicalTableName(name: PartitionedTableName): string {
+    if (name === "instances") {
+      return "workflow_state"
+    }
+    if (name === "activation_tasks") {
+      return "tasks"
+    }
+    return name
   }
 
   private groupByPhysicalPartition<T extends WorkflowRunRef>(
@@ -3847,9 +4943,12 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `
       SELECT * FROM ${this.partitionedTable("activation_tasks", input)}
       WHERE activation_id = $1
-        AND NOT EXISTS (
+        AND (
+          NOT has_effects
+          OR NOT EXISTS (
           SELECT 1 FROM ${this.partitionedTable("activity_deadlines", input)} d
           WHERE d.activation_id = $1 AND d.deadline_at <= $2::timestamptz
+          )
         )
       FOR UPDATE
       `,
@@ -4221,11 +5320,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       if (existingForKey && start.conflictPolicy !== "terminate_existing") {
         return childStartCommitConflict("existing_child_activation_key", start)
       }
-
-      const existingInstance = await this.instanceRow(client, start)
-      if (existingInstance && start.conflictPolicy !== "terminate_existing") {
-        return childStartCommitConflict("existing_child_instance", start)
-      }
     }
     return undefined
   }
@@ -4307,49 +5401,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       }
     }
 
-    const existingInstanceRows: Array<IndexedChildStartExistingRow<InstanceRow>> = []
-    const byChildPartition = new Map<number, typeof flattened>()
-    for (const row of flattened) {
-      const partition = this.physicalPartitionFor(row.workflow_id, row.run_id)
-      const group = byChildPartition.get(partition) ?? []
-      group.push(row)
-      byChildPartition.set(partition, group)
-    }
-    for (const [partition, rows] of byChildPartition) {
-      existingInstanceRows.push(
-        ...(await this.rows<IndexedChildStartExistingRow<InstanceRow>>(
-          client,
-          `
-          WITH input AS (
-            SELECT *
-            FROM jsonb_to_recordset($1::jsonb) AS i(
-              input_index integer,
-              start_index integer,
-              workflow_id text,
-              run_id text
-            )
-          )
-          SELECT input.input_index, input.start_index, i.*
-          FROM input
-          JOIN ${this.partitionedTable("instances", partition)} i
-            ON i.workflow_id = input.workflow_id
-           AND i.run_id = input.run_id
-          FOR UPDATE OF i
-          `,
-          [encodeJson(rows)],
-        )),
-      )
-    }
-    for (const row of existingInstanceRows) {
-      if (conflicts.has(row.input_index)) {
-        continue
-      }
-      const start = inputs[row.input_index].childStarts?.[row.start_index]
-      if (start && start.conflictPolicy !== "terminate_existing") {
-        conflicts.set(row.input_index, childStartCommitConflict("existing_child_instance", start))
-      }
-    }
-
     return conflicts
   }
 
@@ -4369,47 +5420,28 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         [input.workflowId, input.runId, input.activationId, start.key],
       )
       if (existingForKey && start.conflictPolicy === "terminate_existing") {
-        await this.deleteInstanceRecords(client, existingForKey.workflow_id, existingForKey.run_id)
-      }
-      if ((await this.instanceRow(client, start)) && start.conflictPolicy === "terminate_existing") {
-        await this.deleteInstanceRecords(client, start.workflowId, start.runId)
+        await this.cancelStartedChild(client, existingForKey, input.now, {
+          deliverToParent: false,
+          deliveredBySequence: input.expectedSequence + 1,
+          reason: parentClosedChildError("canceled"),
+        })
+        await client.query(
+          `
+          DELETE FROM ${this.partitionedTable("children", input)}
+          WHERE child_record_id = $1
+          `,
+          [existingForKey.child_record_id],
+        )
       }
 
       const childRecordId = `child-${randomUUID()}`
       await client.query(
         `
-        INSERT INTO ${this.partitionedTable("instances", start)} (
-          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
-          sequence, status, common_json, phase_name, phase_data_json, output_json,
-          error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
-          parent_child_record_id, created_at, updated_at
-        ) VALUES (
-          $1, $2, $3, $4, $5, 0, 'running', $6::jsonb, $7, $8::jsonb,
-          NULL, NULL, NULL, $9::jsonb, $10, $11, $12, $13::timestamptz, $13::timestamptz
-        )
-        `,
-        [
-          start.workflowName,
-          start.workflowVersion,
-          start.workflowId,
-          start.runId,
-          start.partitionShard,
-          encodeJson(start.common),
-          start.phase.name,
-          encodeJson(start.phase.data),
-          encodeJson(start.waits),
-          input.workflowId,
-          input.runId,
-          childRecordId,
-          input.now,
-        ],
-      )
-      await client.query(
-        `
         INSERT INTO ${this.partitionedTable("children", input)} (
           child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-          workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', $10)
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          status, parent_close_policy
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'started', $11)
         `,
         [
           childRecordId,
@@ -4421,29 +5453,26 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
           start.workflowVersion,
           start.workflowId,
           start.runId,
+          start.partitionShard,
           start.parentClosePolicy ?? "cancel",
         ],
       )
-      await this.insertReadyEventsForState(client, {
-        workflowName: start.workflowName,
-        workflowVersion: start.workflowVersion,
-        workflowId: start.workflowId,
-        runId: start.runId,
-        partitionShard: start.partitionShard,
-        sequence: 0,
-        status: "running",
-        waits: start.waits,
-        updatedAt: input.now,
-        snapshot: readyEventSnapshotFromRunningState({
-          common: start.common,
-          phase: start.phase,
-          waits: start.waits,
-          parentWorkflowId: input.workflowId,
-          parentRunId: input.runId,
-          parentChildRecordId: childRecordId,
-          createdAt: input.now,
-          updatedAt: input.now,
+      const parent = await this.instanceRow(client, input)
+      await this.writeOutboxMessage(client, {
+        messageId: childStartMessageId(childRecordId),
+        sourceWorkflowId: input.workflowId,
+        sourceRunId: input.runId,
+        sourceShard: parent?.partition_shard ?? start.partitionShard,
+        targetWorkflowId: start.workflowId,
+        targetRunId: start.runId,
+        targetShard: start.partitionShard,
+        messageType: "child_start",
+        payload: childStartMessagePayload({
+          childRecordId,
+          input,
+          start,
         }),
+        createdAt: input.now,
       })
       this.log("info", "provider.child.create", {
         workflowName: start.workflowName,
@@ -4466,9 +5495,9 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   private async writeCheckpointChildStartsForBatch(
     client: PoolClient,
-    inputs: CommitCheckpointInput[],
+    successes: Array<{ input: CommitActivationInput; instance: InstanceRow }>,
   ): Promise<void> {
-    const flattened = inputs.flatMap((input) =>
+    const flattened = successes.flatMap(({ input, instance }) =>
       (input.childStarts ?? []).map((start) => ({
         child_record_id: `child-${randomUUID()}`,
         parent_workflow_id: input.workflowId,
@@ -4487,6 +5516,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         parent_close_policy: start.parentClosePolicy ?? "cancel",
         conflict_policy: start.conflictPolicy ?? "use_existing",
         now: input.now,
+        source_shard: instance.partition_shard,
         start,
       })),
     )
@@ -4494,19 +5524,14 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       return
     }
     if (flattened.some((row) => row.conflict_policy === "terminate_existing")) {
-      for (const input of inputs) {
+      for (const { input } of successes) {
         await this.writeCheckpointChildStarts(client, input)
       }
       return
     }
 
-    const byChildPartition = new Map<number, typeof flattened>()
     const byParentPartition = new Map<number, typeof flattened>()
     for (const row of flattened) {
-      const childPartition = this.physicalPartitionFor(row.workflow_id, row.run_id)
-      const childGroup = byChildPartition.get(childPartition) ?? []
-      childGroup.push(row)
-      byChildPartition.set(childPartition, childGroup)
       const parentPartition = this.physicalPartitionFor(
         row.parent_workflow_id,
         row.parent_run_id,
@@ -4516,43 +5541,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       byParentPartition.set(parentPartition, parentGroup)
     }
 
-    for (const [partition, rows] of byChildPartition) {
-      await client.query(
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS c(
-            child_record_id text,
-            parent_workflow_id text,
-            parent_run_id text,
-            workflow_name text,
-            workflow_version integer,
-            workflow_id text,
-            run_id text,
-            partition_shard integer,
-            common_json jsonb,
-            phase_name text,
-            phase_data_json jsonb,
-            waits_json jsonb,
-            now timestamptz
-          )
-        )
-        INSERT INTO ${this.partitionedTable("instances", partition)} (
-          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
-          sequence, status, common_json, phase_name, phase_data_json, output_json,
-          error_json, cancel_reason, waits_json, parent_workflow_id, parent_run_id,
-          parent_child_record_id, created_at, updated_at
-        )
-        SELECT
-          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
-          0, 'running', common_json, phase_name, phase_data_json, NULL,
-          NULL, NULL, waits_json, parent_workflow_id, parent_run_id,
-          child_record_id, now, now
-        FROM input
-        `,
-        [encodeJson(rows)],
-      )
-    }
     for (const [partition, rows] of byParentPartition) {
       await client.query(
         `
@@ -4568,44 +5556,49 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
             workflow_version integer,
             workflow_id text,
             run_id text,
+            partition_shard integer,
             parent_close_policy text
           )
         )
         INSERT INTO ${this.partitionedTable("children", partition)} (
           child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-          workflow_name, workflow_version, workflow_id, run_id, status, parent_close_policy
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          status, parent_close_policy
         )
         SELECT
           child_record_id, parent_workflow_id, parent_run_id, activation_id, key,
-          workflow_name, workflow_version, workflow_id, run_id, 'started', parent_close_policy
+          workflow_name, workflow_version, workflow_id, run_id, partition_shard,
+          'started', parent_close_policy
         FROM input
         `,
         [encodeJson(rows)],
       )
     }
-
-    for (const row of flattened) {
-      await this.insertReadyEventsForState(client, {
-        workflowName: row.workflow_name,
-        workflowVersion: row.workflow_version,
-        workflowId: row.workflow_id,
-        runId: row.run_id,
-        partitionShard: row.partition_shard,
-        sequence: 0,
-        status: "running",
-        waits: row.waits_json,
-        updatedAt: row.now,
-        snapshot: readyEventSnapshotFromRunningState({
-          common: row.common_json,
-          phase: { name: row.phase_name, data: row.phase_data_json },
-          waits: row.waits_json,
-          parentWorkflowId: row.parent_workflow_id,
-          parentRunId: row.parent_run_id,
-          parentChildRecordId: row.child_record_id,
-          createdAt: row.now,
-          updatedAt: row.now,
+    await this.writeOutboxMessages(
+      client,
+      flattened.map((row) => ({
+        messageId: childStartMessageId(row.child_record_id),
+        sourceWorkflowId: row.parent_workflow_id,
+        sourceRunId: row.parent_run_id,
+        sourceShard: row.source_shard,
+        targetWorkflowId: row.workflow_id,
+        targetRunId: row.run_id,
+        targetShard: row.partition_shard,
+        messageType: "child_start",
+        payload: childStartMessagePayload({
+          childRecordId: row.child_record_id,
+          input: {
+            workflowId: row.parent_workflow_id,
+            runId: row.parent_run_id,
+            activationId: row.activation_id,
+            now: row.now,
+          },
+          start: row.start,
         }),
-      })
+        createdAt: row.now,
+      })),
+    )
+    for (const row of flattened) {
       this.log("info", "provider.child.create", {
         workflowName: row.workflow_name,
         workflowId: row.workflow_id,
@@ -4869,213 +5862,59 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (!partitionRef) {
       return
     }
-    const running = successes
-      .filter(({ input }) => input.next.status === "running")
-      .map(({ input, nextSequence }) => {
-        if (input.next.status !== "running") {
-          throw new Error("unreachable")
-        }
-        return {
-          workflow_id: input.workflowId,
-          run_id: input.runId,
-          workflow_version: input.workflowVersion,
-          sequence: nextSequence,
-          common_json: input.next.common,
-          phase_name: input.next.phase.name,
-          phase_data_json: input.next.phase.data,
-          waits_json: input.waits,
-          updated_at: input.now,
-        }
-      })
-    if (running.length > 0) {
-      await client.query(
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS i(
-            workflow_id text,
-            run_id text,
-            workflow_version integer,
-            sequence integer,
-            common_json jsonb,
-            phase_name text,
-            phase_data_json jsonb,
-            waits_json jsonb,
-            updated_at timestamptz
-          )
+    const rows = successes.map(({ input, nextSequence }) => ({
+      workflow_id: input.workflowId,
+      run_id: input.runId,
+      workflow_version: input.workflowVersion,
+      sequence: nextSequence,
+      status: input.next.status,
+      common_json: input.next.status === "running" ? input.next.common : null,
+      phase_name: input.next.status === "running" ? input.next.phase.name : null,
+      phase_data_json: input.next.status === "running" ? input.next.phase.data : null,
+      output_json: input.next.status === "completed" ? toJson(input.next.output) : null,
+      error_json: input.next.status === "failed" ? input.next.error : null,
+      cancel_reason: input.next.status === "canceled" ? input.next.reason : null,
+      waits_json: input.waits,
+      updated_at: input.now,
+    }))
+    await client.query(
+      `
+      WITH input AS (
+        SELECT *
+        FROM jsonb_to_recordset($1::jsonb) AS i(
+          workflow_id text,
+          run_id text,
+          workflow_version integer,
+          sequence integer,
+          status text,
+          common_json jsonb,
+          phase_name text,
+          phase_data_json jsonb,
+          output_json jsonb,
+          error_json jsonb,
+          cancel_reason text,
+          waits_json jsonb,
+          updated_at timestamptz
         )
-        UPDATE ${this.partitionedTable("instances", partitionRef)} target
-        SET workflow_version = input.workflow_version,
-          sequence = input.sequence,
-          status = 'running',
-          common_json = input.common_json,
-          phase_name = input.phase_name,
-          phase_data_json = input.phase_data_json,
-          output_json = NULL,
-          error_json = NULL,
-          cancel_reason = NULL,
-          waits_json = input.waits_json,
-          updated_at = input.updated_at
-        FROM input
-        WHERE target.workflow_id = input.workflow_id
-          AND target.run_id = input.run_id
-        `,
-        [encodeJson(running)],
       )
-    }
-
-    const completed = successes
-      .filter(({ input }) => input.next.status === "completed")
-      .map(({ input, nextSequence }) => {
-        if (input.next.status !== "completed") {
-          throw new Error("unreachable")
-        }
-        return {
-          workflow_id: input.workflowId,
-          run_id: input.runId,
-          workflow_version: input.workflowVersion,
-          sequence: nextSequence,
-          output_json: toJson(input.next.output),
-          waits_json: input.waits,
-          updated_at: input.now,
-        }
-      })
-    if (completed.length > 0) {
-      await client.query(
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS i(
-            workflow_id text,
-            run_id text,
-            workflow_version integer,
-            sequence integer,
-            output_json jsonb,
-            waits_json jsonb,
-            updated_at timestamptz
-          )
-        )
-        UPDATE ${this.partitionedTable("instances", partitionRef)} target
-        SET workflow_version = input.workflow_version,
-          sequence = input.sequence,
-          status = 'completed',
-          common_json = NULL,
-          phase_name = NULL,
-          phase_data_json = NULL,
-          output_json = input.output_json,
-          error_json = NULL,
-          cancel_reason = NULL,
-          waits_json = input.waits_json,
-          updated_at = input.updated_at
-        FROM input
-        WHERE target.workflow_id = input.workflow_id
-          AND target.run_id = input.run_id
-        `,
-        [encodeJson(completed)],
-      )
-    }
-
-    const canceled = successes
-      .filter(({ input }) => input.next.status === "canceled")
-      .map(({ input, nextSequence }) => {
-        if (input.next.status !== "canceled") {
-          throw new Error("unreachable")
-        }
-        return {
-          workflow_id: input.workflowId,
-          run_id: input.runId,
-          workflow_version: input.workflowVersion,
-          sequence: nextSequence,
-          cancel_reason: input.next.reason,
-          waits_json: input.waits,
-          updated_at: input.now,
-        }
-      })
-    if (canceled.length > 0) {
-      await client.query(
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS i(
-            workflow_id text,
-            run_id text,
-            workflow_version integer,
-            sequence integer,
-            cancel_reason text,
-            waits_json jsonb,
-            updated_at timestamptz
-          )
-        )
-        UPDATE ${this.partitionedTable("instances", partitionRef)} target
-        SET workflow_version = input.workflow_version,
-          sequence = input.sequence,
-          status = 'canceled',
-          common_json = NULL,
-          phase_name = NULL,
-          phase_data_json = NULL,
-          output_json = NULL,
-          error_json = NULL,
-          cancel_reason = input.cancel_reason,
-          waits_json = input.waits_json,
-          updated_at = input.updated_at
-        FROM input
-        WHERE target.workflow_id = input.workflow_id
-          AND target.run_id = input.run_id
-        `,
-        [encodeJson(canceled)],
-      )
-    }
-
-    const failed = successes
-      .filter(({ input }) => input.next.status === "failed")
-      .map(({ input, nextSequence }) => {
-        if (input.next.status !== "failed") {
-          throw new Error("unreachable")
-        }
-        return {
-          workflow_id: input.workflowId,
-          run_id: input.runId,
-          workflow_version: input.workflowVersion,
-          sequence: nextSequence,
-          error_json: input.next.error,
-          waits_json: input.waits,
-          updated_at: input.now,
-        }
-      })
-    if (failed.length > 0) {
-      await client.query(
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS i(
-            workflow_id text,
-            run_id text,
-            workflow_version integer,
-            sequence integer,
-            error_json jsonb,
-            waits_json jsonb,
-            updated_at timestamptz
-          )
-        )
-        UPDATE ${this.partitionedTable("instances", partitionRef)} target
-        SET workflow_version = input.workflow_version,
-          sequence = input.sequence,
-          status = 'failed',
-          common_json = NULL,
-          phase_name = NULL,
-          phase_data_json = NULL,
-          output_json = NULL,
-          error_json = input.error_json,
-          cancel_reason = NULL,
-          waits_json = input.waits_json,
-          updated_at = input.updated_at
-        FROM input
-        WHERE target.workflow_id = input.workflow_id
-          AND target.run_id = input.run_id
-        `,
-        [encodeJson(failed)],
-      )
-    }
+      UPDATE ${this.partitionedTable("instances", partitionRef)} target
+      SET workflow_version = input.workflow_version,
+        sequence = input.sequence,
+        status = input.status,
+        common_json = input.common_json,
+        phase_name = input.phase_name,
+        phase_data_json = input.phase_data_json,
+        output_json = input.output_json,
+        error_json = input.error_json,
+        cancel_reason = input.cancel_reason,
+        waits_json = input.waits_json,
+        updated_at = input.updated_at
+      FROM input
+      WHERE target.workflow_id = input.workflow_id
+        AND target.run_id = input.run_id
+      `,
+      [encodeJson(rows)],
+    )
   }
 
   private async consumeSignalsForBatch(
@@ -5150,7 +5989,11 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   private async completeActivationTasksForBatch(
     client: PoolClient,
-    successes: Array<{ input: CommitActivationInput; nextSequence: number }>,
+    successes: Array<{
+      input: CommitActivationInput
+      nextSequence: number
+      claim?: Pick<ActivationClaimRow, "has_effects">
+    }>,
   ): Promise<void> {
     const partitionRef = successes[0]?.input
     if (!partitionRef) {
@@ -5180,31 +6023,34 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       `,
       [encodeJson(rows)],
     )
-    await client.query(
-      `
-      WITH input AS (
-        SELECT *
-        FROM jsonb_to_recordset($1::jsonb) AS i(activation_id text)
+    const effectRows = successes
+      .filter(({ claim, input }) =>
+        claim === undefined ||
+        claim.has_effects ||
+        (input.effects ?? []).some((effect) => effect.status !== "completed")
       )
-      DELETE FROM ${this.partitionedTable("effects", partitionRef)} target
-      USING input
-      WHERE target.activation_id = input.activation_id
-      `,
-      [encodeJson(rows)],
-    )
+      .map(({ input }) => ({ activation_id: input.activationId }))
+    if (effectRows.length > 0) {
+      await client.query(
+        `
+        WITH input AS (
+          SELECT *
+          FROM jsonb_to_recordset($1::jsonb) AS i(activation_id text)
+        )
+        DELETE FROM ${this.partitionedTable("effects", partitionRef)} target
+        USING input
+        WHERE target.activation_id = input.activation_id
+        `,
+        [encodeJson(effectRows)],
+      )
+    }
   }
 
-  private async updateParentChildRecordsForBatch(
+  private async writeChildCompletionOutboxForBatch(
     client: PoolClient,
     successes: Array<{ input: CommitActivationInput; instance: InstanceRow; nextSequence: number }>,
   ): Promise<void> {
-    const completions: Array<WorkflowRunRef & {
-      child_record_id: string
-      status: "completed" | "failed"
-      completed_at: string
-      output_json: JsonValue | null
-      error_json: JsonValue | null
-    }> = []
+    const messages: OutboxMessageInput[] = []
     for (const { input, instance } of successes) {
       if (
         !instance.parent_child_record_id ||
@@ -5214,15 +6060,32 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       ) {
         continue
       }
+      const parentShard = await this.parentShardForChildCompletion(client, instance)
+      if (parentShard === null) {
+        continue
+      }
       if (input.next.status === "completed") {
-        completions.push({
-          workflowId: instance.parent_workflow_id,
-          runId: instance.parent_run_id,
-          child_record_id: instance.parent_child_record_id,
-          status: "completed",
-          completed_at: input.now,
-          output_json: toJson(input.next.output),
-          error_json: null,
+        messages.push({
+          messageId: childCompletedMessageId(instance.parent_child_record_id),
+          sourceWorkflowId: instance.workflow_id,
+          sourceRunId: instance.run_id,
+          sourceShard: instance.partition_shard,
+          targetWorkflowId: instance.parent_workflow_id,
+          targetRunId: instance.parent_run_id,
+          targetShard: parentShard,
+          messageType: "child_completed",
+          payload: childCompletedMessagePayload({
+            childRecordId: instance.parent_child_record_id,
+            parentWorkflowId: instance.parent_workflow_id,
+            parentRunId: instance.parent_run_id,
+            workflowId: instance.workflow_id,
+            runId: instance.run_id,
+            status: "completed",
+            output: toJson(input.next.output),
+            error: null,
+            completedAt: input.now,
+          }),
+          createdAt: input.now,
         })
         continue
       }
@@ -5230,92 +6093,36 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         input.next.status === "failed"
           ? input.next.error
           : { message: input.next.reason || "Child canceled" }
-      completions.push({
-        workflowId: instance.parent_workflow_id,
-        runId: instance.parent_run_id,
-        child_record_id: instance.parent_child_record_id,
-        status: "failed",
-        completed_at: input.now,
-        output_json: null,
-        error_json: error,
+      messages.push({
+        messageId: childCompletedMessageId(instance.parent_child_record_id),
+        sourceWorkflowId: instance.workflow_id,
+        sourceRunId: instance.run_id,
+        sourceShard: instance.partition_shard,
+        targetWorkflowId: instance.parent_workflow_id,
+        targetRunId: instance.parent_run_id,
+        targetShard: parentShard,
+        messageType: "child_completed",
+        payload: childCompletedMessagePayload({
+          childRecordId: instance.parent_child_record_id,
+          parentWorkflowId: instance.parent_workflow_id,
+          parentRunId: instance.parent_run_id,
+          workflowId: instance.workflow_id,
+          runId: instance.run_id,
+          status: "failed",
+          output: null,
+          error,
+          completedAt: input.now,
+        }),
+        createdAt: input.now,
       })
     }
-    if (completions.length === 0) {
-      return
-    }
-
-    const refreshedParents = new Set<string>()
-    for (const group of this.groupByPhysicalPartition(completions)) {
-      const updated = await this.rows<{ parent_workflow_id: string; parent_run_id: string }>(
-        client,
-        `
-        WITH input AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS i(
-            child_record_id text,
-            status text,
-            completed_at timestamptz,
-            output_json jsonb,
-            error_json jsonb
-          )
-        )
-        UPDATE ${this.partitionedTable("children", group.partition)} target
-        SET status = input.status,
-          completed_at = input.completed_at,
-          output_json = input.output_json,
-          error_json = input.error_json
-        FROM input
-        WHERE target.child_record_id = input.child_record_id
-          AND target.status = 'started'
-        RETURNING target.parent_workflow_id, target.parent_run_id
-        `,
-        [encodeJson(group.items)],
-      )
-      for (const row of updated) {
-        refreshedParents.add(`${row.parent_workflow_id}\0${row.parent_run_id}`)
-      }
-    }
-
-    const parentRefs = [...refreshedParents].map((key) => {
-      const [workflowId, runId] = key.split("\0")
-      return { workflowId: workflowId!, runId: runId! }
-    })
-    for (const group of this.groupByPhysicalPartition(parentRefs)) {
-      const parents = await this.rows<InstanceRow>(
-        client,
-        `
-        WITH wanted AS (
-          SELECT *
-          FROM jsonb_to_recordset($1::jsonb) AS w(workflow_id text, run_id text)
-        )
-        SELECT i.*
-        FROM ${this.partitionedTable("instances", group.partition)} i
-        JOIN wanted
-          ON wanted.workflow_id = i.workflow_id
-         AND wanted.run_id = i.run_id
-        WHERE i.status = 'running'
-        `,
-        [
-          encodeJson(
-            group.items.map((ref) => ({
-              workflow_id: ref.workflowId,
-              run_id: ref.runId,
-            })),
-          ),
-        ],
-      )
-      await this.insertReadyEventsForStates(
-        client,
-        parents.map((parent) => readyEventStateFromInstanceRow(parent)),
-      )
-    }
+    await this.writeOutboxMessages(client, messages)
   }
 
-  private async updateParentChildRecord(
+  private async writeChildCompletionOutbox(
     client: PoolClient,
     previous: InstanceRow,
     input: CommitCheckpointInput,
-    nextSequence: number,
   ): Promise<void> {
     if (
       !previous.parent_child_record_id ||
@@ -5325,55 +6132,70 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     ) {
       return
     }
-    const existing = await this.one<ChildRow>(
-      client,
-      `
-      SELECT * FROM ${this.partitionedTable("children", {
-        workflowId: previous.parent_workflow_id,
-        runId: previous.parent_run_id,
-      })}
-      WHERE child_record_id = $1 AND status = 'started'
-      LIMIT 1
-      FOR UPDATE
-      `,
-      [previous.parent_child_record_id],
-    )
-    if (!existing) {
+    const parentShard = await this.parentShardForChildCompletion(client, previous)
+    if (parentShard === null) {
       return
     }
-    if (input.next.status === "completed") {
-      await client.query(
-        `
-        UPDATE ${this.partitionedTable("children", {
-          workflowId: existing.parent_workflow_id,
-          runId: existing.parent_run_id,
-        })}
-        SET status = 'completed', completed_at = $1::timestamptz,
-          output_json = $2::jsonb, error_json = NULL
-        WHERE child_record_id = $3
-        `,
-        [input.now, encodeJson(toJson(input.next.output)), existing.child_record_id],
-      )
-    } else {
-      const error =
-        input.next.status === "failed"
-          ? input.next.error
-          : { message: input.next.reason || "Child canceled" }
-      await client.query(
-        `
-        UPDATE ${this.partitionedTable("children", {
-          workflowId: existing.parent_workflow_id,
-          runId: existing.parent_run_id,
-        })}
-        SET status = 'failed', completed_at = $1::timestamptz,
-          output_json = NULL, error_json = $2::jsonb
-        WHERE child_record_id = $3
-        `,
-        [input.now, encodeJson(error), existing.child_record_id],
-      )
+    const status = input.next.status === "completed" ? "completed" : "failed"
+    const output = input.next.status === "completed" ? toJson(input.next.output) : null
+    const error =
+      input.next.status === "failed"
+        ? input.next.error
+        : input.next.status === "canceled"
+          ? { message: input.next.reason || "Child canceled" }
+          : null
+    await this.writeOutboxMessage(client, {
+      messageId: childCompletedMessageId(previous.parent_child_record_id),
+      sourceWorkflowId: previous.workflow_id,
+      sourceRunId: previous.run_id,
+      sourceShard: previous.partition_shard,
+      targetWorkflowId: previous.parent_workflow_id,
+      targetRunId: previous.parent_run_id,
+      targetShard: parentShard,
+      messageType: "child_completed",
+      payload: childCompletedMessagePayload({
+        childRecordId: previous.parent_child_record_id,
+        parentWorkflowId: previous.parent_workflow_id,
+        parentRunId: previous.parent_run_id,
+        workflowId: previous.workflow_id,
+        runId: previous.run_id,
+        status,
+        output,
+        error,
+        completedAt: input.now,
+      }),
+      createdAt: input.now,
+    })
+  }
+
+  private async parentShardForChildCompletion(
+    client: Queryable,
+    child: InstanceRow,
+  ): Promise<number | null> {
+    if (!child.parent_workflow_id || !child.parent_run_id || !child.parent_child_record_id) {
+      return null
     }
-    await this.replaceReadyEventsForInstance(client, existing.parent_workflow_id, existing.parent_run_id)
-    void nextSequence
+    const startMessage = await this.one<Pick<MessageRow, "source_shard">>(
+      client,
+      `
+      SELECT source_shard
+      FROM ${this.partitionedTable("inbox", {
+        workflowId: child.workflow_id,
+        runId: child.run_id,
+      })}
+      WHERE message_id = $1
+      LIMIT 1
+      `,
+      [childStartMessageId(child.parent_child_record_id)],
+    )
+    if (startMessage) {
+      return startMessage.source_shard
+    }
+    const parent = await this.instanceRow(client, {
+      workflowId: child.parent_workflow_id,
+      runId: child.parent_run_id,
+    })
+    return parent?.partition_shard ?? null
   }
 
   private async applyParentClosePolicy(
@@ -5460,49 +6282,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       status,
     })
 
-    const instance = await this.instanceRow(
-      client,
-      { workflowId: child.workflow_id, runId: child.run_id },
-      true,
-    )
-    if (instance?.status === "running") {
-      const childCloseSequence = instance.sequence + 1
-      await client.query(
-        `
-        UPDATE ${this.partitionedTable("instances", {
-          workflowId: child.workflow_id,
-          runId: child.run_id,
-        })}
-        SET sequence = sequence + 1, status = 'canceled',
-          common_json = NULL, phase_name = NULL, phase_data_json = NULL,
-          output_json = NULL, error_json = NULL, cancel_reason = $1,
-          waits_json = $2::jsonb, updated_at = $3::timestamptz
-        WHERE workflow_id = $4 AND run_id = $5 AND status = 'running'
-        `,
-        [options.reason.message, encodeJson([]), now, child.workflow_id, child.run_id],
-      )
-      await client.query(
-        `
-        UPDATE ${this.partitionedTable("activation_tasks", {
-          workflowId: child.workflow_id,
-          runId: child.run_id,
-        })}
-        SET claim_owner_id = NULL, claim_epoch = NULL, claimed_at = NULL
-        WHERE workflow_id = $1 AND run_id = $2 AND completed_by_sequence IS NULL
-        `,
-        [child.workflow_id, child.run_id],
-      )
-      await this.replaceReadyEventsForInstance(client, child.workflow_id, child.run_id)
-      await this.closeStartedChildren(
-        client,
-        child.workflow_id,
-        child.run_id,
-        now,
-        childCloseSequence,
-        "canceled",
-      )
-    }
-
     await client.query(
       `
       UPDATE ${this.partitionedTable("children", {
@@ -5523,6 +6302,30 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     if (options.deliverToParent) {
       await this.replaceReadyEventsForInstance(client, child.parent_workflow_id, child.parent_run_id)
     }
+    const parent = await this.instanceRow(client, {
+      workflowId: child.parent_workflow_id,
+      runId: child.parent_run_id,
+    })
+    await this.writeOutboxMessage(client, {
+      messageId: childCancelMessageId(child.child_record_id),
+      sourceWorkflowId: child.parent_workflow_id,
+      sourceRunId: child.parent_run_id,
+      sourceShard: parent?.partition_shard ?? child.partition_shard,
+      targetWorkflowId: child.workflow_id,
+      targetRunId: child.run_id,
+      targetShard: child.partition_shard,
+      messageType: "child_cancel",
+      payload: childCancelMessagePayload({
+        childRecordId: child.child_record_id,
+        parentWorkflowId: child.parent_workflow_id,
+        parentRunId: child.parent_run_id,
+        workflowId: child.workflow_id,
+        runId: child.run_id,
+        reason: options.reason,
+        canceledAt: now,
+      }),
+      createdAt: now,
+    })
   }
 
   private async abandonStartedChild(
@@ -6238,6 +7041,144 @@ function childStartCommitConflict(
       name: "ChildStartConflict",
       message: `Child start ${start.key} failed: ${reason} (${start.workflowId}/${start.runId})`,
     },
+  }
+}
+
+function childStartMessageId(childRecordId: string): string {
+  return `child-start/${childRecordId}`
+}
+
+function childCompletedMessageId(childRecordId: string): string {
+  return `child-completed/${childRecordId}`
+}
+
+function childCancelMessageId(childRecordId: string): string {
+  return `child-cancel/${childRecordId}`
+}
+
+function childStartMessagePayload(input: {
+  childRecordId: string
+  input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    now: string
+  }
+  start: CheckpointChildStart
+}): JsonValue {
+  return {
+    childRecordId: input.childRecordId,
+    parentWorkflowId: input.input.workflowId,
+    parentRunId: input.input.runId,
+    activationId: input.input.activationId,
+    key: input.start.key,
+    workflowName: input.start.workflowName,
+    workflowVersion: input.start.workflowVersion,
+    workflowId: input.start.workflowId,
+    runId: input.start.runId,
+    partitionShard: input.start.partitionShard,
+    common: input.start.common,
+    phase: input.start.phase,
+    waits: input.start.waits,
+    parentClosePolicy: input.start.parentClosePolicy ?? "cancel",
+    conflictPolicy: input.start.conflictPolicy ?? "use_existing",
+    createdAt: input.input.now,
+  }
+}
+
+function childStartPayloadFromMessage(row: MessageRow): ChildStartMessagePayload {
+  const payload = row.payload_json as ChildStartMessagePayload
+  return {
+    ...payload,
+    parentClosePolicy: payload.parentClosePolicy ?? "cancel",
+    conflictPolicy: payload.conflictPolicy ?? "use_existing",
+  }
+}
+
+function childStartPayloadJson(payload: ChildStartMessagePayload): Record<string, unknown> {
+  return {
+    child_record_id: payload.childRecordId,
+    parent_workflow_id: payload.parentWorkflowId,
+    parent_run_id: payload.parentRunId,
+    activation_id: payload.activationId,
+    key: payload.key,
+    workflow_name: payload.workflowName,
+    workflow_version: payload.workflowVersion,
+    workflow_id: payload.workflowId,
+    run_id: payload.runId,
+    partition_shard: payload.partitionShard,
+    common_json: payload.common,
+    phase_name: payload.phase.name,
+    phase_data_json: payload.phase.data,
+    waits_json: payload.waits,
+    parent_close_policy: payload.parentClosePolicy,
+    conflict_policy: payload.conflictPolicy,
+    created_at: payload.createdAt,
+  }
+}
+
+function childCompletedMessagePayload(input: {
+  childRecordId: string
+  parentWorkflowId: string
+  parentRunId: string
+  workflowId: string
+  runId: string
+  status: "completed" | "failed"
+  output: JsonValue | null
+  error: SerializedError | null
+  completedAt: string
+}): JsonValue {
+  return {
+    childRecordId: input.childRecordId,
+    parentWorkflowId: input.parentWorkflowId,
+    parentRunId: input.parentRunId,
+    workflowId: input.workflowId,
+    runId: input.runId,
+    status: input.status,
+    output: input.output,
+    error: input.error,
+    completedAt: input.completedAt,
+  }
+}
+
+function childCompletedPayloadFromMessage(row: MessageRow): ChildCompletedMessagePayload {
+  return row.payload_json as ChildCompletedMessagePayload
+}
+
+function childCancelMessagePayload(input: {
+  childRecordId: string
+  parentWorkflowId: string
+  parentRunId: string
+  workflowId: string
+  runId: string
+  reason: SerializedError
+  canceledAt: string
+}): JsonValue {
+  return {
+    childRecordId: input.childRecordId,
+    parentWorkflowId: input.parentWorkflowId,
+    parentRunId: input.parentRunId,
+    workflowId: input.workflowId,
+    runId: input.runId,
+    reason: input.reason,
+    canceledAt: input.canceledAt,
+  }
+}
+
+function childCancelPayloadFromMessage(row: MessageRow): ChildCancelMessagePayload {
+  return row.payload_json as ChildCancelMessagePayload
+}
+
+function messageRowJson(row: MessageRow): Record<string, unknown> {
+  return {
+    message_id: row.message_id,
+    source_shard: row.source_shard,
+    target_shard: row.target_shard,
+    target_workflow_id: row.target_workflow_id,
+    target_run_id: row.target_run_id,
+    message_type: row.message_type,
+    payload_json: row.payload_json,
+    created_at: iso(row.created_at),
   }
 }
 

@@ -2,6 +2,7 @@ import pg from "pg"
 import { randomUUID } from "node:crypto"
 import { describe, expect, it } from "vitest"
 import {
+  parsePostgresBenchmarkArgs,
   runPostgresBenchmark,
   type PostgresBenchmarkOptions,
 } from "../src/benchmarks/postgres.js"
@@ -15,6 +16,7 @@ function benchmarkOptions(
   overrides: Partial<PostgresBenchmarkOptions> = {},
 ): PostgresBenchmarkOptions {
   return {
+    mode: "mixed",
     connectionString: connectionString ?? "postgresql://durable:durable@127.0.0.1:55432/durable",
     schema: `durable_bench_test_${randomUUID().replaceAll("-", "_")}`,
     physicalPartitions: 1,
@@ -45,6 +47,7 @@ describeIfPostgres("Postgres benchmark", () => {
     )
 
     expect(result.backend).toBe("postgres")
+    expect(result.mode).toBe("mixed")
     expect(result.completedWorkflows).toBe(6)
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
@@ -62,6 +65,8 @@ describeIfPostgres("Postgres benchmark", () => {
     })
     expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
     expect(result.queryProfile?.poolWait.connectCount).toBeGreaterThan(0)
+    expect(result.queryProfile?.topProcessingByTotal.length).toBeGreaterThan(0)
+    expect(result.queryProfile?.topProcessingByCount.length).toBeGreaterThan(0)
     const profileSql = [
       ...(result.queryProfile?.topByCount ?? []),
       ...(result.queryProfile?.topByTotal ?? []),
@@ -80,5 +85,22 @@ describeIfPostgres("Postgres benchmark", () => {
     } finally {
       await pool.end()
     }
+  })
+
+  it("supports feature-isolation modes and validates mode flags", async () => {
+    expect(() => parsePostgresBenchmarkArgs(["--mode", "fast"]))
+      .toThrow("--mode must be mixed, bare, activity, signal, timer, or child")
+
+    const result = await runPostgresBenchmark(
+      benchmarkOptions({
+        mode: "bare",
+        workflows: 4,
+        maxRounds: 50,
+      }),
+    )
+    expect(result.mode).toBe("bare")
+    expect(result.completedWorkflows).toBe(4)
+    expect(result.expectedActivations).toBe(4)
+    expect(result.activations).toBe(4)
   })
 })

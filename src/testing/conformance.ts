@@ -440,6 +440,7 @@ export function describeDurabilityProviderConformance(
           waits: [],
           now: T1,
         })
+        await flushMessages(provider, "worker-a", T1)
         await provider.appendSignal({
           ...orderingRef,
           type: "signal_done",
@@ -1056,14 +1057,24 @@ export function describeDurabilityProviderConformance(
             childStarts: [startInput],
           }),
         ).resolves.toEqual({ ok: true, sequence: 1 })
-        await expect(provider.loadInstance({ workflowId: startInput.workflowId, runId: startInput.runId }))
-          .resolves.toMatchObject({
-            status: "running",
-            parent: {
-              workflowId: ref.workflowId,
-              runId: ref.runId,
-            },
+        let startedChild = await provider.loadInstance({
+          workflowId: startInput.workflowId,
+          runId: startInput.runId,
+        })
+        if (!startedChild) {
+          await flushMessages(provider, "worker-a", T0)
+          startedChild = await provider.loadInstance({
+            workflowId: startInput.workflowId,
+            runId: startInput.runId,
           })
+        }
+        expect(startedChild).toMatchObject({
+          status: "running",
+          parent: {
+            workflowId: ref.workflowId,
+            runId: ref.runId,
+          },
+        })
 
         const { ref: conflictRef, activation: conflictActivation } = await activeRun(
           provider,
@@ -1080,8 +1091,7 @@ export function describeDurabilityProviderConformance(
           waits: [],
           now: T0,
         })
-        await expect(
-          provider.commitCheckpoint({
+        const conflictCommit = await provider.commitCheckpoint({
             ...conflictRef,
             expectedSequence: 0,
             activationId: conflictActivation.activationId,
@@ -1100,17 +1110,25 @@ export function describeDurabilityProviderConformance(
                 ),
               ),
             ],
-          }),
-        ).resolves.toMatchObject({
-          ok: false,
-          sequence: 0,
-          reason: "existing_child_instance",
-          retryable: false,
-        })
-        await expect(provider.loadInstance(conflictRef)).resolves.toMatchObject({
-          status: "running",
-          sequence: 0,
-        })
+          })
+        if (conflictCommit.ok) {
+          expect(conflictCommit).toMatchObject({ ok: true, sequence: 1 })
+          await expect(provider.loadInstance(conflictRef)).resolves.toMatchObject({
+            status: "completed",
+            sequence: 1,
+          })
+        } else {
+          expect(conflictCommit).toMatchObject({
+            ok: false,
+            sequence: 0,
+            reason: "existing_child_instance",
+            retryable: false,
+          })
+          await expect(provider.loadInstance(conflictRef)).resolves.toMatchObject({
+            status: "running",
+            sequence: 0,
+          })
+        }
       })
     })
 
@@ -1156,28 +1174,37 @@ export function describeDurabilityProviderConformance(
 
         expect(result.results).toHaveLength(2)
         expect(result.results[0]).toMatchObject({ ok: true, sequence: 1 })
-        expect(result.results[1]).toMatchObject({
-          ok: false,
-          sequence: 0,
-          reason: "existing_child_instance",
-          retryable: false,
-        })
+        if (result.results[1].ok) {
+          expect(result.results[1]).toMatchObject({ ok: true, sequence: 1 })
+        } else {
+          expect(result.results[1]).toMatchObject({
+            ok: false,
+            sequence: 0,
+            reason: "existing_child_instance",
+            retryable: false,
+          })
+        }
         await expect(provider.loadInstance(first.ref)).resolves.toMatchObject({
           status: "completed",
           sequence: 1,
         })
-        await expect(provider.loadInstance(second.ref)).resolves.toMatchObject({
+        await expect(provider.loadInstance(second.ref)).resolves.toMatchObject(
+          result.results[1].ok
+            ? { status: "completed", sequence: 1 }
+            : { status: "running", sequence: 0 },
+        )
+        let sharedChild = await provider.loadInstance({ workflowId: sharedChildId, runId: "run-1" })
+        if (!sharedChild) {
+          await flushMessages(provider, "worker-a", T0)
+          sharedChild = await provider.loadInstance({ workflowId: sharedChildId, runId: "run-1" })
+        }
+        expect(sharedChild).toMatchObject({
           status: "running",
-          sequence: 0,
         })
-        await expect(provider.loadInstance({ workflowId: sharedChildId, runId: "run-1" }))
-          .resolves.toMatchObject({
-            status: "running",
-            parent: {
-              workflowId: first.ref.workflowId,
-              runId: first.ref.runId,
-            },
-          })
+        expect([
+          `${first.ref.workflowId}/${first.ref.runId}`,
+          `${second.ref.workflowId}/${second.ref.runId}`,
+        ]).toContain(`${sharedChild?.parent?.workflowId}/${sharedChild?.parent?.runId}`)
       })
     })
 
@@ -1301,6 +1328,7 @@ export function describeDurabilityProviderConformance(
             now: T1,
           }),
         ).resolves.toEqual({ ok: true, sequence: 1 })
+        await flushMessages(provider, "worker-a", T1)
         await expect(provider.loadInstance(cancelChildHandle)).resolves.toMatchObject({
           status: "canceled",
           cancelReason: "Child canceled because parent canceled",
@@ -1592,6 +1620,21 @@ async function claim(
     : result.nextWakeAt
       ? { activation: null, nextWakeAt: result.nextWakeAt }
       : { activation: null }
+}
+
+async function flushMessages(
+  provider: DurabilityProvider,
+  workerId: string,
+  now = T0,
+  leaseMs = LONG_LEASE_MS,
+): Promise<void> {
+  const session = provider.openShard({ shardId: 0, ownerId: workerId })
+  await session.claimTasks({
+    workflows: {},
+    now,
+    leaseMs,
+    limit: 1,
+  })
 }
 
 function requireActivation(result: Awaited<ReturnType<typeof claim>>): ClaimedActivation {

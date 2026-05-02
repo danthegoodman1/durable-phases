@@ -20,6 +20,7 @@ export type NullMultiProcessBenchmarkOptions = {
   activityDelayMs: number
   batch: number
   maxRounds: number
+  unsafeNoClone: boolean
   json: boolean
 }
 
@@ -69,6 +70,7 @@ const defaultOptions: NullMultiProcessBenchmarkOptions = {
   activityDelayMs: 0,
   batch: 32,
   maxRounds: 10_000,
+  unsafeNoClone: false,
   json: false,
 }
 
@@ -106,6 +108,7 @@ export async function runNullMultiProcessBenchmark(
         activityDelayMs: options.activityDelayMs,
         batch: options.batch,
         maxRounds: options.maxRounds,
+        unsafeNoClone: options.unsafeNoClone,
         json: true,
       }).then((result) => ({
         processIndex,
@@ -196,6 +199,8 @@ export function parseNullMultiProcessBenchmarkArgs(
       options.batch = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--max-rounds") {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
+    } else if (flag === "--unsafe-no-clone") {
+      options.unsafeNoClone = true
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -235,6 +240,7 @@ async function runNullBenchmarkProcess(
     String(options.batch),
     "--max-rounds",
     String(options.maxRounds),
+    ...(options.unsafeNoClone ? ["--unsafe-no-clone"] : []),
   ]
 
   const output = await spawnCollect(process.execPath, args, {
@@ -369,6 +375,7 @@ Options:
                     Async delay inside each mixed-workload activity. Default: ${defaultOptions.activityDelayMs}
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for child drain rounds. Default: ${defaultOptions.maxRounds}
+  --unsafe-no-clone Diagnostic only: skip null-provider defensive cloning.
   --json            Print machine-readable JSON.
 `)
 }
@@ -385,6 +392,7 @@ function printResult(result: NullMultiProcessBenchmarkResult): void {
   activation concurrency: ${result.options.activationConcurrency} per worker
   activation prefetch limit: ${result.options.activationPrefetchLimit}
   batch: ${result.options.batch}
+  unsafe no-clone: ${result.options.unsafeNoClone ? "yes" : "no"}
   elapsed: ${formatMs(result.elapsedMs)}
   processing wall estimate: ${formatMs(result.processingMs)}
 

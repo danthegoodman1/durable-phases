@@ -83,6 +83,10 @@ type ChildStartConflict = {
   error: SerializedError
 }
 
+export type NullDurabilityProviderOptions = {
+  unsafeNoClone?: boolean
+}
+
 export class NullDurabilityProvider implements DurabilityProvider {
   private readonly instances = new Map<RefKey, PersistedInstance>()
   private readonly signals = new Map<string, SignalRecord>()
@@ -94,8 +98,13 @@ export class NullDurabilityProvider implements DurabilityProvider {
   private readonly effectsByActivation = new Map<string, EffectRecord[]>()
   private readonly claimedSequenceEpochs = new Map<string, number>()
   private readonly shardLeases = new Map<number, MemoryShardLease>()
+  private readonly unsafeNoClone: boolean
   private signalCounter = 0
   private childCounter = 0
+
+  constructor(options: NullDurabilityProviderOptions = {}) {
+    this.unsafeNoClone = options.unsafeNoClone ?? false
+  }
 
   close(): void {
     this.instances.clear()
@@ -125,7 +134,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
       leaseEpoch,
     }
     this.shardLeases.set(input.shardId, lease)
-    return clone(lease)
+    return this.clone(lease)
   }
 
   openShard(input: OpenShardInput): ShardDurabilitySession {
@@ -153,12 +162,12 @@ export class NullDurabilityProvider implements DurabilityProvider {
       partitionShard: input.partitionShard,
       sequence: 0,
       status: "running",
-      common: clone(input.common),
-      phase: clone(input.phase),
-      waits: clone(input.waits),
+      common: this.clone(input.common),
+      phase: this.clone(input.phase),
+      waits: this.clone(input.waits),
       createdAt: input.now,
       updatedAt: input.now,
-      ...(input.parent ? { parent: clone(input.parent) } : {}),
+      ...(input.parent ? { parent: this.clone(input.parent) } : {}),
     }
     this.instances.set(key, instance)
     this.replaceTasksForInstance(instance)
@@ -230,7 +239,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
     if (!instance) {
       return null
     }
-    const copy = clone(instance)
+    const copy = this.clone(instance)
     if (options.includeEffects) {
       copy.effects = [...this.effectsByActivation.values()].flat().filter((effect) =>
         effect.activationId.startsWith(`${ref.workflowId}/${ref.runId}/`),
@@ -240,7 +249,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
   }
 
   listInstances(): PersistedInstance[] {
-    return [...this.instances.values()].map((instance) => clone(instance))
+    return [...this.instances.values()].map((instance) => this.clone(instance))
   }
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
@@ -250,14 +259,14 @@ export class NullDurabilityProvider implements DurabilityProvider {
       workflowId: input.workflowId,
       runId: input.runId,
       type: input.type,
-      payload: clone(input.payload),
+      payload: this.clone(input.payload),
       receivedAt: input.receivedAt,
     }
     this.signals.set(signal.signalId, signal)
     if (instance?.status === "running") {
       this.refreshSignalTasksForInstance(instance)
     }
-    return clone(signal)
+    return this.clone(signal)
   }
 
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<ShardLease | null> {
@@ -369,9 +378,9 @@ export class NullDurabilityProvider implements DurabilityProvider {
         continue
       }
       claims.push({
-        activation: activationFromTask(task),
-        instance: clone(instance),
-        effects: clone(this.effectsByActivation.get(task.activationId) ?? []),
+        activation: activationFromTask(task, this.clone),
+        instance: this.clone(instance),
+        effects: this.clone(this.effectsByActivation.get(task.activationId) ?? []),
         lease: { scope: "shard", shardId: session.shardId, epoch: lease.leaseEpoch },
       })
     }
@@ -444,7 +453,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
       if (!task) {
         throw new Error(`Lost activation lease: ${input.activationId}`)
       }
-      const effects = checkpointEffectsToRecords(input, task)
+      const effects = checkpointEffectsToRecords(input, task, this.clone)
       this.effectsByActivation.set(input.activationId, effects)
       const nextAttemptAt = effects
         .map((effect) => effect.nextAttemptAt)
@@ -521,7 +530,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
       })
     }
 
-    const previous = clone(instance)
+    const previous = this.clone(instance)
     const nextSequence = instance.sequence + 1
     const updated = this.nextInstance(instance, input, nextSequence)
     this.instances.set(refKey(input), updated)
@@ -540,7 +549,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
     }
 
     this.effectsByActivation.delete(input.activationId)
-    for (const effect of checkpointEffectsToRecords(input, task)) {
+    for (const effect of checkpointEffectsToRecords(input, task, this.clone)) {
       if (effect.status === "pending") {
         const effects = this.effectsByActivation.get(input.activationId) ?? []
         effects.push(effect)
@@ -571,22 +580,22 @@ export class NullDurabilityProvider implements DurabilityProvider {
       sequence: nextSequence,
       createdAt: current.createdAt,
       updatedAt: input.now,
-      ...(current.parent ? { parent: clone(current.parent) } : {}),
+      ...(current.parent ? { parent: this.clone(current.parent) } : {}),
     }
     if (input.next.status === "running") {
       return {
         ...base,
         status: "running",
-        common: clone(input.next.common),
-        phase: clone(input.next.phase),
-        waits: clone(input.waits),
+        common: this.clone(input.next.common),
+        phase: this.clone(input.next.phase),
+        waits: this.clone(input.waits),
       }
     }
     if (input.next.status === "completed") {
       return {
         ...base,
         status: "completed",
-        output: clone(toJson(input.next.output)),
+        output: this.clone(toJson(input.next.output)),
         waits: [],
       }
     }
@@ -601,7 +610,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
     return {
       ...base,
       status: "failed",
-      error: clone(input.next.error),
+      error: this.clone(input.next.error),
       waits: [],
     }
   }
@@ -682,7 +691,7 @@ export class NullDurabilityProvider implements DurabilityProvider {
         event: {
           kind: "signal",
           signalId: signal.signalId,
-          payload: clone(signal.payload),
+          payload: this.clone(signal.payload),
           occurredAt: signal.receivedAt,
           consumeSignalId: signal.signalId,
         },
@@ -719,10 +728,10 @@ export class NullDurabilityProvider implements DurabilityProvider {
         childRecordId: child.childRecordId,
         occurredAt,
         event: child.status === "completed"
-          ? { ok: true, output: clone(child.output) }
+          ? { ok: true, output: this.clone(child.output) }
           : {
               ok: false,
-              error: clone(child.error ?? { message: "Child failed" }),
+              error: this.clone(child.error ?? { message: "Child failed" }),
             },
       },
       sortKey: sortKey(occurredAt, "child", wait.name, child.childRecordId),
@@ -761,8 +770,8 @@ export class NullDurabilityProvider implements DurabilityProvider {
       sequence: instance.sequence,
       kind: input.kind,
       waitName: input.wait?.name,
-      wait: clone(input.wait),
-      event: clone(input.event),
+      wait: this.clone(input.wait),
+      event: this.clone(input.event),
       readyAt: input.readyAt,
       sortKey: input.sortKey,
     }
@@ -855,6 +864,10 @@ export class NullDurabilityProvider implements DurabilityProvider {
       .filter((task): task is MemoryTask => task !== undefined)
   }
 
+  private clone = <T>(value: T): T => {
+    return this.unsafeNoClone ? value : clone(value)
+  }
+
   private validateChildStarts(input: {
     workflowId: string
     runId: string
@@ -919,9 +932,9 @@ export class NullDurabilityProvider implements DurabilityProvider {
       partitionShard: start.partitionShard,
       sequence: 0,
       status: "running",
-      common: clone(start.common),
-      phase: clone(start.phase),
-      waits: clone(start.waits),
+      common: this.clone(start.common),
+      phase: this.clone(start.phase),
+      waits: this.clone(start.waits),
       createdAt: now,
       updatedAt: now,
       parent: {
@@ -958,13 +971,13 @@ export class NullDurabilityProvider implements DurabilityProvider {
     child.completedAt = input.now
     if (input.next.status === "completed") {
       child.status = "completed"
-      child.output = clone(toJson(input.next.output))
+      child.output = this.clone(toJson(input.next.output))
       child.error = undefined
     } else {
       child.status = "failed"
       child.output = undefined
       child.error = input.next.status === "failed"
-        ? clone(input.next.error)
+        ? this.clone(input.next.error)
         : { message: input.next.reason || "Child canceled" }
     }
     this.replaceTasksForRef(child.parentWorkflowId, child.parentRunId)
@@ -1155,7 +1168,7 @@ class NullShardSession implements ShardDurabilitySession {
   }
 }
 
-function activationFromTask(task: MemoryTask): ClaimedActivation {
+function activationFromTask(task: MemoryTask, cloneValue: <T>(value: T) => T): ClaimedActivation {
   if (task.kind === "run") {
     return {
       kind: "run",
@@ -1189,8 +1202,8 @@ function activationFromTask(task: MemoryTask): ClaimedActivation {
     sequence: task.sequence,
     activationTime: task.readyAt,
     waitName: task.waitName!,
-    wait: clone(task.wait!),
-    event: clone(task.event!),
+    wait: cloneValue(task.wait!),
+    event: cloneValue(task.event!),
     leaseUntil: task.leaseUntil ?? task.readyAt,
   }
 }
@@ -1220,6 +1233,7 @@ function checkpointEffectsToRecords(
     effects?: CheckpointEffectMutation[]
   },
   task: Pick<MemoryTask, "activationId">,
+  cloneValue: <T>(value: T) => T,
 ): EffectRecord[] {
   return (input.effects ?? []).map((effect) => ({
     effectId: `effect-${randomUUID()}`,
@@ -1237,11 +1251,11 @@ function checkpointEffectsToRecords(
     backoffCoefficient: effect.backoffCoefficient ?? 2,
     nonRetryableErrorNames: effect.nonRetryableErrorNames,
     nextAttemptAt: effect.status === "retry_scheduled" ? effect.nextAttemptAt : undefined,
-    result: effect.status === "completed" ? clone(effect.result) : undefined,
+    result: effect.status === "completed" ? cloneValue(effect.result) : undefined,
     error: effect.status === "failed" || effect.status === "retry_scheduled"
-      ? clone(effect.error)
+      ? cloneValue(effect.error)
       : undefined,
-    heartbeatDetails: clone(effect.heartbeatDetails),
+    heartbeatDetails: cloneValue(effect.heartbeatDetails),
   }))
 }
 
