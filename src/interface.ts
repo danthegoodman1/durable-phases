@@ -69,6 +69,7 @@ export type ActivationInstanceSnapshot = {
   workflowVersion: number
   workflowId: string
   runId: string
+  partitionShard: number
   sequence: number
   status: "running" | "completed" | "canceled" | "failed"
   common?: JsonObject
@@ -161,7 +162,21 @@ export type DispatchShardLease = {
   shardId: number
   ownerId: string
   leaseUntil: string
+  leaseEpoch?: number
 }
+
+export type ShardLease = DispatchShardLease & {
+  leaseEpoch: number
+}
+
+export type OpenShardInput =
+  | ShardLease
+  | {
+      shardId: number
+      ownerId?: string
+      leaseUntil?: string
+      leaseEpoch?: number
+    }
 
 export type ClaimDispatchShardInput = {
   shardId: number
@@ -245,10 +260,15 @@ export type ClaimReadyActivationsInput = ClaimReadyActivationInput & {
   limit: number
 }
 
+export type ActivationClaimLease =
+  | { scope: "activation" }
+  | { scope: "shard"; shardId: number; epoch: number }
+
 export type ClaimedActivationWithInstance = {
   activation: ClaimedActivation
   instance: ActivationInstanceSnapshot
   effects: EffectRecord[]
+  lease: ActivationClaimLease
 }
 
 export type ClaimReadyActivationsResult = {
@@ -261,6 +281,7 @@ export type ClaimReadyActivationResult =
       activation: ClaimedActivation
       instance: ActivationInstanceSnapshot
       effects: EffectRecord[]
+      lease: ActivationClaimLease
       nextWakeAt?: undefined
     }
   | {
@@ -464,7 +485,44 @@ export type RecordActivationFailureInput = {
   releaseActivation?: boolean
 }
 
+export type ClaimShardTasksInput = {
+  workflows: Record<string, { version: number }>
+  shardCount?: number
+  now: string
+  leaseMs: number
+  limit: number
+}
+
+export type ClaimShardTasksResult = ClaimReadyActivationsResult
+
+export type ShardDurabilitySession = {
+  readonly shardId: number
+  readonly ownerId?: string
+  readonly leaseEpoch?: number
+  createInstance(input: CreateInstanceInput): Promise<InstanceRef>
+  createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
+  cancelChild(input: CancelChildInput): Promise<void>
+  readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
+  appendSignal(input: AppendSignalInput): Promise<SignalRecord>
+  claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult>
+  heartbeat(input: { now: string; leaseMs: number }): Promise<void>
+  release(): Promise<void>
+  heartbeatActivations(input: HeartbeatActivationsInput): Promise<void>
+  heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
+  releaseActivations(input: ReleaseActivationsInput): Promise<void>
+  releaseActivation(input: ReleaseActivationInput): Promise<void>
+  getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
+  heartbeatEffect(input: HeartbeatEffectInput): Promise<void>
+  completeEffect(input: CompleteEffectInput): Promise<void>
+  failEffect(input: FailEffectInput): Promise<FailEffectResult>
+  commitActivations(input: CommitActivationInput[]): Promise<CommitActivationsResult>
+  commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
+  recordActivationFailures(input: RecordActivationFailureInput[]): Promise<void>
+}
+
 export type DurabilityProvider = {
+  claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null>
+  openShard(input: OpenShardInput): ShardDurabilitySession
   createInstance(input: CreateInstanceInput): Promise<InstanceRef>
   createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
   cancelChild(input: CancelChildInput): Promise<void>

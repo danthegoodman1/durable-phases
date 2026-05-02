@@ -62,6 +62,11 @@ describeIfPostgres("Postgres benchmark", () => {
     })
     expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
     expect(result.queryProfile?.poolWait.connectCount).toBeGreaterThan(0)
+    const profileSql = [
+      ...(result.queryProfile?.topByCount ?? []),
+      ...(result.queryProfile?.topByTotal ?? []),
+    ].map((entry) => entry.sql).join("\n")
+    expect(profileSql).not.toContain("SELECT input.activation_id, i.*")
     expect(result.diagnostics?.sampleCount).toBeGreaterThan(0)
     expect(result.diagnostics?.databaseDelta?.xact_commit).toBeGreaterThan(0)
 

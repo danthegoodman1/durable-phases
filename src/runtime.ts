@@ -4,6 +4,7 @@ import type {
   ActivationInstanceSnapshot,
   ClaimedActivation,
   ClaimedActivationWithInstance,
+  ClaimShardTasksResult,
   ConflictPolicy,
   CheckpointChildStart,
   CheckpointEffectMutation,
@@ -14,6 +15,8 @@ import type {
   EffectRecord,
   PersistedInstance,
   SignalRecord,
+  ShardDurabilitySession,
+  ShardLease,
 } from "./interface.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import {
@@ -105,6 +108,15 @@ type ActivationTask = {
   promise: Promise<ActivationTaskOutcome>
 }
 
+type RuntimeClaim = ClaimedActivationWithInstance & {
+  session: ShardDurabilitySession
+}
+
+type ClaimBatchWithSession = {
+  session: ShardDurabilitySession
+  batch: ClaimShardTasksResult
+}
+
 type ActivationTaskSettled = {
   kind: "activation_task_settled"
   task: ActivationTask
@@ -143,6 +155,10 @@ type ActivationChildLedger = {
   keyByRef: Map<string, string>
 }
 
+type ActivationHeartbeatControl = {
+  required: boolean
+}
+
 type PendingCommit = {
   input: CommitActivationInput
   resolve(result: CommitCheckpointResult): void
@@ -155,7 +171,7 @@ class ActivationCommitBatcher {
   private flushing = false
 
   constructor(
-    private readonly provider: DurabilityProvider,
+    private readonly session: ShardDurabilitySession,
     private readonly batchSize: number,
     private readonly maxDelayMs: number,
   ) {}
@@ -190,7 +206,7 @@ class ActivationCommitBatcher {
     this.flushing = true
     const batch = this.pending.splice(0, this.batchSize)
     try {
-      const output = await this.provider.commitActivations(batch.map((item) => item.input))
+      const output = await this.session.commitActivations(batch.map((item) => item.input))
       const byActivation = new Map(output.results.map((result) => [result.activationId, result]))
       batch.forEach((item, index) => {
         const result = byActivation.get(item.input.activationId) ?? output.results[index]
@@ -248,11 +264,11 @@ export class DurableRuntime {
       "activationPrefetchLimit",
     )
     this.activationCommitBatchSize = positiveInteger(
-      options.activationCommitBatchSize ?? 32,
+      options.activationCommitBatchSize ?? 64,
       "activationCommitBatchSize",
     )
     this.activationCommitMaxDelayMs = nonNegativeInteger(
-      options.activationCommitMaxDelayMs ?? 2,
+      options.activationCommitMaxDelayMs ?? 5,
       "activationCommitMaxDelayMs",
     )
     this.dispatchLeaseMs = options.dispatchLeaseMs ?? 30_000
@@ -291,14 +307,16 @@ export class DurableRuntime {
     const now = this.now()
     const workflowId = options.workflowId ?? `${workflow.name}-${randomUUID()}`
     const runId = options.runId ?? "run-1"
-    const instance = this.initialInstance(workflow, workflowId, runId, startCommand, now)
+    const partitionShard = workflowPartitionShard(workflowId, runId, this.shardCount)
+    const instance = this.initialInstance(workflow, workflowId, runId, partitionShard, startCommand, now)
+    const session = this.shardSessionForShard(partitionShard)
 
-    const ref = await this.provider.createInstance({
+    const ref = await session.createInstance({
       workflowName: workflow.name,
       workflowVersion: workflow.version,
       workflowId: instance.workflowId,
       runId: instance.runId,
-      partitionShard: workflowPartitionShard(instance.workflowId, instance.runId, this.shardCount),
+      partitionShard,
       common: instance.common!,
       phase: instance.phase!,
       waits: instance.waits,
@@ -323,9 +341,10 @@ export class DurableRuntime {
   ): Promise<SignalRecord> {
     this.registerWorkflows([workflow])
     const normalizedRef = normalizeRef(ref)
-    const instance = await this.provider.loadInstance(normalizedRef)
+    const session = this.shardSessionForRef(normalizedRef)
+    const instance = await session.readInstance(normalizedRef)
     const parsedPayload = this.parseSignalPayloadForInstance(workflow, instance, type, payload)
-    const signalRecord = await this.provider.appendSignal({
+    const signalRecord = await session.appendSignal({
       ...normalizedRef,
       type,
       payload: toJson(parsedPayload),
@@ -369,27 +388,27 @@ export class DurableRuntime {
   }
 
   async drain(options: DrainOptions = {}): Promise<DrainResult> {
-    const shardIds = await this.claimDispatchShards()
+    const shardSessions = await this.claimShardSessions()
     let dispatchHeartbeat: DispatchHeartbeat | undefined
     let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
     try {
-      if (shardIds.length > 0) {
-        await this.heartbeatDispatchShards(shardIds)
-        dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
+      if (shardSessions.length > 0) {
+        await this.heartbeatShardSessions(shardSessions)
+        dispatchHeartbeat = this.startDispatchShardHeartbeat(shardSessions)
         dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
           kind: "dispatch_heartbeat_failed",
           error,
         }))
       }
-      return await this.drainOwnedShards(shardIds, options, dispatchFailure)
+      return await this.drainOwnedShards(shardSessions, options, dispatchFailure)
     } finally {
       dispatchHeartbeat?.stop()
-      await this.releaseDispatchShards(shardIds)
+      await this.releaseShardSessions(shardSessions)
     }
   }
 
   private async drainOwnedShards(
-    shardIds: number[],
+    shardSessions: ShardDurabilitySession[],
     options: DrainOptions,
     dispatchFailure?: Promise<DispatchHeartbeatFailure>,
   ): Promise<DrainResult> {
@@ -423,7 +442,9 @@ export class DurableRuntime {
       activationCommitMaxDelayMs,
     })
 
-    if (shardIds.length === 0) {
+    const shardIds = shardSessions.map((session) => session.shardId)
+
+    if (shardSessions.length === 0) {
       this.log("debug", "runtime.drain.no_shards", {
         workerId: this.workerId,
         maxConcurrentActivations,
@@ -451,14 +472,23 @@ export class DurableRuntime {
     }
 
     const tasks = new Set<ActivationTask>()
-    const queuedClaims: ClaimedActivationWithInstance[] = []
-    const commitBatcher = new ActivationCommitBatcher(
-      this.provider,
-      activationCommitBatchSize,
-      activationCommitMaxDelayMs,
-    )
+    const queuedClaims: RuntimeClaim[] = []
+    const commitBatchers = new Map<number, ActivationCommitBatcher>()
+    const commitBatcherFor = (session: ShardDurabilitySession) => {
+      let batcher = commitBatchers.get(session.shardId)
+      if (!batcher) {
+        batcher = new ActivationCommitBatcher(
+          session,
+          activationCommitBatchSize,
+          activationCommitMaxDelayMs,
+        )
+        commitBatchers.set(session.shardId, batcher)
+      }
+      return batcher
+    }
     const queuedHeartbeat = this.startQueuedActivationHeartbeat(() =>
-      queuedClaims.map((claim) => claim.activation.activationId),
+      queuedClaims
+        .filter((claim) => requiresActivationHeartbeat(claim))
     )
     let queuedHeartbeatFailure: Promise<QueuedActivationHeartbeatFailure> | undefined =
       queuedHeartbeat.failure.catch((error: unknown) => ({
@@ -470,26 +500,26 @@ export class DurableRuntime {
       if (queuedClaims.length === 0) {
         return
       }
-      const activationIds = queuedClaims.splice(0).map((claim) => claim.activation.activationId)
-      await this.provider
-        .releaseActivations({
-          activationIds,
-          workerId: this.workerId,
-        })
-        .catch(() => undefined)
+      const claims = queuedClaims.splice(0)
+      await Promise.allSettled(
+        groupRuntimeClaimsBySession(claims).map(({ session, claims }) =>
+          session.releaseActivations({
+            activationIds: claims.map((claim) => claim.activation.activationId),
+            workerId: this.workerId,
+          }),
+        ),
+      )
       this.gauge("durable.runtime.activation.prefetched", queuedClaims.length, {
         workerId: this.workerId,
       })
     }
 
-    const startActivation = (claim: ClaimedActivationWithInstance) => {
-      const { activation, instance, effects } = claim
+    const startActivation = (claim: RuntimeClaim) => {
+      const { activation } = claim
       const task: ActivationTask = {
         promise: this.runClaimedActivation(
-          activation,
-          instance,
-          effects,
-          commitBatcher,
+          claim,
+          commitBatcherFor(claim.session),
           drainController.signal,
         ).catch((error: unknown): ActivationTaskOutcome => ({ kind: "failed", activation, error })),
       }
@@ -604,18 +634,28 @@ export class DurableRuntime {
             activationPrefetchLimit - queuedClaims.length - tasks.size,
             maxActivations - totalClaimed,
           )
-          const batch = await this.provider.claimReadyActivations({
-            workerId: this.workerId,
-            shardIds,
-            shardCount: this.shardCount,
-            workflows: this.workflowVersions(),
-            now: this.now(),
-            leaseMs: this.activationLeaseMs,
-            limit: openPrefetchSlots,
-          })
+          const batches: ClaimBatchWithSession[] = []
+          let remainingPrefetchSlots = openPrefetchSlots
+          for (const session of shardSessions) {
+            if (remainingPrefetchSlots <= 0) {
+              break
+            }
+            const batch = await session.claimTasks({
+              shardCount: this.shardCount,
+              workflows: this.workflowVersions(),
+              now: this.now(),
+              leaseMs: this.activationLeaseMs,
+              limit: remainingPrefetchSlots,
+            })
+            batches.push({ session, batch })
+            remainingPrefetchSlots -= batch.claims.length
+          }
+          const claimedCount = batches.reduce((total, item) => total + item.batch.claims.length, 0)
 
-          if (batch.claims.length === 0) {
-            nextWakeAt = batch.nextWakeAt
+          if (claimedCount === 0) {
+            nextWakeAt = earliestIso(
+              ...batches.map((item) => item.batch.nextWakeAt),
+            )
             claimMissed = true
             this.log("debug", "runtime.activation.claim_miss", () => ({
               workerId: this.workerId,
@@ -632,36 +672,41 @@ export class DurableRuntime {
             break
           }
 
-          for (const claim of batch.claims) {
-            totalClaimed += 1
-            this.log("debug", "runtime.activation.claimed", () => ({
-              workerId: this.workerId,
-              workflowName: claim.activation.workflowName,
-              workflowId: claim.activation.workflowId,
-              runId: claim.activation.runId,
-              activationId: claim.activation.activationId,
-              activationKind: claim.activation.kind,
-              eventKind: activationEventKind(claim.activation),
-              sequence: claim.activation.sequence,
-              activeSlots: tasks.size,
-              prefetched: queuedClaims.length + 1,
-              maxConcurrentActivations,
-              activationPrefetchLimit,
-              activationCommitMaxDelayMs,
-            }))
-            this.count(
-              "durable.runtime.activation.claim",
-              () => this.activationTags(claim.activation, "claimed"),
-            )
-            queuedClaims.push(claim)
+          for (const { session, batch } of batches) {
+            for (const claim of batch.claims) {
+              totalClaimed += 1
+              this.log("debug", "runtime.activation.claimed", () => ({
+                workerId: this.workerId,
+                workflowName: claim.activation.workflowName,
+                workflowId: claim.activation.workflowId,
+                runId: claim.activation.runId,
+                activationId: claim.activation.activationId,
+                activationKind: claim.activation.kind,
+                eventKind: activationEventKind(claim.activation),
+                sequence: claim.activation.sequence,
+                shardId: session.shardId,
+                activeSlots: tasks.size,
+                prefetched: queuedClaims.length + 1,
+                maxConcurrentActivations,
+                activationPrefetchLimit,
+                activationCommitMaxDelayMs,
+              }))
+              this.count(
+                "durable.runtime.activation.claim",
+                () => this.activationTags(claim.activation, "claimed"),
+              )
+              queuedClaims.push({ ...claim, session })
+            }
           }
           this.gauge("durable.runtime.activation.prefetched", queuedClaims.length, {
             workerId: this.workerId,
           })
           startQueuedActivations()
 
-          if (batch.claims.length < openPrefetchSlots) {
-            nextWakeAt = batch.nextWakeAt
+          if (claimedCount < openPrefetchSlots) {
+            nextWakeAt = earliestIso(
+              ...batches.map((item) => item.batch.nextWakeAt),
+            )
             claimMissed = true
             break
           }
@@ -749,7 +794,7 @@ export class DurableRuntime {
     const jitterRatio = options.jitterRatio ?? 0.1
     const sleep = options.sleep ?? sleepMs
     let activations = 0
-    let shardIds: number[] = []
+    let shardSessions: ShardDurabilitySession[] = []
     let dispatchHeartbeat: DispatchHeartbeat | undefined
     let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
     this.log("info", "runtime.worker.start", {
@@ -765,9 +810,9 @@ export class DurableRuntime {
       dispatchHeartbeat?.stop()
       dispatchHeartbeat = undefined
       dispatchFailure = undefined
-      if (shardIds.length > 0) {
-        await this.releaseDispatchShards(shardIds)
-        shardIds = []
+      if (shardSessions.length > 0) {
+        await this.releaseShardSessions(shardSessions)
+        shardSessions = []
       }
     }
 
@@ -775,11 +820,11 @@ export class DurableRuntime {
       while (!options.signal?.aborted) {
         let result: DrainResult
         try {
-          if (shardIds.length === 0) {
-            shardIds = await this.claimDispatchShards()
-            if (shardIds.length > 0) {
-              await this.heartbeatDispatchShards(shardIds)
-              dispatchHeartbeat = this.startDispatchShardHeartbeat(shardIds)
+          if (shardSessions.length === 0) {
+            shardSessions = await this.claimShardSessions()
+            if (shardSessions.length > 0) {
+              await this.heartbeatShardSessions(shardSessions)
+              dispatchHeartbeat = this.startDispatchShardHeartbeat(shardSessions)
               dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
                 kind: "dispatch_heartbeat_failed",
                 error,
@@ -787,7 +832,7 @@ export class DurableRuntime {
             }
           }
 
-          result = await this.drainOwnedShards(shardIds, {
+          result = await this.drainOwnedShards(shardSessions, {
             maxActivations: maxActivationsPerDrain,
             maxConcurrentActivations,
             activationPrefetchLimit,
@@ -857,19 +902,20 @@ export class DurableRuntime {
     return { activations }
   }
 
-  private async claimDispatchShards(): Promise<number[]> {
-    const shardIds: number[] = []
+  private async claimShardSessions(): Promise<ShardDurabilitySession[]> {
+    const sessions: ShardDurabilitySession[] = []
     for (const shardId of this.dispatchShardIds) {
-      const lease = await this.provider.claimDispatchShard({
+      const lease = await this.provider.claimShard({
         shardId,
         ownerId: this.workerId,
         now: this.now(),
         leaseMs: this.dispatchLeaseMs,
       })
       if (lease) {
-        shardIds.push(shardId)
+        sessions.push(this.provider.openShard(lease))
       }
     }
+    const shardIds = sessions.map((session) => session.shardId)
     this.log("debug", "runtime.dispatch_shards.claimed", {
       workerId: this.workerId,
       shardIds,
@@ -879,15 +925,13 @@ export class DurableRuntime {
     this.gauge("durable.runtime.dispatch_shards.owned", shardIds.length, {
       workerId: this.workerId,
     })
-    return shardIds
+    return sessions
   }
 
-  private async heartbeatDispatchShards(shardIds: number[]): Promise<void> {
+  private async heartbeatShardSessions(sessions: ShardDurabilitySession[]): Promise<void> {
     await Promise.all(
-      shardIds.map((shardId) =>
-        this.provider.heartbeatDispatchShard({
-          shardId,
-          ownerId: this.workerId,
+      sessions.map((session) =>
+        session.heartbeat({
           now: this.now(),
           leaseMs: this.dispatchLeaseMs,
         }),
@@ -895,15 +939,8 @@ export class DurableRuntime {
     )
   }
 
-  private async releaseDispatchShards(shardIds: number[]): Promise<void> {
-    await Promise.allSettled(
-      shardIds.map((shardId) =>
-        this.provider.releaseDispatchShard({
-          shardId,
-          ownerId: this.workerId,
-        }),
-      ),
-    )
+  private async releaseShardSessions(sessions: ShardDurabilitySession[]): Promise<void> {
+    await Promise.allSettled(sessions.map((session) => session.release()))
   }
 
   private workflowVersions(): Record<string, { version: number }> {
@@ -920,8 +957,10 @@ export class DurableRuntime {
     activation: ClaimedActivation,
     latest: ActivationInstanceSnapshot,
     effects: EffectRecord[],
+    session: ShardDurabilitySession,
     commitBatcher: ActivationCommitBatcher,
     signal: AbortSignal,
+    heartbeatControl: ActivationHeartbeatControl,
   ): Promise<void> {
     this.log("debug", "runtime.activation.started", () => ({
       workerId: this.workerId,
@@ -934,7 +973,7 @@ export class DurableRuntime {
       sequence: activation.sequence,
     }))
     if (latest.status !== "running" || latest.sequence !== activation.sequence) {
-      await this.provider.releaseActivation({
+      await session.releaseActivation({
         activationId: activation.activationId,
         workerId: this.workerId,
       })
@@ -951,7 +990,7 @@ export class DurableRuntime {
 
     const workflow = this.workflows.get(latest.workflowName)
     if (!workflow) {
-      await this.provider.releaseActivation({
+      await session.releaseActivation({
         activationId: activation.activationId,
         workerId: this.workerId,
       })
@@ -967,7 +1006,7 @@ export class DurableRuntime {
     }
 
     if (latest.workflowVersion > workflow.version) {
-      await this.provider.releaseActivation({
+      await session.releaseActivation({
         activationId: activation.activationId,
         workerId: this.workerId,
       })
@@ -986,7 +1025,7 @@ export class DurableRuntime {
         { workflowId: latest.workflowId, runId: latest.runId, updatedAt: commitTime },
         next,
       )
-      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
+      await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, session, {
         effects: [...effectLedger.mutations.values()],
         childStarts: [...childLedger.byKey.values()],
       }, commitBatcher)
@@ -1015,6 +1054,8 @@ export class DurableRuntime {
       signal,
       effectLedger,
       childLedger,
+      heartbeatControl,
+      session,
     )
     let transition: TransitionCommand
     let consumeSignalId: string | undefined
@@ -1067,7 +1108,7 @@ export class DurableRuntime {
             next,
           )
         : []
-    await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, {
+    await this.commitOrDiscard(latest, workflow, activation.activationId, next, waits, commitTime, session, {
       consumeSignalId,
       consumeChildRecordId,
       effects: [...effectLedger.mutations.values()],
@@ -1082,6 +1123,7 @@ export class DurableRuntime {
     next: InstanceStatus<any>,
     waits: DurableWait[],
     now: string,
+    session: ShardDurabilitySession,
     options: {
       consumeSignalId?: string
       consumeChildRecordId?: string
@@ -1108,7 +1150,7 @@ export class DurableRuntime {
     const result =
       commitBatcher
         ? await commitBatcher.commit(input)
-        : (await this.provider.commitActivations([input])).results[0] ??
+        : (await session.commitActivations([input])).results[0] ??
           { ok: false, sequence: latest.sequence, reason: "missing_commit_result" }
 
     if (!result.ok) {
@@ -1126,7 +1168,7 @@ export class DurableRuntime {
         workflowName: workflow.name,
         status: "commit_conflict",
       }))
-      await this.provider.releaseActivation({
+      await session.releaseActivation({
         activationId,
         workerId: this.workerId,
       })
@@ -1179,6 +1221,7 @@ export class DurableRuntime {
     instance: ActivationInstanceSnapshot,
     activationId: string,
     activationSignal: AbortSignal,
+    session: ShardDurabilitySession,
     ledger: ActivationEffectLedger,
     key: string,
     fn: (ctx: ActivityContext) => Promise<T> | T,
@@ -1347,7 +1390,7 @@ export class DurableRuntime {
               nonRetryableErrorNames: normalized.nonRetryableErrorNames,
             }
       ledger.mutations.set(key, mutation)
-      await this.provider.recordActivationFailures([
+      await session.recordActivationFailures([
         {
           workflowId: instance.workflowId,
           runId: instance.runId,
@@ -1435,6 +1478,8 @@ export class DurableRuntime {
     activationSignal: AbortSignal,
     effects: ActivationEffectLedger,
     childLedger: ActivationChildLedger,
+    heartbeatControl: ActivationHeartbeatControl,
+    session: ShardDurabilitySession,
   ): DurableContext {
     return {
       now: () => activationTime,
@@ -1449,6 +1494,7 @@ export class DurableRuntime {
             instance,
             currentActivationId,
             activationSignal,
+            session,
             effects,
             key,
             fn,
@@ -1456,7 +1502,8 @@ export class DurableRuntime {
           )
         }
 
-        const reservation = await this.provider.getOrReserveEffect({
+        heartbeatControl.required = true
+        const reservation = await session.getOrReserveEffect({
           workflowId: instance.workflowId,
           runId: instance.runId,
           activationId: currentActivationId,
@@ -1523,7 +1570,7 @@ export class DurableRuntime {
             if (activationSignal.aborted) {
               throw abortError()
             }
-            await this.provider.heartbeatEffect({
+            await session.heartbeatEffect({
               workflowId: instance.workflowId,
               runId: instance.runId,
               activationId: currentActivationId,
@@ -1565,7 +1612,7 @@ export class DurableRuntime {
           if (activationSignal.aborted) {
             throw error
           }
-          const failure = await this.provider.failEffect({
+          const failure = await session.failEffect({
             workflowId: instance.workflowId,
             runId: instance.runId,
             activationId: currentActivationId,
@@ -1614,7 +1661,7 @@ export class DurableRuntime {
           throw error
         }
 
-        await this.provider.completeEffect({
+        await session.completeEffect({
           workflowId: instance.workflowId,
           runId: instance.runId,
           activationId: currentActivationId,
@@ -1658,6 +1705,7 @@ export class DurableRuntime {
             childWorkflow,
             childWorkflowId,
             "run-1",
+            workflowPartitionShard(childWorkflowId, "run-1", this.shardCount),
             startCommand,
             now,
           )
@@ -1738,7 +1786,7 @@ export class DurableRuntime {
             return handle
           }
 
-          const eagerHandle = await this.provider.createChildInstance({
+          const eagerHandle = await session.createChildInstance({
             workflowName: childWorkflow.name,
             workflowVersion: childWorkflow.version,
             workflowId: childInstance.workflowId,
@@ -1804,7 +1852,7 @@ export class DurableRuntime {
             })
             return
           }
-          await this.provider.cancelChild({
+          await session.cancelChild({
             parentWorkflowId: instance.workflowId,
             parentRunId: instance.runId,
             activationId: currentActivationId,
@@ -1833,19 +1881,34 @@ export class DurableRuntime {
   }
 
   private async runClaimedActivation(
-    activation: ClaimedActivation,
-    instance: ActivationInstanceSnapshot,
-    effects: EffectRecord[],
+    claim: RuntimeClaim,
     commitBatcher: ActivationCommitBatcher,
     signal: AbortSignal,
   ): Promise<ActivationTaskOutcome> {
+    const { activation, instance, effects } = claim
+    const heartbeatControl: ActivationHeartbeatControl = {
+      required: requiresActivationHeartbeat(claim),
+    }
     try {
-      await this.withActivationHeartbeat(activation, signal, (activationSignal) =>
-        this.runActivation(activation, instance, effects, commitBatcher, activationSignal),
+      await this.withActivationHeartbeat(
+        claim.session,
+        activation,
+        signal,
+        () => heartbeatControl.required,
+        (activationSignal) =>
+          this.runActivation(
+            activation,
+            instance,
+            effects,
+            claim.session,
+            commitBatcher,
+            activationSignal,
+            heartbeatControl,
+          ),
       )
       return { kind: "handled", activation }
     } catch (error) {
-      await this.releaseActivationQuietly(activation.activationId)
+      await this.releaseActivationQuietly(claim.session, activation.activationId)
       if (isActivityRetryScheduledError(error)) {
         this.log("info", "runtime.activation.retry_scheduled", () => ({
           workerId: this.workerId,
@@ -1875,7 +1938,7 @@ export class DurableRuntime {
     }
   }
 
-  private startDispatchShardHeartbeat(shardIds: number[]): DispatchHeartbeat {
+  private startDispatchShardHeartbeat(sessions: ShardDurabilitySession[]): DispatchHeartbeat {
     let rejectHeartbeat: (error: unknown) => void = () => undefined
     let failed = false
     let inFlight = false
@@ -1887,7 +1950,7 @@ export class DurableRuntime {
         return
       }
       inFlight = true
-      void this.heartbeatDispatchShards(shardIds)
+      void this.heartbeatShardSessions(sessions)
         .catch((error) => {
           if (!failed) {
             failed = true
@@ -1908,7 +1971,7 @@ export class DurableRuntime {
     }
   }
 
-  private startQueuedActivationHeartbeat(activationIds: () => string[]): QueuedActivationHeartbeat {
+  private startQueuedActivationHeartbeat(claims: () => RuntimeClaim[]): QueuedActivationHeartbeat {
     let rejectHeartbeat: (error: unknown) => void = () => undefined
     let failed = false
     let inFlight = false
@@ -1916,18 +1979,21 @@ export class DurableRuntime {
       rejectHeartbeat = reject
     })
     const timer = setInterval(() => {
-      const ids = [...new Set(activationIds())]
-      if (ids.length === 0 || inFlight || failed) {
+      const claimBatch = claims()
+      if (claimBatch.length === 0 || inFlight || failed) {
         return
       }
       inFlight = true
-      void this.provider
-        .heartbeatActivations({
-          activationIds: ids,
-          workerId: this.workerId,
-          now: this.now(),
-          leaseMs: this.activationLeaseMs,
-        })
+      void Promise.all(
+        groupRuntimeClaimsBySession(claimBatch).map(({ session, claims }) =>
+          session.heartbeatActivations({
+            activationIds: [...new Set(claims.map((claim) => claim.activation.activationId))],
+            workerId: this.workerId,
+            now: this.now(),
+            leaseMs: this.activationLeaseMs,
+          }),
+        ),
+      )
         .catch((error) => {
           if (!failed) {
             failed = true
@@ -1949,8 +2015,10 @@ export class DurableRuntime {
   }
 
   private async withActivationHeartbeat<T>(
+    session: ShardDurabilitySession,
     activation: ClaimedActivation,
     externalSignal: AbortSignal | undefined,
+    shouldHeartbeat: () => boolean,
     fn: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const controller = new AbortController()
@@ -1970,11 +2038,11 @@ export class DurableRuntime {
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true })
 
     const timer = setInterval(() => {
-      if (heartbeatInFlight || stopped) {
+      if (!shouldHeartbeat() || heartbeatInFlight || stopped) {
         return
       }
       heartbeatInFlight = true
-      void this.provider
+      void session
         .heartbeatActivations({
           activationIds: [activation.activationId],
           workerId: this.workerId,
@@ -2019,8 +2087,11 @@ export class DurableRuntime {
     }
   }
 
-  private async releaseActivationQuietly(activationId: string): Promise<void> {
-    await this.provider
+  private async releaseActivationQuietly(
+    session: ShardDurabilitySession,
+    activationId: string,
+  ): Promise<void> {
+    await session
       .releaseActivation({
         activationId,
         workerId: this.workerId,
@@ -2288,6 +2359,7 @@ export class DurableRuntime {
     workflow: AnyWorkflow,
     workflowId: string,
     runId: string,
+    partitionShard: number,
     startCommand: StartCommand,
     now: string,
   ): PersistedInstance {
@@ -2310,6 +2382,7 @@ export class DurableRuntime {
       workflowVersion: workflow.version,
       workflowId,
       runId,
+      partitionShard,
       sequence: 0,
       status: "running",
       common: snapshot.common,
@@ -2373,11 +2446,19 @@ export class DurableRuntime {
 
   private async requireInstance(ref: InstanceRef | string): Promise<PersistedInstance> {
     const normalizedRef = normalizeRef(ref)
-    const instance = await this.provider.loadInstance(normalizedRef)
+    const instance = await this.shardSessionForRef(normalizedRef).readInstance(normalizedRef)
     if (!instance) {
       throw new Error(`Unknown workflow instance: ${normalizedRef.workflowId}/${normalizedRef.runId}`)
     }
     return instance
+  }
+
+  private shardSessionForRef(ref: InstanceRef): ShardDurabilitySession {
+    return this.shardSessionForShard(workflowPartitionShard(ref.workflowId, ref.runId, this.shardCount))
+  }
+
+  private shardSessionForShard(shardId: number): ShardDurabilitySession {
+    return this.provider.openShard({ shardId })
   }
 
   private now(): string {
@@ -2572,6 +2653,25 @@ function childHandleFromStart<W extends AnyWorkflow>(start: CheckpointChildStart
   } as ChildHandle<W>
 }
 
+function requiresActivationHeartbeat(claim: ClaimedActivationWithInstance): boolean {
+  return claim.lease.scope === "activation"
+}
+
+function groupRuntimeClaimsBySession(
+  claims: RuntimeClaim[],
+): Array<{ session: ShardDurabilitySession; claims: RuntimeClaim[] }> {
+  const groups = new Map<ShardDurabilitySession, RuntimeClaim[]>()
+  for (const claim of claims) {
+    const group = groups.get(claim.session)
+    if (group) {
+      group.push(claim)
+    } else {
+      groups.set(claim.session, [claim])
+    }
+  }
+  return [...groups].map(([session, claims]) => ({ session, claims }))
+}
+
 type LocalActivityOptions = {
   maxAttempts: number
   maxElapsedMs: number | null
@@ -2674,6 +2774,10 @@ function errorFromSerialized(error: { message: string; name?: string; stack?: st
 
 function addMs(isoValue: string, ms: number): string {
   return new Date(new Date(isoValue).getTime() + ms).toISOString()
+}
+
+function earliestIso(...values: Array<string | undefined>): string | undefined {
+  return values.filter(Boolean).sort()[0]
 }
 
 function callWaitHandler(

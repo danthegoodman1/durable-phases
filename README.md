@@ -4,9 +4,12 @@ Durable Phases is a TypeScript runtime for phase-based durable execution. It
 turns workflow phases, durable waits, signals, timers, child workflows, and
 activities into checkpointed state backed by a `DurabilityProvider`.
 
-The runtime ships with production-shaped SQLite and Postgres providers. Both
-support shard leases, activation leases, atomic checkpoint commits, durable work
-indexes, signal inboxes, child records, and activation-scoped effects.
+The runtime ships with production-shaped SQLite and Postgres providers. The
+provider boundary is now shard-native: the runtime owns a dispatch shard, opens
+a shard session, claims shard-local tasks, executes activations, and commits
+append-friendly state mutations back to that same shard. Normal checkpoint-local
+work is fenced by shard ownership; eager heartbeat/timeout activities still keep
+their own durable attempt fencing.
 
 ## Quickstart
 
@@ -56,9 +59,10 @@ The Compose file defaults to the pinned official image
 `pg.Pool`, schema name, pool size, statement/lock timeouts,
 `physicalPartitions`, and optional observability sinks. The provider uses
 explicit transactions, row locks, `FOR UPDATE SKIP LOCKED`, conflict-aware
-upserts, a unified `activation_tasks` table for ready work plus leases, partial
-hot-path indexes, and an advisory transaction lock for concurrent schema
-initialization.
+upserts, shard-epoch task ownership, partial hot-path indexes, and an advisory
+transaction lock for concurrent schema initialization. The live
+`activation_tasks` rows carry execution snapshots so shard-local claims do not
+join against `instances` on the normal hot path.
 
 `physicalPartitions` is fixed when a schema is created and is persisted in
 provider metadata. Hot workflow/run tables are manually suffixed
@@ -74,8 +78,8 @@ production guarantee.
 
 ```bash
 npm run benchmark:sqlite -- --workflows 1000 --activation-concurrency 4 --activation-prefetch-limit 32 --json
-npm run benchmark:postgres -- --activation-concurrency 4 --activation-prefetch-limit 32 --json
-npm run benchmark:postgres -- --physical-partitions 4 --json
+npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --physical-partitions 4 --json
+npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 16 --activation-prefetch-limit 64 --batch 64 --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
 npm run benchmark:postgres:diagnose -- --physical-partitions 4 --workflows 1000 --workers 16 --shards 16 --pool-size 64 --json
 ```
@@ -84,29 +88,31 @@ The benchmark reports setup, processing, and verification time separately.
 Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
 
-Measured on this workspace with 1,000 workflows, zero artificial activity delay,
-activation concurrency 4, activation prefetch 32, and batch 32. SQLite uses
-file-backed WAL/FULL durability; Postgres uses `synchronous_commit=on`:
+Measured on this workspace with 1,000 workflows and zero artificial activity
+delay. SQLite uses file-backed WAL/FULL durability; Postgres uses
+`synchronous_commit=on`:
 
-| Provider | workers/shards | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| SQLite WAL/FULL | 4/4 | n/a | n/a | 650 | 3,249 | 3,726 | 5,961 |
-| SQLite WAL/FULL | 16/16 | n/a | n/a | 822 | 4,108 | 4,891 | 7,825 |
-| Postgres Docker postgres:18.3 | 4/4 | 1 | 24 | 194 | 968 | 1,780 | 2,848 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 24 | 222 | 1,109 | 2,035 | 3,255 |
-| Postgres Docker postgres:18.3 | 16/16 | 1 | 64 | 267 | 1,334 | 3,966 | 6,345 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 64 | 280 | 1,400 | 4,129 | 6,607 |
-| Postgres Docker postgres:18.3 | 32/32 | 1 | 96 | 263 | 1,314 | 3,912 | 6,259 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 96 | 298 | 1,491 | 4,064 | 6,503 |
+| Provider | workers/shards | activation concurrency | prefetch / drain batch | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SQLite WAL/FULL single file | 4/4 | 4 | 32 / 32 | n/a | n/a | 406 | 2,032 | 2,205 | 3,528 |
+| SQLite WAL/FULL single file | 16/16 | 4 | 32 / 32 | n/a | n/a | 805 | 4,027 | 4,758 | 7,613 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 1 | 24 | 166 | 832 | 1,279 | 2,046 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 4 | 24 | 165 | 826 | 1,339 | 2,143 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 1 | 64 | 270 | 1,348 | 3,393 | 5,430 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 4 | 64 | 241 | 1,207 | 3,442 | 5,508 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 1 | 96 | 239 | 1,193 | 3,509 | 5,614 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 4 | 96 | 264 | 1,321 | 3,675 | 5,880 |
 
 `npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
 sampling of pool pressure, active Postgres wait events, WAL/database deltas,
 Node CPU, and event loop utilization.
 
-The no-delay workload is mostly local DB/CPU-bound, so higher activation
-concurrency does not necessarily improve that particular throughput row. The
-concurrency path is still useful for workers with long in-flight async
-activations because one blocked activation no longer occupies the entire worker.
+The no-delay workload is mostly local DB/CPU-bound. Higher activation
+concurrency can improve throughput when it gives the runtime enough completed
+work to coalesce provider commits, but it eventually runs into the local
+Postgres/container ceiling. It is also useful for workflows with long in-flight
+async activations because one blocked activation no longer occupies the entire
+worker.
 
 The Postgres rows are from local Docker on the same machine, so they include
 client/server and container overhead.

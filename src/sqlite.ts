@@ -8,6 +8,8 @@ import type {
   CancelChildInput,
   ChildRecord,
   ClaimDispatchShardInput,
+  ClaimShardTasksInput,
+  ClaimShardTasksResult,
   ClaimedActivation,
   ClaimedActivationWithInstance,
   ClaimReadyActivationsInput,
@@ -35,6 +37,7 @@ import type {
   HeartbeatDispatchShardInput,
   HeartbeatEffectInput,
   LoadInstanceOptions,
+  OpenShardInput,
   PersistedInstance,
   ReadyEvent,
   RecordActivationFailureInput,
@@ -42,6 +45,8 @@ import type {
   ReleaseActivationInput,
   ReleaseDispatchShardInput,
   ReserveEffectInput,
+  ShardDurabilitySession,
+  ShardLease,
   SignalRecord,
 } from "./interface.js"
 import type {
@@ -306,6 +311,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     this.db.close()
     this.statements.clear()
     this.closed = true
+  }
+
+  async claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null> {
+    const lease = await this.claimDispatchShard(input)
+    return lease ? { ...lease, leaseEpoch: lease.leaseEpoch ?? 0 } : null
+  }
+
+  openShard(input: OpenShardInput): ShardDurabilitySession {
+    return new SqliteShardSession(this, input)
   }
 
   async createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
@@ -867,6 +881,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           activation: stripCandidateMetadata(candidate),
           instance: this.activationInstanceSnapshot(candidate.instance),
           effects: this.effectsForActivation(candidate.activationId),
+          lease: { scope: "activation" },
         })
       }
 
@@ -912,6 +927,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       activation: first.activation,
       instance: first.instance,
       effects: first.effects,
+      lease: first.lease,
     }
   }
 
@@ -1711,6 +1727,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       workflowVersion: row.workflow_version,
       workflowId: row.workflow_id,
       runId: row.run_id,
+      partitionShard: row.partition_shard,
       sequence: row.sequence,
       status: row.status,
       common: decodeJson<JsonObject | undefined>(row.common_json, undefined),
@@ -3317,6 +3334,129 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       } else {
         gaugeDurable(this.observability, observation.name, observation.value, observation.tags)
       }
+    }
+  }
+}
+
+class SqliteShardSession implements ShardDurabilitySession {
+  readonly shardId: number
+  readonly ownerId?: string
+  readonly leaseEpoch?: number
+
+  constructor(
+    private readonly provider: SqliteDurabilityProvider,
+    input: OpenShardInput,
+  ) {
+    this.shardId = input.shardId
+    this.ownerId = input.ownerId
+    this.leaseEpoch = input.leaseEpoch
+  }
+
+  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+    this.assertShard(input.partitionShard)
+    return this.provider.createInstance(input)
+  }
+
+  createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
+    return this.provider.createChildInstance(input)
+  }
+
+  cancelChild(input: CancelChildInput): Promise<void> {
+    return this.provider.cancelChild(input)
+  }
+
+  readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null> {
+    return this.provider.loadInstance(ref, options)
+  }
+
+  appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
+    return this.provider.appendSignal(input)
+  }
+
+  claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult> {
+    if (!this.ownerId) {
+      throw new Error(`Shard ${this.shardId} is not opened with an owner`)
+    }
+    return this.provider.claimReadyActivations({
+      workerId: this.ownerId,
+      shardIds: [this.shardId],
+      shardCount: input.shardCount,
+      workflows: input.workflows,
+      now: input.now,
+      leaseMs: input.leaseMs,
+      limit: input.limit,
+    })
+  }
+
+  async heartbeat(input: { now: string; leaseMs: number }): Promise<void> {
+    if (!this.ownerId) {
+      return
+    }
+    await this.provider.heartbeatDispatchShard({
+      shardId: this.shardId,
+      ownerId: this.ownerId,
+      now: input.now,
+      leaseMs: input.leaseMs,
+    })
+  }
+
+  async release(): Promise<void> {
+    if (!this.ownerId) {
+      return
+    }
+    await this.provider.releaseDispatchShard({
+      shardId: this.shardId,
+      ownerId: this.ownerId,
+    })
+  }
+
+  heartbeatActivations(input: HeartbeatActivationsInput): Promise<void> {
+    return this.provider.heartbeatActivations(input)
+  }
+
+  heartbeatActivation(input: HeartbeatActivationInput): Promise<void> {
+    return this.provider.heartbeatActivation(input)
+  }
+
+  releaseActivations(input: ReleaseActivationsInput): Promise<void> {
+    return this.provider.releaseActivations(input)
+  }
+
+  releaseActivation(input: ReleaseActivationInput): Promise<void> {
+    return this.provider.releaseActivation(input)
+  }
+
+  getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation> {
+    return this.provider.getOrReserveEffect(input)
+  }
+
+  heartbeatEffect(input: HeartbeatEffectInput): Promise<void> {
+    return this.provider.heartbeatEffect(input)
+  }
+
+  completeEffect(input: CompleteEffectInput): Promise<void> {
+    return this.provider.completeEffect(input)
+  }
+
+  failEffect(input: FailEffectInput): Promise<FailEffectResult> {
+    return this.provider.failEffect(input)
+  }
+
+  commitActivations(input: CommitActivationInput[]): Promise<CommitActivationsResult> {
+    return this.provider.commitActivations(input)
+  }
+
+  commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
+    return this.provider.commitCheckpoint(input)
+  }
+
+  recordActivationFailures(input: RecordActivationFailureInput[]): Promise<void> {
+    return this.provider.recordActivationFailures(input)
+  }
+
+  private assertShard(partitionShard: number): void {
+    if (partitionShard !== this.shardId) {
+      throw new Error(`Shard session ${this.shardId} cannot write shard ${partitionShard}`)
     }
   }
 }

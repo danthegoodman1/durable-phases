@@ -130,6 +130,47 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
     )
   })
 
+  it("stores execution snapshots on live activation tasks", async () => {
+    await withProvider(async (provider, schema) => {
+      await expect(
+        scalar<number>(
+          schema,
+          `
+          SELECT count(*)::int
+          FROM information_schema.columns
+          WHERE table_schema = $1
+            AND table_name = 'activation_tasks_p00'
+            AND column_name LIKE 'instance_%'
+          `,
+          [schema],
+        ),
+      ).resolves.toBeGreaterThan(0)
+
+      await provider.createInstance({
+        workflowName: "pg_snapshot_task",
+        workflowVersion: 1,
+        workflowId: "pg-snapshot-task",
+        runId: "run-1",
+        partitionShard: 0,
+        common: { value: 42 },
+        phase: { name: "run", data: { step: "ready" } },
+        waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+        now: "2026-01-01T00:00:00.000Z",
+      })
+      await expect(
+        scalar<string>(
+          schema,
+          `
+          SELECT instance_common_json->>'value'
+          FROM {schema}.activation_tasks_p00
+          WHERE workflow_id = $1 AND run_id = $2
+          `,
+          ["pg-snapshot-task", "run-1"],
+        ),
+      ).resolves.toBe("42")
+    })
+  })
+
   it("routes hot workflow data to deterministic physical tables", async () => {
     await withProvider(
       async (provider, schema) => {
@@ -352,6 +393,170 @@ describeIfPostgres("PostgresDurabilityProvider", () => {
       } finally {
         await providerB.close()
       }
+    })
+  })
+
+  it("reclaims shard-scoped tasks by shard epoch and fences stale commits", async () => {
+    await withProvider(async (providerA, schema) => {
+      const providerB = await PostgresDurabilityProvider.create({
+        connectionString,
+        schema,
+        poolSize: 4,
+      })
+      try {
+        await providerA.createInstance({
+          workflowName: "pg_epoch",
+          workflowVersion: 1,
+          workflowId: "pg-epoch",
+          runId: "run-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "run", data: {} },
+          waits: [{ kind: "run", name: "__run", readyAt: "2026-01-01T00:00:00.000Z" }],
+          now: "2026-01-01T00:00:00.000Z",
+        })
+        await expect(
+          providerA.claimDispatchShard({
+            shardId: 0,
+            ownerId: "worker-a",
+            now: "2026-01-01T00:00:00.000Z",
+            leaseMs: 100,
+          }),
+        ).resolves.toMatchObject({ leaseEpoch: 1 })
+        const first = await providerA.claimReadyActivations({
+          workerId: "worker-a",
+          shardIds: [0],
+          workflows: { pg_epoch: { version: 1 } },
+          now: "2026-01-01T00:00:00.000Z",
+          leaseMs: 60_000,
+          limit: 1,
+        })
+        expect(first.claims).toHaveLength(1)
+        expect(first.claims[0].lease).toEqual({ scope: "shard", shardId: 0, epoch: 1 })
+
+        await expect(
+          providerB.claimDispatchShard({
+            shardId: 0,
+            ownerId: "worker-b",
+            now: "2026-01-01T00:00:01.000Z",
+            leaseMs: 60_000,
+          }),
+        ).resolves.toMatchObject({ leaseEpoch: 2 })
+        const reclaimed = await providerB.claimReadyActivations({
+          workerId: "worker-b",
+          shardIds: [0],
+          workflows: { pg_epoch: { version: 1 } },
+          now: "2026-01-01T00:00:01.000Z",
+          leaseMs: 60_000,
+          limit: 1,
+        })
+        expect(reclaimed.claims).toHaveLength(1)
+        expect(reclaimed.claims[0].activation.activationId).toBe(first.claims[0].activation.activationId)
+        expect(reclaimed.claims[0].lease).toEqual({ scope: "shard", shardId: 0, epoch: 2 })
+
+        await expect(
+          providerA.commitCheckpoint({
+            workflowId: "pg-epoch",
+            runId: "run-1",
+            expectedSequence: 0,
+            activationId: first.claims[0].activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { stale: true } },
+            waits: [],
+            now: "2026-01-01T00:00:01.000Z",
+          }),
+        ).resolves.toMatchObject({ ok: false, reason: "lost_activation_lease" })
+      } finally {
+        await providerB.close()
+      }
+    })
+  })
+
+  it("does not heartbeat shard-scoped activations from the runtime", async () => {
+    await withProvider(async (provider) => {
+      let activationHeartbeats = 0
+      const originalHeartbeatActivations = provider.heartbeatActivations.bind(provider)
+      provider.heartbeatActivations = async (input) => {
+        activationHeartbeats += 1
+        await originalHeartbeatActivations(input)
+      }
+      const Workflow = defineWorkflow({
+        name: "pg_shard_scoped_runtime",
+        version: 1,
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        common: z.object({}),
+        initial() {
+          return start({ common: {}, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 25))
+              return complete({ ok: true })
+            },
+          }),
+        },
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [Workflow],
+        workerId: "pg-shard-scoped-runtime",
+        leaseHeartbeatIntervalMs: 1,
+        activationLeaseMs: 5,
+        dispatchLeaseMs: 1_000,
+      })
+      const ref = await runtime.start(Workflow, {}, { workflowId: "pg-shard-scoped-runtime" })
+      await expect(runtime.drain()).resolves.toMatchObject({ activations: 1 })
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({ status: "completed" })
+      expect(activationHeartbeats).toBe(0)
+    })
+  })
+
+  it("heartbeats shard-scoped activations once eager activity fencing is needed", async () => {
+    await withProvider(async (provider) => {
+      let activationHeartbeats = 0
+      const originalHeartbeatActivations = provider.heartbeatActivations.bind(provider)
+      provider.heartbeatActivations = async (input) => {
+        activationHeartbeats += 1
+        await originalHeartbeatActivations(input)
+      }
+      const Workflow = defineWorkflow({
+        name: "pg_shard_scoped_eager_activity",
+        version: 1,
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        common: z.object({}),
+        initial() {
+          return start({ common: {}, phase: "run", data: {} })
+        },
+        phases: {
+          run: phase({
+            run: async ({ ctx }) => {
+              await ctx.activity(
+                "eager",
+                async () => {
+                  await new Promise((resolve) => setTimeout(resolve, 25))
+                  return true
+                },
+                { startToCloseTimeoutMs: 1_000, retry: { maxAttempts: 1 } },
+              )
+              return complete({ ok: true })
+            },
+          }),
+        },
+      })
+      const runtime = new DurableRuntime(provider, {
+        workflows: [Workflow],
+        workerId: "pg-shard-scoped-eager-runtime",
+        leaseHeartbeatIntervalMs: 1,
+        activationLeaseMs: 5,
+        dispatchLeaseMs: 1_000,
+      })
+      const ref = await runtime.start(Workflow, {}, { workflowId: "pg-shard-scoped-eager" })
+      await expect(runtime.drain()).resolves.toMatchObject({ activations: 1 })
+      await expect(provider.loadInstance(ref)).resolves.toMatchObject({ status: "completed" })
+      expect(activationHeartbeats).toBeGreaterThan(0)
     })
   })
 

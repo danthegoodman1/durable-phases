@@ -828,22 +828,28 @@ Single-instance queries use the provider's committed snapshot reads. They do not
 Conceptually:
 
 ```ts
-type DurabilityProvider = {
-  createInstance(input: CreateInstanceInput): Promise<CreateInstanceResult>
-  loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
+type ShardLease = {
+  shardId: number
+  ownerId: string
+  leaseUntil: string
+  leaseEpoch: number
+}
 
+type ShardDurabilitySession = {
+  shardId: number
+  ownerId?: string
+  leaseEpoch?: number
+
+  createInstance(input: CreateInstanceInput): Promise<CreateInstanceResult>
+  createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
+  cancelChild(input: CancelChildInput): Promise<void>
+
+  readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
 
-  claimDispatchShard?(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
-  heartbeatDispatchShard?(input: HeartbeatDispatchShardInput): Promise<void>
-  releaseDispatchShard?(input: ReleaseDispatchShardInput): Promise<void>
-
-  claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult>
-  claimReadyActivation(input: ClaimReadyActivationInput): Promise<ClaimReadyActivationResult>
-  heartbeatActivations(input: HeartbeatActivationsInput): Promise<void>
-  heartbeatActivation(input: HeartbeatActivationInput): Promise<void>
-  releaseActivations(input: ReleaseActivationsInput): Promise<void>
-  releaseActivation(input: ReleaseActivationInput): Promise<void>
+  claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult>
+  heartbeat(input: { now: string; leaseMs: number }): Promise<void>
+  release(): Promise<void>
 
   getOrReserveEffect(input: ReserveEffectInput): Promise<EffectReservation>
   heartbeatEffect(input: HeartbeatEffectInput): Promise<void>
@@ -851,8 +857,18 @@ type DurabilityProvider = {
   failEffect(input: FailEffectInput): Promise<FailEffectResult>
 
   commitActivations(input: CommitActivationInput[]): Promise<CommitActivationsResult>
-  commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult>
   recordActivationFailures(input: RecordActivationFailureInput[]): Promise<void>
+}
+
+type DurabilityProvider = {
+  claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null>
+  openShard(lease: ShardLease | { shardId: number; ownerId?: string }): ShardDurabilitySession
+
+  // Compatibility/read helpers may remain on concrete providers, but runtime
+  // execution is shard-session native.
+  createInstance(input: CreateInstanceInput): Promise<CreateInstanceResult>
+  loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
+  appendSignal(input: AppendSignalInput): Promise<SignalRecord>
 }
 ```
 
@@ -956,16 +972,17 @@ current wait set
 unconsumed signal inbox
 current activation effects
 child handles
-activation claims
+live shard tasks
 ```
 
-This lets `commitCheckpoint(...)` remain a single-partition compare-and-swap instead of a distributed transaction.
+This lets `commitActivations(...)` remain a shard-local compare-and-swap instead
+of a distributed transaction.
 
 Global dispatch structures should be secondary indexes of pointers, not the authoritative state:
 
 ```text
 due timer index
-ready activation index
+ready task index
 child completion index
 signal wakeup index
 ```
@@ -995,15 +1012,21 @@ state still routes by the same workflow identity, and public workflow refs remai
 `{ workflowId, runId }`.
 
 Worker identity and local execution concurrency are separate concerns. `workerId`
-is the durable lease owner recorded on shard leases, activation leases, and effect
+is the durable lease owner recorded on shard leases, task ownership, and effect
 attempt ownership. Activation concurrency is a local worker setting that controls
 how many claimed activations that worker may execute at once.
 
 TypeScript workers also have an activation prefetch limit. Prefetching controls
-how many claimed activation leases the worker may hold ahead of execution, while
+how many claimed activations the worker may hold ahead of execution, while
 activation concurrency still controls how many handlers run at the same time.
-Workers must heartbeat both queued and running activation leases and release
-queued claims on shutdown, abort, or fatal handler error.
+Providers may return activation-scoped claims or shard-scoped claims. Workers
+must heartbeat queued and running activation-scoped leases. For shard-scoped
+claims, workers rely on the dispatch shard heartbeat on the normal
+checkpoint-local path and must abort queued and running work if shard ownership
+is lost. Eager activities with timeout/deadline fencing may still request an
+activation heartbeat loop so due effect deadlines are detected while the owning
+worker is alive. Queued claims are released on shutdown, abort, or fatal handler
+error.
 
 Activation completions may be batched by the runtime before provider commit.
 `activationCommitBatchSize` controls the maximum number of completed activations
@@ -1023,12 +1046,18 @@ type DispatchShardLease = {
   shardId: string
   ownerId: string
   leaseUntil: string
+  leaseEpoch?: number
 }
 ```
 
-Shard leases assign polling responsibility, not correctness ownership. If a worker dies, the shard lease expires and another worker may poll that shard.
+Shard leases assign polling responsibility. Providers may also use shard leases
+as correctness ownership by attaching a monotonically increasing shard epoch to
+claimed tasks. If a worker dies, the shard lease expires and another worker may
+take over the shard, increment the epoch, and fence stale commits from the old
+owner.
 
-Small or embedded providers may omit explicit shard leasing and poll directly. They must still preserve the same activation-lease and checkpoint-CAS invariants.
+Small or embedded providers may omit explicit shard leasing and poll directly.
+They must still preserve equivalent claim fencing and checkpoint-CAS invariants.
 
 The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`,
 and `synchronous=FULL`. File-backed SQLite stores are the crash-durable SQLite
@@ -1039,21 +1068,34 @@ The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
 conflict-aware upserts, JSONB payload/snapshot columns, partial indexes for hot
 pending/ready paths, statement and lock timeouts, and an advisory transaction
-lock for concurrent schema initialization. Its ready and activation-lease state
-is stored in a compact live `activation_tasks` table so Postgres can claim work
-with a set-oriented row-locking update rather than coordinating a separate ready
-index and activation-claim table. Successful checkpoint commits delete the old
-sequence's live tasks and insert only the next live tasks. Provider startup must
-not rebuild or rewrite live ready indexes; readiness is maintained
-transactionally by instance creation, signal append, child completion/cancel,
-failure retry recording, and checkpoint commits.
+lock for concurrent schema initialization. Its ready work is stored in a
+denormalized live `activation_tasks` table with execution snapshots and
+shard-epoch ownership, so the normal claim path can return execution-ready
+snapshots without a follow-up instance read and without per-activation
+heartbeats on the checkpoint-local path.
+Successful checkpoint commits delete the old sequence's live tasks and insert
+only the next live tasks. Provider startup must not rebuild or rewrite live
+ready indexes; readiness is maintained transactionally by instance creation,
+signal append, child completion/cancel, failure retry recording, and checkpoint
+commits.
 
-### Activation claiming
+Future shard-native providers, including a true shard-file SQLite mode,
+Cassandra, or FoundationDB, should keep each shard's hot state local and use
+durable outbox/inbox handoff for cross-shard work instead of relying on
+cross-shard transactions in the hot path.
 
-`claimReadyActivations(...)` returns up to `limit` ready handler activations plus
-their current lean instance snapshots and activation-scoped effect ledgers.
-`claimReadyActivation(...)` is a
-compatibility wrapper over batch limit `1`.
+### Shard task claiming
+
+The runtime computes `shardId = hash(workflowId, runId) % shardCount` for
+`start()` and `signal()` and routes those operations directly to the shard
+session. Workers claim dispatch shards, open shard sessions, and call
+`claimTasks(...)` on each owned shard.
+
+`claimTasks(...)` returns up to `limit` ready handler activations plus their
+current execution snapshots and any activation-scoped effect ledgers needed for
+retry/eager activity work. The normal checkpoint-local path is fenced by the
+current shard lease epoch; providers may still use activation-scoped leases for
+embedded or compatibility paths.
 
 Ready activations come from:
 
@@ -1066,9 +1108,15 @@ run phases that should execute immediately
 
 When more than one wait is ready for an instance, the provider and runtime must select the winner using the canonical wait ordering rules.
 
-Claims are leased. If a worker crashes, another worker may claim the activation after the lease expires.
+Claims are fenced. If a worker crashes, another worker may claim the shard after
+the shard lease expires, increment the epoch, and reclaim unfinished tasks. Any
+late commit from the old owner must fail without consuming inbox records,
+writing child starts/effects, or updating current workflow state. If a provider
+uses activation-scoped leases for a compatibility path, another worker may claim
+the activation after that activation lease expires.
 Providers should expose batch heartbeat/release helpers so a worker can manage
-prefetched activation leases without issuing one provider call per queued claim.
+prefetched activation-scoped leases without issuing one provider call per queued
+claim.
 
 In a sharded provider, claim calls should verify that the caller owns the
 dispatch shard for the requested work, or otherwise use an equivalent mechanism
@@ -1078,10 +1126,10 @@ shards to possible physical table partitions without maintaining hot-path shard
 routing rows.
 
 The instance snapshot returned with a claim is for activation execution, not
-debug introspection. It includes identity, version, current sequence, status,
-common state, phase/output/error, waits, parent link, and timestamps. It does
-not include effect ledger records inside the snapshot itself; the claim result
-carries the activation's current effect ledger separately. Full
+debug introspection. It includes identity, version, partition shard, current
+sequence, status, common state, phase/output/error, waits, parent link, and
+timestamps. It does not include effect ledger records inside the snapshot
+itself; the claim result carries the activation's current effect ledger separately. Full
 `loadInstance(...)` reads may include provider-specific debug details such as
 effects when explicitly requested.
 
@@ -1108,6 +1156,9 @@ type ClaimedActivationWithInstance = {
   activation: ClaimedActivation
   instance: ActivationInstanceSnapshot
   effects: EffectRecord[]
+  lease:
+    | { scope: "activation" }
+    | { scope: "shard"; shardId: number; epoch: number }
 }
 
 type ClaimReadyActivationsResult = {
@@ -1250,11 +1301,12 @@ checkpoint. Child start conflicts that cannot be retried, such as a requested
 child workflow id already existing, must be reported as non-retryable commit
 failures so workers do not spin on the same activation.
 
-`recordActivationFailures(...)` records activation-scoped checkpoint activity
+`recordActivationFailures(...)` records shard-task-scoped checkpoint activity
 failures that do not advance workflow sequence, such as retry-scheduled local
 activity failures. It must verify the caller still owns the live activation
-lease. When requested, it releases the activation lease so another worker can
-reclaim the same activation after the retry wake time.
+task through shard epoch ownership or an activation lease. When requested, it
+releases the task so another worker can reclaim the same activation after the
+retry wake time.
 
 ### Provider invariants
 
@@ -1268,7 +1320,7 @@ stable runtime ordering fields for signals, timers, and child completions
 single-partition authoritative state per workflow run
 secondary dispatch indexes that can be reconciled from authoritative state
 optional leased dispatch shards for scalable polling
-leased activation claims
+leased shard-local tasks
 effect memoization scoped by activation id + user effect key
 durable heartbeat metadata for running effects
 heartbeat timeout detection for retryable long-running effects

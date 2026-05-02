@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { z } from "zod"
 import type {
+  ActivationClaimLease,
   ClaimedActivation,
   CheckpointChildStart,
   CommitCheckpointInput,
@@ -8,6 +9,7 @@ import type {
   DurableWait,
   EffectReservation,
   ReadyEvent,
+  ShardDurabilitySession,
 } from "../interface.js"
 import { DurableRuntime } from "../runtime.js"
 import type { ActivityOptions, InstanceRef, InstanceStatus, JsonObject } from "../workflow.js"
@@ -192,12 +194,10 @@ export function describeDurabilityProviderConformance(
             phase: { name: "run", data: { index } },
           })
         }
-        await ownShard(provider, "worker-a")
+        const session = await ownShard(provider, "worker-a")
 
         await expect(
-          provider.claimReadyActivations({
-            workerId: "worker-a",
-            shardIds: [0],
+          session.claimTasks({
             workflows: WORKFLOWS,
             now: T0,
             leaseMs: LONG_LEASE_MS,
@@ -205,9 +205,7 @@ export function describeDurabilityProviderConformance(
           }),
         ).rejects.toThrow()
 
-        const batch = await provider.claimReadyActivations({
-          workerId: "worker-a",
-          shardIds: [0],
+        const batch = await session.claimTasks({
           workflows: WORKFLOWS,
           now: T0,
           leaseMs: LONG_LEASE_MS,
@@ -240,7 +238,7 @@ export function describeDurabilityProviderConformance(
 
         await expect(claim(providerA, "worker-a")).resolves.toMatchObject({ activation: null })
 
-        const shardA = await providerA.claimDispatchShard({
+        const shardA = await providerA.claimShard({
           shardId: 0,
           ownerId: "worker-a",
           now: T0,
@@ -248,22 +246,20 @@ export function describeDurabilityProviderConformance(
         })
         expect(shardA).toMatchObject({ shardId: 0, ownerId: "worker-a" })
         await expect(
-          providerB.claimDispatchShard({
+          providerB.claimShard({
             shardId: 0,
             ownerId: "worker-b",
             now: T0,
             leaseMs: 100,
           }),
         ).resolves.toBeNull()
-        await providerA.heartbeatDispatchShard({
-          shardId: 0,
-          ownerId: "worker-a",
+        await providerA.openShard(shardA!).heartbeat({
           now: T0,
           leaseMs: 1_000,
         })
-        await providerA.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
+        await providerA.openShard(shardA!).release()
         await expect(
-          providerB.claimDispatchShard({
+          providerB.claimShard({
             shardId: 0,
             ownerId: "worker-b",
             now: T0,
@@ -271,8 +267,8 @@ export function describeDurabilityProviderConformance(
           }),
         ).resolves.toMatchObject({ ownerId: "worker-b" })
 
-        await providerB.releaseDispatchShard({ shardId: 0, ownerId: "worker-b" })
-        await providerA.claimDispatchShard({
+        await providerB.openShard({ shardId: 0, ownerId: "worker-b" }).release()
+        await providerA.claimShard({
           shardId: 0,
           ownerId: "worker-a",
           now: T0,
@@ -289,7 +285,7 @@ export function describeDurabilityProviderConformance(
         ).rejects.toThrow()
 
         await expect(
-          providerB.claimDispatchShard({
+          providerB.claimShard({
             shardId: 0,
             ownerId: "worker-b",
             now: T1,
@@ -602,7 +598,7 @@ export function describeDurabilityProviderConformance(
           payload: { ok: true },
           receivedAt: T0,
         })
-        await providerA.claimDispatchShard({
+        await providerA.claimShard({
           shardId: 0,
           ownerId: "worker-a",
           now: T0,
@@ -623,7 +619,7 @@ export function describeDurabilityProviderConformance(
           }),
         ).resolves.toMatchObject({ ok: false, sequence: 0 })
 
-        await providerB.claimDispatchShard({
+        await providerB.claimShard({
           shardId: 0,
           ownerId: "worker-b",
           now: T1,
@@ -980,6 +976,7 @@ export function describeDurabilityProviderConformance(
       await withStore(factory, async (store) => {
         const provider = await store.createProvider()
         const { ref, activation } = await activeRun(provider, "child-conflicts", {
+          shardLeaseMs: 100,
           activationLeaseMs: 100,
         })
         await expect(
@@ -1564,15 +1561,15 @@ async function ownShard(
   workerId: string,
   now = T0,
   leaseMs = LONG_LEASE_MS,
-): Promise<void> {
-  await expect(
-    provider.claimDispatchShard({
-      shardId: 0,
-      ownerId: workerId,
-      now,
-      leaseMs,
-    }),
-  ).resolves.toMatchObject({ shardId: 0, ownerId: workerId })
+): Promise<ShardDurabilitySession> {
+  const lease = await provider.claimShard({
+    shardId: 0,
+    ownerId: workerId,
+    now,
+    leaseMs,
+  })
+  expect(lease).toMatchObject({ shardId: 0, ownerId: workerId })
+  return provider.openShard(lease!)
 }
 
 async function claim(
@@ -1582,9 +1579,8 @@ async function claim(
   leaseMs = LONG_LEASE_MS,
   workflows: Record<string, { version: number }> = WORKFLOWS,
 ) {
-  const result = await provider.claimReadyActivations({
-    workerId,
-    shardIds: [0],
+  const session = provider.openShard({ shardId: 0, ownerId: workerId })
+  const result = await session.claimTasks({
     workflows,
     now,
     leaseMs,
@@ -1592,7 +1588,7 @@ async function claim(
   })
   const first = result.claims[0]
   return first
-    ? { activation: first.activation, instance: first.instance, effects: first.effects }
+    ? { activation: first.activation, instance: first.instance, effects: first.effects, lease: first.lease }
     : result.nextWakeAt
       ? { activation: null, nextWakeAt: result.nextWakeAt }
       : { activation: null }
@@ -1643,14 +1639,20 @@ async function activeRun(
     shardLeaseMs?: number
     activationLeaseMs?: number
   } = {},
-): Promise<{ ref: InstanceRef; activation: ClaimedActivation }> {
+): Promise<{ ref: InstanceRef; activation: ClaimedActivation; lease: ActivationClaimLease }> {
   const ref = await createConformanceInstance(provider, { workflowId, waits: [runWait()] })
   await ownShard(provider, "worker-a", T0, options.shardLeaseMs ?? LONG_LEASE_MS)
-  const activation = requireActivation(
-    await claim(provider, "worker-a", T0, options.activationLeaseMs ?? LONG_LEASE_MS),
-  )
+  const claimResult = await claim(provider, "worker-a", T0, options.activationLeaseMs ?? LONG_LEASE_MS)
+  const activation = requireActivation(claimResult)
   expect(activation).toMatchObject({ kind: "run", workflowId })
-  return { ref, activation }
+  if (!("lease" in claimResult)) {
+    throw new Error("Expected active run claim to include lease metadata")
+  }
+  const lease = claimResult.lease
+  if (!lease) {
+    throw new Error("Expected active run claim to include lease metadata")
+  }
+  return { ref, activation, lease }
 }
 
 function childCreateInput(
