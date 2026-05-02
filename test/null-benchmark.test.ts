@@ -269,7 +269,7 @@ describe("Null durability benchmark", () => {
       next: { status: "completed", output: { ok: true } },
       waits: [],
       now: T1,
-    })).resolves.toMatchObject({ ok: false, reason: "lost_activation_lease" })
+    })).resolves.toMatchObject({ ok: false, reason: "lost_shard_task_lease" })
     await expect(provider.loadInstance({ workflowId: "stale-epoch", runId: "run-1" }))
       .resolves.toMatchObject({ status: "running", sequence: 0 })
   })

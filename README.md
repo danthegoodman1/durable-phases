@@ -40,13 +40,19 @@ with WAL mode, `synchronous=FULL`, foreign keys, and `busy_timeout`. `:memory:`
 stores remain available for tests and local experiments, but they are not
 crash-durable.
 
-`SqliteShardFileDurabilityProvider` is available when one durable store should
-be split across multiple SQLite files. It maps each dispatch shard to its own
-WAL/FULL database file, so separate Node processes can own disjoint shard ranges
-and write different files concurrently. Default local child workflow IDs are
-chosen to stay on the parent shard; explicit cross-shard local child workflow IDs
-are rejected in this provider until SQLite gets a true cross-shard outbox/inbox
-handoff.
+SQLite now uses the shared shard-owned append engine: the hot path keeps
+workflow projections, task queues, timers, signals, child records, and eager
+effect state in memory after shard recovery. Durable writes append fenced
+mutation batches to `shard_journal`, with periodic `shard_snapshots` for bounded
+startup replay. SQLite is no longer used as the task scheduler; processing SQL
+is append/replay plus shard lease writes, not joins over ready/effect tables.
+
+`SqliteShardFileDurabilityProvider` maps each dispatch shard to its own
+WAL/FULL SQLite append store. It is useful for local scaling experiments where
+separate workers or processes own disjoint shard ranges. Local child workflow
+IDs are shard-affine by default; explicit cross-shard local child IDs are still
+rejected in this provider until a deliberate cross-file outbox/inbox handoff is
+added.
 
 ## Local Postgres
 
@@ -85,18 +91,15 @@ physical table set internally.
 
 ## Benchmarks
 
-The SQLite and Postgres benchmarks run the same real workflows with activities,
-signals, timers, and child completions. These are local sanity numbers, not a
-production guarantee.
+The benchmarks run real workflows with activities, signals, timers, and child
+completions. These are local sanity numbers, not a production guarantee.
 
 ```bash
 npm run benchmark:sqlite -- --workflows 1000 --activation-concurrency 4 --activation-prefetch-limit 32 --json
 npm run benchmark:sqlite -- --shard-files --workflows 1000 --workers 16 --shards 16 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --json
-npm run benchmark:sqlite:processes -- --processes 4 --workflows 4000 --workers-per-process 4 --shards-per-process 4 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --json
 npm run benchmark:sqlite -- --mode signal --profile-queries --json
 npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
-npm run benchmark:postgres:diagnose -- --physical-partitions 4 --workflows 1000 --workers 16 --shards 16 --pool-size 64 --json
 npm run benchmark:null -- --workflows 1000 --mode mixed --json
 npm run benchmark:null -- --workflows 10000 --mode bare --json
 npm run benchmark:null:processes -- --processes 4 --workflows 4000 --mode mixed --json
@@ -113,56 +116,29 @@ exported from the runtime package. It is useful for estimating TypeScript
 runtime headroom without SQLite/Postgres IO, not for durability validation.
 `benchmark:null:processes` launches multiple isolated null-provider subprocesses
 and aggregates throughput to show whether the ceiling scales with Node process
-count. `benchmark:sqlite:processes` launches multiple subprocesses against one
-shared SQLite shard-file directory, with each process assigned a disjoint shard
-range.
+count.
 
-Measured on this workspace with 1,000 workflows and zero artificial activity
-delay. SQLite uses file-backed WAL/FULL durability; Postgres uses
-`synchronous_commit=on`:
+Fresh rows from this pass, measured on this workspace with zero artificial
+activity delay. SQLite uses file-backed WAL/FULL durability:
 
-| Provider | workers/shards | activation concurrency | prefetch / drain batch | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| SQLite WAL/FULL single file | 4/4 | 4 | 32 / 32 | n/a | n/a | 402 | 2,012 | 2,225 | 3,560 |
-| SQLite WAL/FULL single file | 16/16 | 4 | 32 / 32 | n/a | n/a | 731 | 3,653 | 4,418 | 7,069 |
-| SQLite WAL/FULL shard files | 4/4 | 4 | 32 / 32 | n/a | n/a | 407 | 2,035 | 2,312 | 3,698 |
-| SQLite WAL/FULL shard files | 16/16 | 4 | 32 / 32 | n/a | n/a | 800 | 3,998 | 5,746 | 9,193 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 1 | 24 | 143 | 716 | 1,234 | 1,975 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 4 | 24 | 156 | 779 | 1,297 | 2,075 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 1 | 64 | 257 | 1,286 | 3,190 | 5,104 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 4 | 64 | 261 | 1,305 | 3,403 | 5,444 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 1 | 96 | 228 | 1,141 | 2,663 | 4,262 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 4 | 96 | 246 | 1,230 | 2,845 | 4,552 |
+| Provider | workload | workers/shards | activation concurrency | prefetch / drain batch | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Null in-memory | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 14,230 | 16,406 | 26,249 |
+| Null in-memory | bare, 10k workflows | 4/4 | 4 | 32 / 32 | 4,558 | 15,232 | 15,232 |
+| SQLite WAL/FULL single file | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 2,253 | 2,472 | 3,955 |
+| SQLite WAL/FULL single file | mixed, 1k workflows | 16/16 | 4 | 32 / 32 | 5,475 | 7,018 | 11,229 |
+| SQLite WAL/FULL shard files | mixed, 1k workflows | 4/4 | 4 | 32 / 32 | 2,200 | 2,488 | 3,980 |
+| SQLite WAL/FULL shard files | mixed, 1k workflows | 16/16 | 4 | 32 / 32 | 4,329 | 7,122 | 11,395 |
 
-SQLite shard-file subprocess scaling, using one shared shard-file directory and
-4 shards per process:
+SQLite profiling on the 100-workflow mixed workload reported about `1.15`
+processing SQL statements per activation. The processing hot path was journal
+catch-up, journal append, and shard lease updates; it did not use SQL joins or
+ready-table scans.
 
-| Provider | processes | total workers/shards | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| SQLite WAL/FULL shard files | 1 | 4/4 | 1,862 | 2,296 | 3,673 |
-| SQLite WAL/FULL shard files | 2 | 8/8 | 3,713 | 4,736 | 7,577 |
-| SQLite WAL/FULL shard files | 4 | 16/16 | 6,856 | 9,313 | 14,900 |
-
-On this laptop, 8 subprocesses oversubscribed the local CPU/IO path and fell
-back to about 6,785 processing activations/sec, so the useful local scale point
-was 4 subprocesses.
-
-`npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
-sampling of pool pressure, active Postgres wait events, WAL/database deltas,
-Node CPU, and event loop utilization.
-
-Profiling adds overhead, so use the table above for normal throughput
-comparisons and the diagnostic output for query-shape investigation.
-
-The no-delay workload is mostly local DB/CPU-bound. Higher activation
-concurrency can improve throughput when it gives the runtime enough completed
-work to coalesce provider commits, but it eventually runs into the local
-Postgres/container ceiling. It is also useful for workflows with long in-flight
-async activations because one blocked activation no longer occupies the entire
-worker.
-
-The Postgres rows are from local Docker on the same machine, so they include
-client/server and container overhead.
+Postgres remains on the existing shard-session SQL provider path until the next
+gated milestone ports it to the same append-store contract. Use the Postgres
+commands above to measure your local Docker setup, but the table intentionally
+does not claim a Postgres gain from this SQLite/null architecture pass.
 
 ## Provider conformance
 

@@ -1072,16 +1072,18 @@ mode. In-memory SQLite stores may be useful for tests and local experiments, but
 they are not crash-durable.
 
 The default `SqliteDurabilityProvider` stores all dispatch shards in one SQLite
-file. `SqliteShardFileDurabilityProvider` stores each dispatch shard in its own
-SQLite file under one provider directory, so separate workers or Node processes
-can own disjoint shard ranges and write different files concurrently. Both
-SQLite providers use shard-owned live `tasks`, `dispatch_shards.lease_epoch`,
-compact `workflow_history`, and batched task claim/commit transactions; the
-older ready-event/activation-lease tables are compatibility/debug support rather
-than the primary work-discovery path.
+file. Its hot path is shard-owned and append-first: provider startup loads the
+latest shard snapshot, replays `shard_journal`, rebuilds in-memory workflow
+projections, task queues, timers, signals, child records, and eager effect
+state, and then persists execution by appending fenced mutation batches. SQLite
+is not the task scheduler in this mode; processing SQL is journal catch-up,
+journal append, snapshot maintenance, and dispatch-shard lease writes.
 
-Because SQLite shard files do not have cross-file transactions, checkpoint-local
-child starts must remain on the parent shard in `SqliteShardFileDurabilityProvider`.
+`SqliteShardFileDurabilityProvider` may store each dispatch shard in its own
+SQLite append store under one provider directory, so separate workers or Node
+processes can own disjoint shard ranges and write different files concurrently.
+Because SQLite shard files do not have cross-file transactions,
+checkpoint-local child starts must remain on the parent shard in this provider.
 The runtime's default child workflow IDs are deterministic and shard-affine for
 the configured shard count. If a caller supplies an explicit local child
 workflow ID that hashes to a different shard, the shard-file provider rejects the

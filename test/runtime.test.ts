@@ -1631,12 +1631,7 @@ describe("durable workflow PoC", () => {
     ])
     expect("effects" in (await provider.loadInstance(ref))!).toBe(false)
     const effects = (await provider.loadInstance(ref, { includeEffects: true }))?.effects ?? []
-    expect(effects.find((effect) => effect.key === "with_context")).toMatchObject({
-      status: "completed",
-      attempt: 1,
-      heartbeatAt: "2026-01-01T00:00:00.000Z",
-      heartbeatDetails: { step: 1 },
-    })
+    expect(effects.find((effect) => effect.key === "with_context")).toBeUndefined()
     expect(await provider.loadInstance(ref)).toMatchObject({
       status: "completed",
       output: { ok: true, value: "old:new" },
@@ -2556,8 +2551,8 @@ describe("durable workflow PoC", () => {
       attemptOwnerId: undefined,
       attemptStartedAt: undefined,
       heartbeatDeadline: undefined,
-      timeoutKind: undefined,
     })
+    expect(longAfterTimeout?.timeoutKind).toBeUndefined()
     expect(longAfterTimeout?.attemptId).not.toBe(long.attemptId)
 
     await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
@@ -3292,7 +3287,7 @@ describe("durable workflow PoC", () => {
     })
   })
 
-  it("requires a live activation lease to start a child workflow", async () => {
+  it("requires live shard ownership to start an eager child workflow", async () => {
     const provider = testProvider(await storePath())
     const parentRef = await provider.createInstance({
       workflowName: "child_start_fence_parent",
@@ -3321,6 +3316,7 @@ describe("durable workflow PoC", () => {
       })
     ).activation
     expect(activation).toMatchObject({ kind: "run" })
+    await provider.releaseDispatchShard({ shardId: 0, ownerId: "worker-a" })
 
     await expect(
       provider.createChildInstance({
@@ -3340,7 +3336,7 @@ describe("durable workflow PoC", () => {
         leaseNow: "2026-01-01T00:00:00.002Z",
         key: "child",
       }),
-    ).rejects.toThrow("Lost activation lease")
+    ).rejects.toThrow("Lost shard lease")
   })
 
   it("reclaims an expired activation lease and reuses completed effects", async () => {
