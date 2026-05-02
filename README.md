@@ -82,11 +82,21 @@ npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-s
 npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 16 --activation-prefetch-limit 64 --batch 64 --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
 npm run benchmark:postgres:diagnose -- --physical-partitions 4 --workflows 1000 --workers 16 --shards 16 --pool-size 64 --json
+npm run benchmark:null -- --workflows 1000 --mode mixed --json
+npm run benchmark:null -- --workflows 10000 --mode bare --json
+npm run benchmark:null:processes -- --processes 4 --workflows 4000 --mode mixed --json
 ```
 
 The benchmark reports setup, processing, and verification time separately.
 Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
+
+`benchmark:null` uses a benchmark-only in-memory shard provider that is not
+exported from the runtime package. It is useful for estimating TypeScript
+runtime headroom without SQLite/Postgres IO, not for durability validation.
+`benchmark:null:processes` launches multiple isolated null-provider subprocesses
+and aggregates throughput to show whether the ceiling scales with Node process
+count.
 
 Measured on this workspace with 1,000 workflows and zero artificial activity
 delay. SQLite uses file-backed WAL/FULL durability; Postgres uses

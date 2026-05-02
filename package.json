@@ -23,6 +23,8 @@
     "test": "vitest run",
     "test:soak": "DURABLE_SOAK=1 vitest run",
     "benchmark": "tsx src/benchmarks/sqlite.ts",
+    "benchmark:null": "tsx src/benchmarks/null.ts",
+    "benchmark:null:processes": "tsx src/benchmarks/null-processes.ts",
     "benchmark:sqlite": "tsx src/benchmarks/sqlite.ts",
     "benchmark:postgres": "tsx src/benchmarks/postgres.ts",
     "benchmark:postgres:diagnose": "tsx src/benchmarks/postgres.ts --diagnose",
