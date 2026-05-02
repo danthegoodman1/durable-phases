@@ -2889,7 +2889,7 @@ describe("durable workflow PoC", () => {
     ).resolves.toMatchObject({ shardId: shard, ownerId: "worker-b" })
   })
 
-  it("does not let a new shard owner steal an unexpired activation lease", async () => {
+  it("lets a new shard owner reclaim shard-scoped work after shard lease expiry", async () => {
     const path = await storePath()
     const providerA = testProvider(path)
     const providerB = testProvider(path)
@@ -2943,22 +2943,26 @@ describe("durable workflow PoC", () => {
         now: "2026-01-01T00:00:00.011Z",
         leaseMs: 1_000,
       }),
-    ).resolves.toMatchObject({ activation: null })
-
-    await expect(
-      providerB.claimReadyActivation({
-        workerId: "worker-b",
-        shardIds: [0],
-        workflows: { activation_owner: { version: 1 } },
-        now: "2026-01-01T00:00:01.001Z",
-        leaseMs: 1_000,
-      }),
     ).resolves.toMatchObject({
       activation: {
         kind: "run",
         activationId: activationA!.activationId,
       },
     })
+
+    await expect(
+      providerA.commitCheckpoint({
+        workflowId: "activation-owner",
+        runId: "run-1",
+        expectedSequence: 0,
+        activationId: activationA!.activationId,
+        workerId: "worker-a",
+        workflowVersion: 1,
+        next: { status: "completed", output: { ok: true } },
+        waits: [],
+        now: "2026-01-01T00:00:01.001Z",
+      }),
+    ).resolves.toMatchObject({ ok: false, reason: "lost_shard_task_lease" })
   })
 
   it("does not claim competing ready events for the same workflow sequence", async () => {
@@ -4022,13 +4026,13 @@ describe("durable workflow PoC", () => {
     clock.advance(8)
     await new Promise((resolve) => setTimeout(resolve, 5))
     await expect(
-      provider.heartbeatActivations({
-        activationIds: ownedClaims.map((claim) => claim.activationId),
-        workerId: "prefetch-worker",
+      provider.claimDispatchShard({
+        shardId: 0,
+        ownerId: "prefetch-competitor",
         now: clock.clock().toISOString(),
         leaseMs: 10,
       }),
-    ).resolves.toBeUndefined()
+    ).resolves.toBeNull()
 
     releaseFirst.resolve()
     await expect(draining).resolves.toEqual({ activations: 3 })
@@ -4544,17 +4548,6 @@ describe("durable workflow PoC", () => {
     clock.advance(8)
     await new Promise((resolve) => setTimeout(resolve, 10))
 
-    for (const claim of claims) {
-      await expect(
-        provider.heartbeatActivation({
-          activationId: claim.activationId,
-          workerId: "multi-lease-worker",
-          now: clock.clock().toISOString(),
-          leaseMs: 10,
-        }),
-      ).resolves.toBeUndefined()
-    }
-
     const competingProvider = testProvider(path)
     await expect(
       competingProvider.claimDispatchShard({
@@ -4904,7 +4897,7 @@ describe("durable workflow PoC", () => {
       shardId: 0,
       ownerId: "worker-v1",
       now: "2026-01-01T00:00:00.000Z",
-      leaseMs: 1,
+      leaseMs: 60_000,
     })
     const oldActivation = (
       await provider.claimReadyActivation({
@@ -4917,15 +4910,9 @@ describe("durable workflow PoC", () => {
     ).activation
     expect(oldActivation).toMatchObject({ kind: "run" })
 
-    await provider.claimDispatchShard({
-      shardId: 0,
-      ownerId: "worker-v2",
-      now: "2026-01-01T00:00:00.002Z",
-      leaseMs: 60_000,
-    })
     await expect(
       provider.claimReadyActivation({
-        workerId: "worker-v2",
+        workerId: "worker-v1",
         shardIds: [0],
         workflows: { migration_pin: { version: 2 } },
         now: "2026-01-01T00:00:00.002Z",
@@ -4950,7 +4937,7 @@ describe("durable workflow PoC", () => {
 
     await expect(
       provider.claimReadyActivation({
-        workerId: "worker-v2",
+        workerId: "worker-v1",
         shardIds: [0],
         workflows: { migration_pin: { version: 2 } },
         now: "2026-01-01T00:00:00.002Z",

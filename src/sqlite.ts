@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { mkdirSync } from "node:fs"
 import { createRequire } from "node:module"
 import { dirname } from "node:path"
+import { performance } from "node:perf_hooks"
 import type {
   ActivationInstanceSnapshot,
   AppendSignalInput,
@@ -88,10 +89,16 @@ const Database = require("better-sqlite3") as SqliteConstructor
 
 export type SqliteDurabilityProviderOptions = DurableObservability & {
   busyTimeoutMs?: number
+  sqlProfiler?: (event: {
+    sql: string
+    method: "run" | "get" | "all"
+    durationMs: number
+  }) => void
 }
 
 type ReadyCandidate = {
   kind: "migration" | "run" | "event"
+  taskId?: string
   activationId: string
   workflowName: string
   workflowId: string
@@ -105,6 +112,7 @@ type ReadyCandidate = {
   eventKind?: ReadyEvent["kind"]
   waitJson?: string | null
   eventJson?: string | null
+  hasEffects?: boolean
 }
 
 type BufferedObservation =
@@ -224,14 +232,26 @@ type ActivationClaimRow = {
   completed_by_sequence: number | null
 }
 
+type WorkflowHistoryRow = {
+  history_id: string
+  workflow_id: string
+  run_id: string
+  sequence: number
+  activation_id: string | null
+  kind: string
+  event_json: string | null
+  created_at: string
+}
+
 type DispatchShardRow = {
   shard_id: number
   owner_id: string | null
   lease_until: string | null
+  lease_epoch: number | null
 }
 
-type ReadyEventRow = {
-  ready_event_id: string
+type TaskRow = {
+  task_id: string
   workflow_id: string
   run_id: string
   workflow_name: string
@@ -245,15 +265,12 @@ type ReadyEventRow = {
   sort_key: string
   wait_json: string | null
   event_json: string | null
-}
-
-type ReadyEventJoinedRow = ReadyEventRow & {
-  instance_workflow_name: string
-  instance_workflow_version: number
-  instance_workflow_id: string
-  instance_run_id: string
-  instance_partition_shard: number
-  instance_sequence: number
+  claim_owner_id: string | null
+  claim_epoch: number | null
+  claimed_at: string | null
+  claim_lease_until: string | null
+  blocked_until: string | null
+  has_effects: number | boolean
   instance_status: "running" | "completed" | "canceled" | "failed"
   instance_common_json: string | null
   instance_phase_name: string | null
@@ -279,12 +296,23 @@ type ReadyEventInstanceState = {
   status: InstanceRow["status"]
   waits: DurableWait[]
   updatedAt: string
+  commonJson: string | null
+  phaseName: string | null
+  phaseDataJson: string | null
+  outputJson: string | null
+  errorJson: string | null
+  cancelReason: string | null
+  parentWorkflowId: string | null
+  parentRunId: string | null
+  parentChildRecordId: string | null
+  createdAt: string
 }
 
 export class SqliteDurabilityProvider implements DurabilityProvider {
   private readonly db: SqliteDatabase
   private readonly busyTimeoutMs: number
   private readonly observability: DurableObservability
+  private readonly sqlProfiler?: SqliteDurabilityProviderOptions["sqlProfiler"]
   private readonly statements = new Map<string, SqliteStatement>()
   private observabilityBuffer?: BufferedObservation[]
   private closed = false
@@ -296,6 +324,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     rejectSqliteSynchronousOption(options)
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000
     this.observability = { logger: options.logger, metrics: options.metrics }
+    this.sqlProfiler = options.sqlProfiler
     if (filePath !== ":memory:") {
       mkdirSync(dirname(filePath), { recursive: true })
     }
@@ -366,7 +395,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.now,
         )
 
-      this.replaceReadyEventsForState({
+      this.replaceTasksForState({
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
         workflowId: input.workflowId,
@@ -376,6 +405,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         status: "running",
         waits: input.waits,
         updatedAt: input.now,
+        commonJson: encodeJson(input.common),
+        phaseName: input.phase.name,
+        phaseDataJson: encodeJson(input.phase.data),
+        outputJson: null,
+        errorJson: null,
+        cancelReason: null,
+        parentWorkflowId: input.parent?.workflowId ?? null,
+        parentRunId: input.parent?.runId ?? null,
+        parentChildRecordId: input.parent?.childRecordId ?? null,
+        createdAt: input.now,
       })
 
       const ref = { workflowId: input.workflowId, runId: input.runId }
@@ -539,7 +578,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           parentClosePolicy,
         )
 
-      this.replaceReadyEventsForState({
+      this.replaceTasksForState({
         workflowName: input.workflowName,
         workflowVersion: input.workflowVersion,
         workflowId: input.workflowId,
@@ -549,6 +588,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         status: "running",
         waits: input.waits,
         updatedAt: input.now,
+        commonJson: encodeJson(input.common),
+        phaseName: input.phase.name,
+        phaseDataJson: encodeJson(input.phase.data),
+        outputJson: null,
+        errorJson: null,
+        cancelReason: null,
+        parentWorkflowId: input.parentWorkflowId,
+        parentRunId: input.parentRunId,
+        parentChildRecordId: childRecordId,
+        createdAt: input.now,
       })
 
       this.log("info", "provider.child.create", {
@@ -609,6 +658,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       this.cancelStartedChild(childRecord, input.now, {
         deliverToParent: true,
+        refreshParent: false,
         reason: childCanceledError(),
       })
       this.log("info", "provider.child.cancel", {
@@ -665,7 +715,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       completedBySequence?: number
     }>
   > {
-    return this.prepare("SELECT * FROM activation_claims ORDER BY workflow_id, run_id, sequence, activation_id")
+    const claims: Array<{
+      activationId: string
+      workflowId: string
+      runId: string
+      sequence: number
+      kind: ActivationClaimRow["kind"]
+      ownerId?: string
+      completedBySequence?: number
+    }> = this.prepare("SELECT * FROM activation_claims ORDER BY workflow_id, run_id, sequence, activation_id")
       .all()
       .map((row) => {
         const claim = requireRow<ActivationClaimRow>(row)
@@ -679,6 +737,54 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           completedBySequence: claim.completed_by_sequence ?? undefined,
         }
       })
+    const byActivationId = new Map(claims.map((claim) => [claim.activationId, claim]))
+    for (const row of this.prepare("SELECT * FROM tasks ORDER BY workflow_id, run_id, sequence, activation_id").all()) {
+      const task = requireRow<TaskRow>(row)
+      const activationId = task.activation_id ?? task.task_id
+      if (byActivationId.has(activationId)) {
+        continue
+      }
+      byActivationId.set(activationId, {
+        activationId,
+        workflowId: task.workflow_id,
+        runId: task.run_id,
+        sequence: task.sequence,
+        kind: activationClaimKindForTask(task),
+        ownerId: task.claim_owner_id ?? undefined,
+      })
+    }
+    for (const row of this.prepare(
+        `
+        SELECT * FROM workflow_history
+        WHERE activation_id IS NOT NULL AND kind = 'checkpoint'
+        ORDER BY workflow_id, run_id, sequence, activation_id
+      `,
+      )
+      .all()) {
+      const history = requireRow<WorkflowHistoryRow>(row)
+      if (byActivationId.has(history.activation_id ?? "")) {
+        continue
+      }
+      const event = decodeJson<{
+        workerId?: string
+        activationKind?: ActivationClaimRow["kind"]
+        expectedSequence?: number
+      }>(history.event_json, {})
+      byActivationId.set(history.activation_id ?? "", {
+        activationId: history.activation_id ?? "",
+        workflowId: history.workflow_id,
+        runId: history.run_id,
+        sequence: event.expectedSequence ?? Math.max(0, history.sequence - 1),
+        kind: event.activationKind ?? "run",
+        ownerId: event.workerId,
+        completedBySequence: history.sequence,
+      })
+    }
+    return [...byActivationId.values()].sort((left, right) =>
+      `${left.workflowId}\0${left.runId}\0${left.sequence}\0${left.activationId}`.localeCompare(
+        `${right.workflowId}\0${right.runId}\0${right.sequence}\0${right.activationId}`,
+      ),
+    )
   }
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
@@ -712,7 +818,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           signal.receivedAt,
         )
 
-      this.replaceSignalReadyEventsForState(readyEventStateFromInstanceRow(instance))
+      this.replaceSignalTasksForState(readyEventStateFromInstanceRow(instance))
 
       this.log("info", "provider.signal.append", {
         workflowId: input.workflowId,
@@ -733,18 +839,25 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       const result = this.prepare(
           `
-          INSERT INTO dispatch_shards (shard_id, owner_id, lease_until)
-          VALUES (?, ?, ?)
+          INSERT INTO dispatch_shards (shard_id, owner_id, lease_until, lease_epoch)
+          VALUES (?, ?, ?, 1)
           ON CONFLICT(shard_id) DO UPDATE SET
             owner_id = excluded.owner_id,
-            lease_until = excluded.lease_until
+            lease_until = excluded.lease_until,
+            lease_epoch = CASE
+              WHEN dispatch_shards.owner_id = excluded.owner_id
+                AND dispatch_shards.lease_until IS NOT NULL
+                AND dispatch_shards.lease_until > ?
+              THEN dispatch_shards.lease_epoch
+              ELSE dispatch_shards.lease_epoch + 1
+            END
           WHERE dispatch_shards.owner_id IS NULL
             OR dispatch_shards.owner_id = excluded.owner_id
             OR dispatch_shards.lease_until IS NULL
             OR dispatch_shards.lease_until <= ?
         `,
         )
-        .run(input.shardId, input.ownerId, leaseUntil, input.now)
+        .run(input.shardId, input.ownerId, leaseUntil, input.now, input.now)
 
       if (result.changes === 0) {
         this.log("debug", "provider.shard.claim_miss", {
@@ -769,7 +882,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         shardId: input.shardId,
         status: "success",
       })
-      return { shardId: input.shardId, ownerId: input.ownerId, leaseUntil }
+      const shard = oneRow<DispatchShardRow>(
+        this.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(input.shardId),
+      )
+      const leaseEpoch = shard?.lease_epoch ?? 1
+      this.prepare(
+          `
+          UPDATE tasks
+          SET claim_owner_id = NULL, claim_epoch = NULL, claimed_at = NULL, claim_lease_until = NULL
+          WHERE partition_shard = ? AND claim_epoch IS NOT NULL AND claim_epoch <> ?
+        `,
+        )
+        .run(input.shardId, leaseEpoch)
+      return { shardId: input.shardId, ownerId: input.ownerId, leaseUntil, leaseEpoch }
     })
 
     return this.withBufferedObservability(() => claim.immediate() as DispatchShardLease | null)
@@ -830,12 +955,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   async claimReadyActivations(input: ClaimReadyActivationsInput): Promise<ClaimReadyActivationsResult> {
     const limit = positiveInteger(input.limit, "claimReadyActivations limit")
     const claim = this.db.transaction(() => {
-      const ownedShards = input.shardIds.filter((shardId) => {
+      const ownedShardRows = input.shardIds.flatMap((shardId) => {
         const shard = oneRow<DispatchShardRow>(
           this.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(shardId),
         )
         return shard?.owner_id === input.workerId && (shard.lease_until ?? "") >= input.now
+          ? [shard]
+          : []
       })
+      const ownedShards = ownedShardRows.map((shard) => shard.shard_id)
+      const shardEpochs = new Map(ownedShardRows.map((shard) => [shard.shard_id, shard.lease_epoch ?? 0]))
 
       if (ownedShards.length === 0) {
         this.log("debug", "provider.activation.claim_miss", {
@@ -862,14 +991,93 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const claims: ClaimedActivationWithInstance[] = []
       const claimedSequences = new Set<string>()
 
+      const taskCandidates = candidates.filter((candidate) => candidate.taskId)
+      if (taskCandidates.length > 0) {
+        const selected: ReadyCandidate[] = []
+        for (const candidate of taskCandidates) {
+          if (selected.length >= limit) {
+            break
+          }
+          const sequenceKey = `${candidate.workflowId}\0${candidate.runId}\0${candidate.sequence}`
+          if (claimedSequences.has(sequenceKey)) {
+            continue
+          }
+          if (this.hasClaimedTaskForSequence(candidate)) {
+            continue
+          }
+          if (candidate.instance.status !== "running" || candidate.instance.sequence !== candidate.sequence) {
+            continue
+          }
+          claimedSequences.add(sequenceKey)
+          selected.push(candidate)
+        }
+        const leaseUntil = addMs(input.now, input.leaseMs)
+        const groups = new Map<number, ReadyCandidate[]>()
+        for (const candidate of selected) {
+          const shardEpoch = shardEpochs.get(candidate.instance.partition_shard) ?? 0
+          const group = groups.get(shardEpoch) ?? []
+          group.push(candidate)
+          groups.set(shardEpoch, group)
+        }
+        const claimedTaskIds = new Set<string>()
+        for (const [shardEpoch, group] of groups) {
+          for (const taskId of this.claimTaskBatch(
+            group.map((candidate) => candidate.taskId).filter((taskId): taskId is string => Boolean(taskId)),
+            input.workerId,
+            shardEpoch,
+            input.now,
+            leaseUntil,
+          )) {
+            claimedTaskIds.add(taskId)
+          }
+        }
+        for (const candidate of selected) {
+          if (!candidate.taskId || !claimedTaskIds.has(candidate.taskId)) {
+            continue
+          }
+          candidate.leaseUntil = leaseUntil
+          if (candidate.hasEffects) {
+            this.writeShardActivationClaim(candidate, input.workerId, input.now, input.leaseMs)
+          } else {
+            this.log("debug", "provider.activation.claim", {
+              workerId: input.workerId,
+              workflowName: candidate.workflowName,
+              workflowId: candidate.workflowId,
+              runId: candidate.runId,
+              activationId: candidate.activationId,
+              activationKind: candidate.kind,
+              eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+              leaseUntil,
+            })
+            this.count("durable.provider.activation.claim", {
+              workerId: input.workerId,
+              workflowName: candidate.workflowName,
+              activationKind: candidate.kind,
+              eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+              status: "success",
+            })
+          }
+          const shardId = candidate.instance.partition_shard
+          const shardEpoch = shardEpochs.get(shardId) ?? 0
+          claims.push({
+            activation: stripCandidateMetadata(candidate),
+            instance: this.activationInstanceSnapshot(candidate.instance),
+            effects: candidate.hasEffects ? this.effectsForActivation(candidate.activationId) : [],
+            lease: { scope: "shard", shardId, epoch: shardEpoch },
+          })
+        }
+      }
+
       for (const candidate of candidates) {
-        if (claims.length >= limit) {
-          break
+        if (claims.length >= limit || candidate.taskId) {
+          continue
         }
         const sequenceKey = `${candidate.workflowId}\0${candidate.runId}\0${candidate.sequence}`
         if (claimedSequences.has(sequenceKey)) {
           continue
         }
+        const shardId = candidate.instance.partition_shard
+        const shardEpoch = shardEpochs.get(shardId) ?? 0
         if (!this.tryWriteActivationClaim(candidate, input.workerId, input.now, input.leaseMs)) {
           continue
         }
@@ -880,8 +1088,10 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         claims.push({
           activation: stripCandidateMetadata(candidate),
           instance: this.activationInstanceSnapshot(candidate.instance),
-          effects: this.effectsForActivation(candidate.activationId),
-          lease: { scope: "activation" },
+          effects: candidate.hasEffects ? this.effectsForActivation(candidate.activationId) : [],
+          lease: candidate.taskId
+            ? { scope: "shard", shardId, epoch: shardEpoch }
+            : { scope: "activation" },
         })
       }
 
@@ -937,21 +1147,38 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return
     }
     const heartbeat = this.db.transaction(() => {
+      let heartbeated = 0
       for (const activationId of activationIds) {
         this.expireActivityTimeouts(input.now, { activationId })
+        const result = this.prepare(
+            `
+            UPDATE activation_claims
+            SET lease_until = ?
+            WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+              AND lease_until >= ?
+          `,
+          )
+          .run(addMs(input.now, input.leaseMs), activationId, input.workerId, input.now)
+        if (result.changes > 0) {
+          heartbeated += 1
+          continue
+        }
+        if (this.liveTaskActivationClaimByActivationId(activationId, input.workerId, input.now)) {
+          this.prepare(
+              `
+              UPDATE tasks
+              SET claim_lease_until = ?
+              WHERE activation_id = ? AND claim_owner_id = ?
+            `,
+            )
+            .run(addMs(input.now, input.leaseMs), activationId, input.workerId)
+          heartbeated += 1
+        }
       }
-      return this.prepare(
-          `
-          UPDATE activation_claims
-          SET lease_until = ?
-          WHERE activation_id IN (${activationIds.map(() => "?").join(", ")}) AND owner_id = ? AND completed_by_sequence IS NULL
-            AND lease_until >= ?
-        `,
-        )
-        .run(addMs(input.now, input.leaseMs), ...activationIds, input.workerId, input.now)
+      return heartbeated
     })
-    const result = this.withBufferedObservability(() => heartbeat.immediate() as SqliteRunResult)
-    if (result.changes !== activationIds.length) {
+    const heartbeated = this.withBufferedObservability(() => heartbeat.immediate() as number)
+    if (heartbeated !== activationIds.length) {
       this.log("warn", "provider.activation.heartbeat_failed", {
         workerId: input.workerId,
         activationIds,
@@ -994,6 +1221,14 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       `,
       )
       .run(...activationIds, input.workerId)
+    this.prepare(
+        `
+        UPDATE tasks
+        SET claim_owner_id = NULL, claim_epoch = NULL, claimed_at = NULL, claim_lease_until = NULL
+        WHERE activation_id IN (${activationIds.map(() => "?").join(", ")}) AND claim_owner_id = ?
+      `,
+      )
+      .run(...activationIds, input.workerId)
     this.log("debug", "provider.activation.release", {
       workerId: input.workerId,
       activationIds,
@@ -1015,6 +1250,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const reserve = this.db.transaction(() => {
       this.expireActivityTimeouts(input.now, { activationId: input.activationId })
       this.assertLiveActivationLease(input)
+      this.ensureActivationClaimForEffectMutation(input)
       const options = normalizeEffectOptions(input)
 
       const existing = oneRow<EffectRow>(
@@ -1062,6 +1298,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
       if (existing) {
         const started = this.ensureEffectAttemptStarted(existing, input)
+        this.markTaskEffects(input.activationId, effectBlockUntil(started))
         this.log("debug", "provider.effect.reserve", {
           workerId: input.workerId,
           workflowId: input.workflowId,
@@ -1123,6 +1360,13 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.now,
           encodeJson(options.nonRetryableErrorNames),
         )
+      this.markTaskEffects(
+        input.activationId,
+        earliestIso(
+          deadlineFrom(input.now, options.startToCloseTimeoutMs) ?? undefined,
+          deadlineFrom(input.now, options.heartbeatTimeoutMs) ?? undefined,
+        ) ?? null,
+      )
 
       this.log("debug", "provider.effect.reserve", {
         workerId: input.workerId,
@@ -1155,7 +1399,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       const heartbeatDeadline = effect?.heartbeat_timeout_ms
         ? addMs(input.now, effect.heartbeat_timeout_ms)
         : null
-      return this.prepare(
+      const result = this.prepare(
           `
           UPDATE effects
           SET heartbeat_at = ?, heartbeat_details_json = ?, heartbeat_deadline = ?
@@ -1173,11 +1417,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           input.effectId,
           input.attemptId,
         )
+      return { result, heartbeatDeadline }
     })
-    const result = this.withBufferedObservability(() => heartbeat.immediate() as SqliteRunResult)
-    if (result.changes === 0) {
+    const output = this.withBufferedObservability(
+      () => heartbeat.immediate() as { result: SqliteRunResult; heartbeatDeadline: string | null },
+    )
+    if (output.result.changes === 0) {
       this.throwEffectMutationError(input)
     }
+    this.markTaskEffects(input.activationId, output.heartbeatDeadline)
     this.log("debug", "provider.effect.heartbeat", {
       workerId: input.workerId,
       workflowId: input.workflowId,
@@ -1215,6 +1463,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (result.changes === 0) {
       this.throwEffectMutationError(input)
     }
+    this.markTaskEffects(input.activationId, null)
     this.log("debug", "provider.effect.complete", {
       workerId: input.workerId,
       workflowId: input.workflowId,
@@ -1268,6 +1517,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           workerId: input.workerId,
           status: "retry_scheduled",
         })
+        this.markTaskEffects(input.activationId, retry.nextAttemptAt)
         return { result: retry, changes: result.changes }
       }
 
@@ -1299,6 +1549,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         error: input.error,
       })
       this.count("durable.provider.effect", { workerId: input.workerId, status: "failed" })
+      this.markTaskEffects(input.activationId, null)
       return { result: { status: "failed" } satisfies FailEffectResult, changes: result.changes }
     })
 
@@ -1331,7 +1582,6 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   private commitCheckpointInTransaction(input: CommitCheckpointInput): CommitCheckpointResult {
-    this.expireActivityTimeouts(input.now, { activationId: input.activationId })
     const conflict = (
       reason: string,
       sequence: number,
@@ -1369,24 +1619,58 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       return conflict("stale_sequence", instance.sequence)
     }
 
-    const claim = oneRow<ActivationClaimRow>(
-      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+    const task = oneRow<TaskRow>(
+      this.prepare(
+          `
+          SELECT * FROM tasks
+          WHERE activation_id = ? AND workflow_id = ? AND run_id = ? AND sequence = ?
+            AND claim_owner_id IS NOT NULL
+          ORDER BY sort_key
+          LIMIT 1
+        `,
+        )
+        .get(input.activationId, input.workflowId, input.runId, input.expectedSequence),
     )
-
-    if (
-      !claim ||
-      claim.workflow_id !== input.workflowId ||
-      claim.run_id !== input.runId ||
-      claim.sequence !== input.expectedSequence ||
-      claim.owner_id !== input.workerId ||
-      !claim.lease_until ||
-      claim.lease_until < input.now ||
-      claim.completed_by_sequence !== null
-    ) {
-      return conflict("lost_activation_lease", instance.sequence)
+    if (task && task.has_effects) {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
     }
 
-    if (!claimMatchesCommit(claim, input)) {
+    if (task) {
+      const shard = oneRow<DispatchShardRow>(
+        this.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(task.partition_shard),
+      )
+      if (
+        task.claim_owner_id !== input.workerId ||
+        task.claim_epoch === null ||
+        shard?.owner_id !== input.workerId ||
+        (shard.lease_until ?? "") < input.now ||
+        (shard.lease_epoch ?? 0) !== task.claim_epoch
+      ) {
+        return conflict("lost_shard_task_lease", instance.sequence)
+      }
+    } else {
+      this.expireActivityTimeouts(input.now, { activationId: input.activationId })
+      const claim = oneRow<ActivationClaimRow>(
+        this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+      )
+      if (
+        !claim ||
+        claim.workflow_id !== input.workflowId ||
+        claim.run_id !== input.runId ||
+        claim.sequence !== input.expectedSequence ||
+        claim.owner_id !== input.workerId ||
+        !claim.lease_until ||
+        claim.lease_until < input.now ||
+        claim.completed_by_sequence !== null
+      ) {
+        return conflict("lost_activation_lease", instance.sequence)
+      }
+      if (!claimMatchesCommit(claim, input)) {
+        return conflict("activation_event_mismatch", instance.sequence)
+      }
+    }
+
+    if (task && !taskMatchesCommit(task, input)) {
       return conflict("activation_event_mismatch", instance.sequence)
     }
 
@@ -1450,26 +1734,34 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
     this.updateParentChildRecord(instance, input, nextSequence)
     this.applyParentClosePolicy(instance, input, nextSequence)
-    this.replaceReadyEventsForState({
-      workflowName: instance.workflow_name,
-      workflowVersion: input.workflowVersion,
-      workflowId: input.workflowId,
-      runId: input.runId,
-      partitionShard: instance.partition_shard,
-      sequence: nextSequence,
-      status: input.next.status,
-      waits: input.waits,
-      updatedAt: input.now,
-    })
+    this.replaceTasksForState(taskStateFromCommit(instance, input, nextSequence))
+    this.appendWorkflowHistory(
+      input,
+      nextSequence,
+      "checkpoint",
+      task ? activationClaimKindForTask(task) : activationClaimKindForCommitInput(input),
+    )
 
-    this.prepare(
-        `
-        UPDATE activation_claims
-        SET completed_by_sequence = ?, completed_at = ?, lease_until = ?, owner_id = ?
-        WHERE activation_id = ?
-      `,
-      )
-      .run(nextSequence, input.now, input.now, input.workerId, input.activationId)
+    if (!task || task.has_effects) {
+      this.prepare(
+          `
+          UPDATE activation_claims
+          SET completed_by_sequence = ?, completed_at = ?, lease_until = ?, owner_id = ?
+          WHERE activation_id = ?
+        `,
+        )
+        .run(nextSequence, input.now, input.now, input.workerId, input.activationId)
+    }
+    if (task) {
+      this.prepare("DELETE FROM tasks WHERE task_id = ?").run(task.task_id)
+      const completedCheckpointEffectKeys = (input.effects ?? [])
+        .filter((effect) => effect.status === "completed")
+        .map((effect) => effect.key)
+      for (const key of completedCheckpointEffectKeys) {
+        this.prepare("DELETE FROM effects WHERE activation_id = ? AND key = ? AND status = 'completed'")
+          .run(input.activationId, key)
+      }
+    }
 
     this.log("info", "provider.checkpoint.commit", {
       workflowName: instance.workflow_name,
@@ -1503,12 +1795,22 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           now: input.now,
           effects: input.effects,
         })
+        this.markTaskEffects(input.activationId, latestRetryBlockedUntil(input.effects))
+        this.appendActivationFailureHistory(input)
         if (input.releaseActivation) {
           this.prepare(
               `
               UPDATE activation_claims
               SET owner_id = NULL, lease_until = NULL
               WHERE activation_id = ? AND owner_id = ? AND completed_by_sequence IS NULL
+            `,
+            )
+            .run(input.activationId, input.workerId)
+          this.prepare(
+              `
+              UPDATE tasks
+              SET claim_owner_id = NULL, claim_epoch = NULL, claimed_at = NULL, claim_lease_until = NULL
+              WHERE activation_id = ? AND claim_owner_id = ?
             `,
             )
             .run(input.activationId, input.workerId)
@@ -1530,9 +1832,32 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     if (existing) {
       return existing
     }
-    const statement = this.db.prepare(sql)
+    const raw = this.db.prepare(sql)
+    const statement = this.sqlProfiler
+      ? this.profiledStatement(sql, raw)
+      : raw
     this.statements.set(sql, statement)
     return statement
+  }
+
+  private profiledStatement(sql: string, statement: SqliteStatement): SqliteStatement {
+    const profile = <T>(method: "run" | "get" | "all", fn: () => T): T => {
+      const startedAt = performance.now()
+      try {
+        return fn()
+      } finally {
+        this.sqlProfiler?.({
+          sql,
+          method,
+          durationMs: performance.now() - startedAt,
+        })
+      }
+    }
+    return {
+      run: (...params) => profile("run", () => statement.run(...params)),
+      get: (...params) => profile("get", () => statement.get(...params)),
+      all: (...params) => profile("all", () => statement.all(...params)),
+    }
   }
 
   private migrate(): void {
@@ -1645,11 +1970,24 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       CREATE TABLE IF NOT EXISTS dispatch_shards (
         shard_id INTEGER PRIMARY KEY,
         owner_id TEXT,
-        lease_until TEXT
+        lease_until TEXT,
+        lease_epoch INTEGER NOT NULL DEFAULT 0
       );
 
-      CREATE TABLE IF NOT EXISTS ready_events (
-        ready_event_id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS workflow_history (
+        history_id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        activation_id TEXT,
+        kind TEXT NOT NULL,
+        event_json TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (workflow_id, run_id) REFERENCES instances(workflow_id, run_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        task_id TEXT PRIMARY KEY,
         workflow_id TEXT NOT NULL,
         run_id TEXT NOT NULL,
         workflow_name TEXT NOT NULL,
@@ -1663,6 +2001,25 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         sort_key TEXT NOT NULL,
         wait_json TEXT,
         event_json TEXT,
+        claim_owner_id TEXT,
+        claim_epoch INTEGER,
+        claimed_at TEXT,
+        claim_lease_until TEXT,
+        blocked_until TEXT,
+        has_effects INTEGER NOT NULL DEFAULT 0,
+        instance_status TEXT NOT NULL,
+        instance_common_json TEXT,
+        instance_phase_name TEXT,
+        instance_phase_data_json TEXT,
+        instance_output_json TEXT,
+        instance_error_json TEXT,
+        instance_cancel_reason TEXT,
+        instance_waits_json TEXT NOT NULL,
+        instance_parent_workflow_id TEXT,
+        instance_parent_run_id TEXT,
+        instance_parent_child_record_id TEXT,
+        instance_created_at TEXT NOT NULL,
+        instance_updated_at TEXT NOT NULL,
         FOREIGN KEY (workflow_id, run_id) REFERENCES instances(workflow_id, run_id) ON DELETE CASCADE
       );
 
@@ -1688,12 +2045,22 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         ON activation_claims(owner_id, lease_until, completed_by_sequence);
       CREATE INDEX IF NOT EXISTS activation_claims_instance_sequence
         ON activation_claims(workflow_id, run_id, sequence, completed_by_sequence, activation_id);
-      CREATE INDEX IF NOT EXISTS ready_events_claim
-        ON ready_events(partition_shard, ready_at, sort_key);
-      CREATE INDEX IF NOT EXISTS ready_events_instance
-        ON ready_events(workflow_id, run_id, sequence);
+      CREATE INDEX IF NOT EXISTS tasks_claim
+        ON tasks(partition_shard, ready_at, sort_key);
+      CREATE INDEX IF NOT EXISTS tasks_claim_sort
+        ON tasks(partition_shard, sort_key);
+      CREATE INDEX IF NOT EXISTS tasks_claim_owner
+        ON tasks(claim_owner_id, claim_epoch);
+      CREATE INDEX IF NOT EXISTS tasks_instance
+        ON tasks(workflow_id, run_id, sequence);
+      CREATE INDEX IF NOT EXISTS tasks_claimed_activation
+        ON tasks(activation_id, workflow_id, run_id, sequence, sort_key)
+        WHERE claim_owner_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS tasks_blocked
+        ON tasks(partition_shard, blocked_until);
+      CREATE INDEX IF NOT EXISTS workflow_history_instance
+        ON workflow_history(workflow_id, run_id, sequence);
     `)
-    this.rebuildAllReadyEvents()
   }
 
   private effectRow(input: {
@@ -1771,44 +2138,45 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       .map((effectRow) => rowToEffectRecord(requireRow<EffectRow>(effectRow)))
   }
 
-  private rebuildAllReadyEvents(): void {
+  private rebuildAllTasks(): void {
     const rebuild = this.db.transaction(() => {
-      this.prepare("DELETE FROM ready_events").run()
+      this.prepare("DELETE FROM tasks").run()
       const rows = this.prepare("SELECT workflow_id, run_id FROM instances WHERE status = 'running'")
         .all()
       for (const row of rows) {
         const instance = requireRow<{ workflow_id: string; run_id: string }>(row)
-        this.replaceReadyEventsForInstance(instance.workflow_id, instance.run_id)
+        this.replaceTasksForInstance(instance.workflow_id, instance.run_id)
       }
     })
     rebuild.immediate()
   }
 
-  private replaceReadyEventsForInstance(workflowId: string, runId: string): void {
+  private replaceTasksForInstance(workflowId: string, runId: string): void {
     const instance = this.instanceRow({ workflowId, runId })
     if (!instance) {
       return
     }
-    this.replaceReadyEventsForState(readyEventStateFromInstanceRow(instance))
+    this.replaceTasksForState(readyEventStateFromInstanceRow(instance))
   }
 
-  private replaceReadyEventsForState(state: ReadyEventInstanceState): void {
-    this.prepare("DELETE FROM ready_events WHERE workflow_id = ? AND run_id = ?")
+  private replaceTasksForState(state: ReadyEventInstanceState): void {
+    this.prepare("DELETE FROM tasks WHERE workflow_id = ? AND run_id = ?")
       .run(state.workflowId, state.runId)
     if (state.status !== "running") {
       return
     }
 
     for (const wait of state.waits) {
-      this.insertReadyEventForWait(state, wait)
+      this.insertTaskForWait(state, wait)
     }
   }
 
-  private replaceSignalReadyEventsForState(state: ReadyEventInstanceState): void {
+  private replaceSignalTasksForState(state: ReadyEventInstanceState): void {
     this.prepare(
         `
-        DELETE FROM ready_events
+        DELETE FROM tasks
         WHERE workflow_id = ? AND run_id = ? AND sequence = ? AND kind = 'signal'
+          AND claim_owner_id IS NULL
       `,
       )
       .run(state.workflowId, state.runId, state.sequence)
@@ -1818,12 +2186,12 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
     for (const wait of state.waits) {
       if (wait.kind === "signal") {
-        this.insertReadyEventForWait(state, wait)
+        this.insertTaskForWait(state, wait)
       }
     }
   }
 
-  private insertReadyEventForWait(state: ReadyEventInstanceState, wait: DurableWait): void {
+  private insertTaskForWait(state: ReadyEventInstanceState, wait: DurableWait): void {
     if (wait.kind === "run") {
       const activationId = activationIdFromParts(
         state.workflowId,
@@ -1832,8 +2200,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         "run",
         wait.name,
       )
-      this.insertReadyEvent({
-        readyEventId: activationId,
+      this.insertTask({
+        state,
+        taskId: activationId,
         workflowId: state.workflowId,
         runId: state.runId,
         workflowName: state.workflowName,
@@ -1881,8 +2250,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         occurredAt: signalRow.received_at,
         consumeSignalId: signalRow.signal_id,
       }
-      this.insertReadyEvent({
-        readyEventId: `${activationId}/${wait.name}`,
+      this.insertTask({
+        state,
+        taskId: `${activationId}/${wait.name}`,
         workflowId: state.workflowId,
         runId: state.runId,
         workflowName: state.workflowName,
@@ -1913,8 +2283,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         firedAt: wait.fireAt,
         occurredAt: wait.fireAt,
       }
-      this.insertReadyEvent({
-        readyEventId: activationId,
+      this.insertTask({
+        state,
+        taskId: activationId,
         workflowId: state.workflowId,
         runId: state.runId,
         workflowName: state.workflowName,
@@ -1967,10 +2338,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
               error: decodeJson<SerializedError>(childRow.error_json, {
                 message: "Child failed",
               }),
-            },
+        },
     }
-    this.insertReadyEvent({
-      readyEventId: activationId,
+    this.insertTask({
+      state,
+      taskId: activationId,
       workflowId: state.workflowId,
       runId: state.runId,
       workflowName: state.workflowName,
@@ -1987,15 +2359,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     })
   }
 
-  private insertReadyEvent(input: {
-    readyEventId: string
+  private insertTask(input: {
+    state: ReadyEventInstanceState
+    taskId: string
     workflowId: string
     runId: string
     workflowName: string
     workflowVersion: number
     partitionShard: number
     sequence: number
-    kind: ReadyEventRow["kind"]
+    kind: TaskRow["kind"]
     waitName: string | null
     activationId: string | null
     readyAt: string
@@ -2005,15 +2378,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }): void {
     this.prepare(
         `
-        INSERT INTO ready_events (
-          ready_event_id, workflow_id, run_id, workflow_name, workflow_version,
+        INSERT OR IGNORE INTO tasks (
+          task_id, workflow_id, run_id, workflow_name, workflow_version,
           partition_shard, sequence, kind, wait_name, activation_id, ready_at,
-          sort_key, wait_json, event_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          sort_key, wait_json, event_json, instance_status, instance_common_json,
+          instance_phase_name, instance_phase_data_json, instance_output_json,
+          instance_error_json, instance_cancel_reason, instance_waits_json,
+          instance_parent_workflow_id, instance_parent_run_id, instance_parent_child_record_id,
+          instance_created_at, instance_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       )
       .run(
-        input.readyEventId,
+        input.taskId,
         input.workflowId,
         input.runId,
         input.workflowName,
@@ -2027,14 +2404,28 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         input.sortKey,
         input.wait ? encodeJson(input.wait) : null,
         input.event ? encodeJson(input.event) : null,
+        "running",
+        input.state.commonJson,
+        input.state.phaseName,
+        input.state.phaseDataJson,
+        input.state.outputJson,
+        input.state.errorJson,
+        input.state.cancelReason,
+        encodeJson(input.state.waits),
+        input.state.parentWorkflowId,
+        input.state.parentRunId,
+        input.state.parentChildRecordId,
+        input.state.createdAt,
+        input.state.updatedAt,
       )
   }
 
   private readyCandidates(input: ClaimReadyActivationInput, limit: number): ReadyCandidate[] {
-    return [
-      ...this.migrationReadyCandidates(input, limit),
-      ...this.indexedReadyCandidates(input, limit),
-    ]
+    const indexed = this.indexedReadyCandidates(input, limit)
+    if (indexed.length > 0) {
+      return indexed.sort(compareReadyCandidates).slice(0, limit)
+    }
+    return this.migrationReadyCandidates(input, limit)
       .sort(compareReadyCandidates)
       .slice(0, limit)
   }
@@ -2066,6 +2457,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
             AND competing.sequence = i.sequence
             AND competing.kind <> 'migration'
             AND competing.completed_by_sequence IS NULL
+          LIMIT 1
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks competing_task
+          WHERE competing_task.workflow_id = i.workflow_id
+            AND competing_task.run_id = i.run_id
+            AND competing_task.sequence = i.sequence
+            AND competing_task.kind <> 'migration'
+            AND competing_task.claim_owner_id IS NOT NULL
+            AND competing_task.claim_epoch IS NOT NULL
           LIMIT 1
         )
         AND NOT EXISTS (
@@ -2122,65 +2523,20 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
 
     const placeholders = input.shardIds.map(() => "?").join(", ")
     const currentClauses = workflowEntries
-      .map(() => "(re.workflow_name = ? AND re.workflow_version = ?)")
+      .map(() => "(t.workflow_name = ? AND t.workflow_version = ?)")
       .join(" OR ")
     const rows = this.prepare(
       `
-        SELECT
-          re.*,
-          i.workflow_name AS instance_workflow_name,
-          i.workflow_version AS instance_workflow_version,
-          i.workflow_id AS instance_workflow_id,
-          i.run_id AS instance_run_id,
-          i.partition_shard AS instance_partition_shard,
-          i.sequence AS instance_sequence,
-          i.status AS instance_status,
-          i.common_json AS instance_common_json,
-          i.phase_name AS instance_phase_name,
-          i.phase_data_json AS instance_phase_data_json,
-          i.output_json AS instance_output_json,
-          i.error_json AS instance_error_json,
-          i.cancel_reason AS instance_cancel_reason,
-          i.waits_json AS instance_waits_json,
-          i.parent_workflow_id AS instance_parent_workflow_id,
-          i.parent_run_id AS instance_parent_run_id,
-          i.parent_child_record_id AS instance_parent_child_record_id,
-          i.created_at AS instance_created_at,
-          i.updated_at AS instance_updated_at
-        FROM ready_events re
-        JOIN instances i ON i.workflow_id = re.workflow_id AND i.run_id = re.run_id
-        WHERE re.partition_shard IN (${placeholders})
-          AND re.ready_at <= ?
-          AND re.kind <> 'migration'
+        SELECT t.*
+        FROM tasks t
+        WHERE t.partition_shard IN (${placeholders})
+          AND t.ready_at <= ?
+          AND t.kind <> 'migration'
           AND (${currentClauses})
-          AND i.status = 'running'
-          AND i.sequence = re.sequence
-          AND NOT EXISTS (
-            SELECT 1 FROM activation_claims same_activation
-            WHERE same_activation.activation_id = re.activation_id
-              AND same_activation.completed_by_sequence IS NULL
-              AND same_activation.owner_id IS NOT NULL
-              AND same_activation.lease_until > ?
-            LIMIT 1
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM activation_claims competing
-            WHERE competing.workflow_id = re.workflow_id
-              AND competing.run_id = re.run_id
-              AND competing.sequence = re.sequence
-              AND competing.activation_id <> re.activation_id
-              AND competing.completed_by_sequence IS NULL
-            LIMIT 1
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM effects blocked
-            WHERE blocked.activation_id = re.activation_id
-              AND blocked.status = 'pending'
-              AND blocked.next_attempt_at IS NOT NULL
-              AND blocked.next_attempt_at > ?
-            LIMIT 1
-          )
-        ORDER BY re.sort_key
+          AND t.instance_status = 'running'
+          AND (t.blocked_until IS NULL OR t.blocked_until <= ?)
+          AND (t.claim_owner_id IS NULL OR t.claim_epoch IS NULL)
+        ORDER BY t.sort_key
         LIMIT ?
       `,
     )
@@ -2189,10 +2545,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         input.now,
         ...workflowEntries.flatMap(([name, workflow]) => [name, workflow.version]),
         input.now,
-        input.now,
         limit,
       )
-      .map((row) => requireRow<ReadyEventJoinedRow>(row))
+      .map((row) => requireRow<TaskRow>(row))
 
     const candidates: ReadyCandidate[] = []
     for (const row of rows) {
@@ -2205,14 +2560,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return candidates
   }
 
-  private readyCandidateFromRow(row: ReadyEventJoinedRow): ReadyCandidate | null {
-    const instance = instanceRowFromReadyEventJoinedRow(row)
+  private readyCandidateFromRow(row: TaskRow): ReadyCandidate | null {
+    const instance = instanceRowFromTaskRow(row)
     if (row.kind === "run") {
       if (!row.activation_id) {
         return null
       }
       return {
         kind: "run",
+        taskId: row.task_id,
         activationId: row.activation_id,
         workflowName: row.workflow_name,
         workflowId: row.workflow_id,
@@ -2222,6 +2578,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         leaseUntil: "",
         sort: [row.sort_key],
         instance,
+        hasEffects: Boolean(row.has_effects),
       }
     }
 
@@ -2231,6 +2588,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       }
       return {
         kind: "event",
+        taskId: row.task_id,
         activationId: row.activation_id,
         workflowName: row.workflow_name,
         workflowId: row.workflow_id,
@@ -2244,6 +2602,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         leaseUntil: "",
         sort: [row.sort_key],
         instance,
+        hasEffects: Boolean(row.has_effects),
       }
     }
 
@@ -2454,6 +2813,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           status: "timeout_failed",
           reason: timeoutKind,
         })
+        this.markTaskEffects(activationId, null)
         continue
       }
 
@@ -2489,6 +2849,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         status: "timeout_retry",
         reason: timeoutKind,
       })
+      this.markTaskEffects(activationId, retry.nextAttemptAt)
     }
 
     this.prepare(
@@ -2496,6 +2857,14 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         UPDATE activation_claims
         SET owner_id = NULL, lease_until = NULL
         WHERE activation_id = ? AND completed_by_sequence IS NULL
+      `,
+      )
+      .run(activationId)
+    this.prepare(
+        `
+        UPDATE tasks
+        SET claim_owner_id = NULL, claim_epoch = NULL, claimed_at = NULL, claim_lease_until = NULL
+        WHERE activation_id = ?
       `,
       )
       .run(activationId)
@@ -2529,7 +2898,79 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     const row = oneRow<{ ready_at: string }>(
       this.prepare(
           `
-          SELECT ready_at FROM ready_events
+          SELECT MIN(wake_at) AS ready_at FROM (
+            SELECT ready_at AS wake_at FROM tasks
+            WHERE partition_shard IN (${placeholders})
+              AND kind IN ('run', 'timer')
+              AND ready_at > ?
+              AND (${versionClauses})
+            UNION ALL
+            SELECT blocked_until AS wake_at FROM tasks
+            WHERE partition_shard IN (${placeholders})
+              AND blocked_until IS NOT NULL
+              AND blocked_until > ?
+              AND (${versionClauses})
+          )
+        `,
+        )
+        .get(...shardIds, now, ...versionParams, ...shardIds, now, ...versionParams),
+    )
+    const effectDeadline = oneRow<{ deadline: string }>(
+      this.prepare(
+          `
+          SELECT MIN(deadline) AS deadline FROM (
+            SELECT e.start_to_close_deadline AS deadline
+            FROM effects e
+            JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+            WHERE i.partition_shard IN (${placeholders})
+              AND i.status = 'running'
+              AND e.status = 'pending'
+              AND e.start_to_close_deadline IS NOT NULL
+              AND e.start_to_close_deadline > ?
+              AND (${versionClauses})
+            UNION ALL
+            SELECT e.heartbeat_deadline AS deadline
+            FROM effects e
+            JOIN instances i ON i.workflow_id = e.workflow_id AND i.run_id = e.run_id
+            WHERE i.partition_shard IN (${placeholders})
+              AND i.status = 'running'
+              AND e.status = 'pending'
+              AND e.heartbeat_deadline IS NOT NULL
+              AND e.heartbeat_deadline > ?
+              AND (${versionClauses})
+          )
+        `,
+        )
+        .get(
+          ...shardIds,
+          now,
+          ...versionParams,
+          ...shardIds,
+          now,
+          ...versionParams,
+        ),
+    )
+
+    return earliestIso(row?.ready_at, effectDeadline?.deadline)
+  }
+
+  private legacyNextWakeAt(
+    shardIds: number[],
+    now: string,
+    workflows: Record<string, { version: number }>,
+  ): string | undefined {
+    const workflowEntries = Object.entries(workflows)
+    if (shardIds.length === 0 || workflowEntries.length === 0) {
+      return undefined
+    }
+
+    const placeholders = shardIds.map(() => "?").join(", ")
+    const versionClauses = workflowEntries.map(() => "(workflow_name = ? AND workflow_version = ?)").join(" OR ")
+    const versionParams = workflowEntries.flatMap(([name, workflow]) => [name, workflow.version])
+    const row = oneRow<{ ready_at: string }>(
+      this.prepare(
+          `
+          SELECT ready_at FROM tasks
           WHERE partition_shard IN (${placeholders})
             AND kind IN ('run', 'timer')
             AND ready_at > ?
@@ -2611,9 +3052,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     leaseMs: number,
   ): boolean {
     const leaseUntil = addMs(now, leaseMs)
-    const existing = oneRow<ActivationClaimRow>(
-      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
-    )
+    const existing = candidate.hasEffects
+      ? oneRow<ActivationClaimRow>(
+          this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
+        )
+      : null
     const result = this.prepare(
         `
         INSERT INTO activation_claims (
@@ -2676,6 +3119,148 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return true
   }
 
+  private tryClaimTask(
+    taskId: string,
+    workerId: string,
+    shardEpoch: number,
+    now: string,
+    leaseUntil: string,
+  ): boolean {
+    const result = this.prepare(
+        `
+        UPDATE tasks
+        SET claim_owner_id = ?, claim_epoch = ?, claimed_at = ?, claim_lease_until = ?
+        WHERE task_id = ?
+          AND (blocked_until IS NULL OR blocked_until <= ?)
+          AND (claim_owner_id IS NULL OR claim_epoch IS NULL OR claim_epoch <> ?)
+      `,
+      )
+      .run(workerId, shardEpoch, now, leaseUntil, taskId, now, shardEpoch)
+    return result.changes > 0
+  }
+
+  private claimTaskBatch(
+    taskIds: string[],
+    workerId: string,
+    shardEpoch: number,
+    now: string,
+    leaseUntil: string,
+  ): string[] {
+    const uniqueTaskIds = [...new Set(taskIds)]
+    if (uniqueTaskIds.length === 0) {
+      return []
+    }
+    const placeholders = uniqueTaskIds.map(() => "?").join(", ")
+    const result = this.prepare(
+        `
+        UPDATE tasks
+        SET claim_owner_id = ?, claim_epoch = ?, claimed_at = ?, claim_lease_until = ?
+        WHERE task_id IN (${placeholders})
+          AND (blocked_until IS NULL OR blocked_until <= ?)
+          AND (claim_owner_id IS NULL OR claim_epoch IS NULL OR claim_epoch <> ?)
+      `,
+      )
+      .run(workerId, shardEpoch, now, leaseUntil, ...uniqueTaskIds, now, shardEpoch)
+    if (result.changes === uniqueTaskIds.length) {
+      return uniqueTaskIds
+    }
+    return this.prepare(
+        `
+        SELECT task_id FROM tasks
+        WHERE task_id IN (${placeholders})
+          AND claim_owner_id = ?
+          AND claim_epoch = ?
+      `,
+      )
+      .all(...uniqueTaskIds, workerId, shardEpoch)
+      .map((row) => requireRow<{ task_id: string }>(row).task_id)
+  }
+
+  private hasClaimedTaskForSequence(candidate: ReadyCandidate): boolean {
+    return Boolean(
+      oneRow(
+        this.prepare(
+            `
+            SELECT task_id FROM tasks
+            WHERE workflow_id = ? AND run_id = ? AND sequence = ?
+              AND task_id <> ?
+              AND claim_owner_id IS NOT NULL
+              AND claim_epoch IS NOT NULL
+            LIMIT 1
+          `,
+          )
+          .get(
+            candidate.workflowId,
+            candidate.runId,
+            candidate.sequence,
+            candidate.taskId ?? "",
+          ),
+      ),
+    )
+  }
+
+  private writeShardActivationClaim(
+    candidate: ReadyCandidate,
+    workerId: string,
+    now: string,
+    leaseMs: number,
+  ): void {
+    const leaseUntil = addMs(now, leaseMs)
+    const existing = oneRow<ActivationClaimRow>(
+      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(candidate.activationId),
+    )
+    this.prepare(
+        `
+        INSERT INTO activation_claims (
+          activation_id, workflow_id, run_id, sequence, kind, wait_name,
+          event_json, wait_json, owner_id, lease_until, activation_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(activation_id) DO UPDATE SET
+          owner_id = excluded.owner_id,
+          lease_until = excluded.lease_until,
+          event_json = excluded.event_json,
+          wait_json = excluded.wait_json,
+          activation_time = COALESCE(activation_claims.activation_time, excluded.activation_time)
+        WHERE activation_claims.completed_by_sequence IS NULL
+      `,
+      )
+      .run(
+        candidate.activationId,
+        candidate.workflowId,
+        candidate.runId,
+        candidate.sequence,
+        candidate.kind,
+        candidate.kind === "event" ? (candidate.waitName ?? null) : null,
+        candidate.kind === "event" ? (candidate.eventJson ?? null) : null,
+        candidate.kind === "event" ? (candidate.waitJson ?? null) : null,
+        workerId,
+        leaseUntil,
+        candidate.activationTime,
+      )
+    if (shouldResetPendingEffectAttemptsOnClaim(existing, workerId, now)) {
+      this.resetPendingEffectsForActivationReclaim(candidate.activationId)
+    }
+    candidate.leaseUntil = leaseUntil
+    this.log("debug", "provider.activation.claim", {
+      workerId,
+      workflowName: candidate.workflowName,
+      workflowId: candidate.workflowId,
+      runId: candidate.runId,
+      activationId: candidate.activationId,
+      activationKind: candidate.kind,
+      eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+      leaseUntil,
+      leaseScope: "shard",
+    })
+    this.count("durable.provider.activation.claim", {
+      workerId,
+      workflowName: candidate.workflowName,
+      activationKind: candidate.kind,
+      eventKind: candidate.kind === "event" ? candidate.eventKind : undefined,
+      status: "success",
+    })
+  }
+
   private resetPendingEffectsForActivationReclaim(activationId: string): void {
     const effects = this.prepare(
         `
@@ -2697,6 +3282,9 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         )
         .run(`attempt-${randomUUID()}`, effect.effect_id)
     }
+    if (effects.length > 0) {
+      this.markTaskEffects(activationId, null)
+    }
   }
 
   private assertLiveActivationLease(input: {
@@ -2710,17 +3298,157 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
     )
     if (
-      !claim ||
-      claim.workflow_id !== input.workflowId ||
-      claim.run_id !== input.runId ||
-      claim.owner_id !== input.workerId ||
-      !claim.lease_until ||
-      claim.lease_until < input.now ||
-      claim.completed_by_sequence !== null
+      claim &&
+      claim.workflow_id === input.workflowId &&
+      claim.run_id === input.runId &&
+      claim.owner_id === input.workerId &&
+      claim.lease_until &&
+      claim.lease_until >= input.now &&
+      claim.completed_by_sequence === null
     ) {
+      return claim
+    }
+    if (claim) {
       throw new Error(`Lost activation lease: ${input.activationId}`)
     }
-    return claim
+    const taskClaim = this.liveTaskActivationClaim(input)
+    if (taskClaim) {
+      return taskClaim
+    }
+    throw new Error(`Lost activation lease: ${input.activationId}`)
+  }
+
+  private ensureActivationClaimForEffectMutation(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    workerId: string
+    now: string
+  }): void {
+    const existing = oneRow<ActivationClaimRow>(
+      this.prepare("SELECT * FROM activation_claims WHERE activation_id = ?").get(input.activationId),
+    )
+    if (existing) {
+      return
+    }
+    const claim = this.liveTaskActivationClaim(input)
+    if (!claim) {
+      throw new Error(`Lost activation lease: ${input.activationId}`)
+    }
+    this.prepare(
+        `
+        INSERT INTO activation_claims (
+          activation_id, workflow_id, run_id, sequence, kind, wait_name,
+          event_json, wait_json, owner_id, lease_until, activation_time
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        claim.activation_id,
+        claim.workflow_id,
+        claim.run_id,
+        claim.sequence,
+        claim.kind,
+        claim.wait_name,
+        claim.event_json,
+        claim.wait_json,
+        claim.owner_id,
+        claim.lease_until,
+        claim.activation_time,
+      )
+  }
+
+  private liveTaskActivationClaim(input: {
+    workflowId: string
+    runId: string
+    activationId: string
+    workerId: string
+    now: string
+  }): ActivationClaimRow | null {
+    const task = oneRow<TaskRow>(
+      this.prepare(
+          `
+          SELECT * FROM tasks
+          WHERE activation_id = ? AND workflow_id = ? AND run_id = ?
+          ORDER BY sort_key
+          LIMIT 1
+        `,
+        )
+        .get(input.activationId, input.workflowId, input.runId),
+    )
+    if (
+      !task ||
+      task.claim_owner_id !== input.workerId ||
+      task.claim_epoch === null ||
+      !task.claim_lease_until ||
+      task.claim_lease_until < input.now
+    ) {
+      return null
+    }
+    if (task.workflow_id !== input.workflowId || task.run_id !== input.runId) {
+      return null
+    }
+    return this.taskActivationClaimFromLiveTask(task, input.workerId, input.now)
+  }
+
+  private liveTaskActivationClaimByActivationId(
+    activationId: string,
+    workerId: string,
+    now: string,
+  ): ActivationClaimRow | null {
+    const task = oneRow<TaskRow>(
+      this.prepare(
+          `
+          SELECT * FROM tasks
+          WHERE activation_id = ?
+          ORDER BY sort_key
+          LIMIT 1
+        `,
+        )
+        .get(activationId),
+    )
+    if (
+      !task ||
+      task.claim_owner_id !== workerId ||
+      task.claim_epoch === null ||
+      !task.claim_lease_until ||
+      task.claim_lease_until < now
+    ) {
+      return null
+    }
+    return this.taskActivationClaimFromLiveTask(task, workerId, now)
+  }
+
+  private taskActivationClaimFromLiveTask(
+    task: TaskRow,
+    workerId: string,
+    now: string,
+  ): ActivationClaimRow | null {
+    const shard = oneRow<DispatchShardRow>(
+      this.prepare("SELECT * FROM dispatch_shards WHERE shard_id = ?").get(task.partition_shard),
+    )
+    if (
+      shard?.owner_id !== workerId ||
+      (shard.lease_until ?? "") < now ||
+      (shard.lease_epoch ?? 0) !== task.claim_epoch
+    ) {
+      return null
+    }
+    const activationId = task.activation_id ?? task.task_id
+    return {
+      activation_id: activationId,
+      workflow_id: task.workflow_id,
+      run_id: task.run_id,
+      sequence: task.sequence,
+      kind: activationClaimKindForTask(task),
+      wait_name: task.wait_name,
+      event_json: task.event_json,
+      wait_json: task.wait_json,
+      owner_id: workerId,
+      lease_until: task.claim_lease_until,
+      activation_time: task.ready_at,
+      completed_by_sequence: null,
+    }
   }
 
   private throwEffectMutationError(input: {
@@ -2846,7 +3574,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
           start.parentClosePolicy ?? "cancel",
         )
 
-      this.replaceReadyEventsForState({
+      this.replaceTasksForState({
         workflowName: start.workflowName,
         workflowVersion: start.workflowVersion,
         workflowId: start.workflowId,
@@ -2856,6 +3584,16 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         status: "running",
         waits: start.waits,
         updatedAt: input.now,
+        commonJson: encodeJson(start.common),
+        phaseName: start.phase.name,
+        phaseDataJson: encodeJson(start.phase.data),
+        outputJson: null,
+        errorJson: null,
+        cancelReason: null,
+        parentWorkflowId: input.workflowId,
+        parentRunId: input.runId,
+        parentChildRecordId: childRecordId,
+        createdAt: input.now,
       })
       this.log("info", "provider.child.create", {
         workflowName: start.workflowName,
@@ -3049,6 +3787,75 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       )
   }
 
+  private appendWorkflowHistory(
+    input: CommitCheckpointInput,
+    sequence: number,
+    kind: string,
+    activationKind: ActivationClaimRow["kind"],
+  ): void {
+    this.prepare(
+        `
+        INSERT INTO workflow_history (
+          history_id, workflow_id, run_id, sequence, activation_id, kind, event_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        `history-${randomUUID()}`,
+        input.workflowId,
+        input.runId,
+        sequence,
+        input.activationId,
+        kind,
+        encodeJson({
+          workerId: input.workerId,
+          expectedSequence: input.expectedSequence,
+          activationKind,
+          status: input.next.status,
+          consumeSignalId: input.consumeSignalId ?? null,
+          consumeChildRecordId: input.consumeChildRecordId ?? null,
+          effects: input.effects?.length ?? 0,
+          childStarts: input.childStarts?.length ?? 0,
+        }),
+        input.now,
+      )
+  }
+
+  private appendActivationFailureHistory(input: RecordActivationFailureInput): void {
+    this.prepare(
+        `
+        INSERT INTO workflow_history (
+          history_id, workflow_id, run_id, sequence, activation_id, kind, event_json, created_at
+        ) VALUES (?, ?, ?, COALESCE((SELECT sequence FROM instances WHERE workflow_id = ? AND run_id = ?), 0), ?, 'activation_failure', ?, ?)
+      `,
+      )
+      .run(
+        `history-${randomUUID()}`,
+        input.workflowId,
+        input.runId,
+        input.workflowId,
+        input.runId,
+        input.activationId,
+        encodeJson({
+          effects: input.effects.length,
+          releaseActivation: input.releaseActivation ?? false,
+        }),
+        input.now,
+      )
+  }
+
+  private markTaskEffects(activationId: string, blockedUntil: string | null): void {
+    this.prepare(
+        `
+        UPDATE tasks
+        SET has_effects = 1,
+          blocked_until = ?
+        WHERE activation_id = ?
+      `,
+      )
+      .run(blockedUntil, activationId)
+  }
+
   private updateParentChildRecord(
     previous: InstanceRow,
     input: CommitCheckpointInput,
@@ -3090,7 +3897,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         .run(input.now, encodeJson(error), existing.child_record_id)
     }
 
-    this.replaceReadyEventsForInstance(existing.parent_workflow_id, existing.parent_run_id)
+    this.replaceTasksForInstance(existing.parent_workflow_id, existing.parent_run_id)
     void nextSequence
   }
 
@@ -3147,6 +3954,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     now: string,
     options: {
       deliverToParent: boolean
+      refreshParent?: boolean
       deliveredBySequence?: number
       reason: SerializedError
     },
@@ -3200,7 +4008,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         `,
         )
         .run(child.workflow_id, child.run_id)
-      this.replaceReadyEventsForInstance(child.workflow_id, child.run_id)
+      this.replaceTasksForInstance(child.workflow_id, child.run_id)
       this.closeStartedChildren(
         child.workflow_id,
         child.run_id,
@@ -3225,8 +4033,8 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
         child.child_record_id,
       )
 
-    if (options.deliverToParent) {
-      this.replaceReadyEventsForInstance(child.parent_workflow_id, child.parent_run_id)
+    if (options.deliverToParent && options.refreshParent !== false) {
+      this.replaceTasksForInstance(child.parent_workflow_id, child.parent_run_id)
     }
   }
 
@@ -3525,6 +4333,27 @@ function claimMatchesCommit(claim: ActivationClaimRow, input: CommitCheckpointIn
   return !input.consumeSignalId && !input.consumeChildRecordId
 }
 
+function taskMatchesCommit(task: TaskRow, input: CommitCheckpointInput): boolean {
+  if (task.kind !== "signal" && task.kind !== "child") {
+    return !input.consumeSignalId && !input.consumeChildRecordId
+  }
+
+  const event = decodeJson<ReadyEvent | null>(task.event_json, null)
+  if (!event) {
+    return false
+  }
+
+  if (event.kind === "signal") {
+    return input.consumeSignalId === event.consumeSignalId && !input.consumeChildRecordId
+  }
+
+  if (event.kind === "child") {
+    return input.consumeChildRecordId === event.childRecordId && !input.consumeSignalId
+  }
+
+  return !input.consumeSignalId && !input.consumeChildRecordId
+}
+
 function shouldResetPendingEffectAttemptsOnClaim(
   existing: ActivationClaimRow | null,
   workerId: string,
@@ -3559,14 +4388,14 @@ function compareReadyCandidates(left: ReadyCandidate, right: ReadyCandidate): nu
   return 0
 }
 
-function instanceRowFromReadyEventJoinedRow(row: ReadyEventJoinedRow): InstanceRow {
+function instanceRowFromTaskRow(row: TaskRow): InstanceRow {
   return {
-    workflow_name: row.instance_workflow_name,
-    workflow_version: row.instance_workflow_version,
-    workflow_id: row.instance_workflow_id,
-    run_id: row.instance_run_id,
-    partition_shard: row.instance_partition_shard,
-    sequence: row.instance_sequence,
+    workflow_name: row.workflow_name,
+    workflow_version: row.workflow_version,
+    workflow_id: row.workflow_id,
+    run_id: row.run_id,
+    partition_shard: row.partition_shard,
+    sequence: row.sequence,
     status: row.instance_status,
     common_json: row.instance_common_json,
     phase_name: row.instance_phase_name,
@@ -3594,6 +4423,83 @@ function readyEventStateFromInstanceRow(row: InstanceRow): ReadyEventInstanceSta
     status: row.status,
     waits: decodeJson<DurableWait[]>(row.waits_json, []),
     updatedAt: row.updated_at,
+    commonJson: row.common_json,
+    phaseName: row.phase_name,
+    phaseDataJson: row.phase_data_json,
+    outputJson: row.output_json,
+    errorJson: row.error_json,
+    cancelReason: row.cancel_reason,
+    parentWorkflowId: row.parent_workflow_id,
+    parentRunId: row.parent_run_id,
+    parentChildRecordId: row.parent_child_record_id,
+    createdAt: row.created_at,
+  }
+}
+
+function taskStateFromCommit(
+  previous: InstanceRow,
+  input: CommitCheckpointInput,
+  nextSequence: number,
+): ReadyEventInstanceState {
+  const base = {
+    workflowName: previous.workflow_name,
+    workflowVersion: input.workflowVersion,
+    workflowId: input.workflowId,
+    runId: input.runId,
+    partitionShard: previous.partition_shard,
+    sequence: nextSequence,
+    waits: input.waits,
+    updatedAt: input.now,
+    parentWorkflowId: previous.parent_workflow_id,
+    parentRunId: previous.parent_run_id,
+    parentChildRecordId: previous.parent_child_record_id,
+    createdAt: previous.created_at,
+  }
+  if (input.next.status === "running") {
+    return {
+      ...base,
+      status: "running",
+      commonJson: encodeJson(input.next.common),
+      phaseName: input.next.phase.name,
+      phaseDataJson: encodeJson(input.next.phase.data),
+      outputJson: null,
+      errorJson: null,
+      cancelReason: null,
+    }
+  }
+  if (input.next.status === "completed") {
+    return {
+      ...base,
+      status: "completed",
+      commonJson: null,
+      phaseName: null,
+      phaseDataJson: null,
+      outputJson: encodeJson(toJson(input.next.output)),
+      errorJson: null,
+      cancelReason: null,
+    }
+  }
+  if (input.next.status === "canceled") {
+    return {
+      ...base,
+      status: "canceled",
+      commonJson: null,
+      phaseName: null,
+      phaseDataJson: null,
+      outputJson: null,
+      errorJson: null,
+      cancelReason: input.next.reason,
+    }
+  }
+  return {
+    ...base,
+    status: "failed",
+    commonJson: null,
+    phaseName: null,
+    phaseDataJson: null,
+    outputJson: null,
+    errorJson: encodeJson(input.next.error),
+    cancelReason: null,
   }
 }
 
@@ -3670,6 +4576,24 @@ function addMs(iso: string, ms: number): string {
 
 function deadlineFrom(now: string, timeoutMs: number | null): string | null {
   return timeoutMs === null ? null : addMs(now, timeoutMs)
+}
+
+function latestRetryBlockedUntil(effects: CheckpointEffectMutation[] = []): string | null {
+  const retryTimes = effects.flatMap((effect) =>
+    effect.status === "retry_scheduled" ? [effect.nextAttemptAt] : [],
+  )
+  if (retryTimes.length === 0) {
+    return null
+  }
+  return retryTimes.sort().at(-1) ?? null
+}
+
+function effectBlockUntil(effect: EffectRow): string | null {
+  return earliestIso(
+    effect.next_attempt_at ?? undefined,
+    effect.start_to_close_deadline ?? undefined,
+    effect.heartbeat_deadline ?? undefined,
+  ) ?? null
 }
 
 type NormalizedEffectOptions = {
@@ -3925,6 +4849,23 @@ function rowToEffectRecord(row: EffectRow): EffectRecord {
     heartbeatAt: row.heartbeat_at ?? undefined,
     heartbeatDetails: decodeJson<JsonValue | undefined>(row.heartbeat_details_json, undefined),
   }
+}
+
+function activationClaimKindForTask(task: TaskRow): ActivationClaimRow["kind"] {
+  if (task.kind === "migration") {
+    return "migration"
+  }
+  if (task.kind === "run") {
+    return "run"
+  }
+  return "event"
+}
+
+function activationClaimKindForCommitInput(input: CommitCheckpointInput): ActivationClaimRow["kind"] {
+  if (input.consumeSignalId || input.consumeChildRecordId) {
+    return "event"
+  }
+  return "run"
 }
 
 // Make it easy to create a store path before the first provider write.

@@ -83,6 +83,7 @@ production guarantee.
 
 ```bash
 npm run benchmark:sqlite -- --workflows 1000 --activation-concurrency 4 --activation-prefetch-limit 32 --json
+npm run benchmark:sqlite -- --mode signal --profile-queries --json
 npm run benchmark:postgres -- --workflows 1000 --workers 16 --shards 16 --pool-size 64 --activation-concurrency 4 --activation-prefetch-limit 32 --batch 32 --physical-partitions 4 --json
 npm run benchmark:postgres -- --profile-queries --json
 npm run benchmark:postgres:diagnose -- --physical-partitions 4 --workflows 1000 --workers 16 --shards 16 --pool-size 64 --json
@@ -91,6 +92,8 @@ npm run benchmark:null -- --workflows 10000 --mode bare --json
 npm run benchmark:null:processes -- --processes 4 --workflows 4000 --mode mixed --json
 ```
 
+The SQLite, Postgres, and null benchmarks support workload modes
+`mixed|bare|activity|signal|timer|child`. `mixed` is the headline workload.
 The benchmark reports setup, processing, and verification time separately.
 Processing throughput excludes one-time workflow creation, final debug-store
 verification, and result loading.
@@ -108,22 +111,21 @@ delay. SQLite uses file-backed WAL/FULL durability; Postgres uses
 
 | Provider | workers/shards | activation concurrency | prefetch / drain batch | physical partitions | pool | e2e workflows/sec | e2e activations/sec | processing activations/sec | processing mixed actions/sec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| SQLite WAL/FULL single file | 4/4 | 4 | 32 / 32 | n/a | n/a | 404 | 2,022 | 2,201 | 3,521 |
-| SQLite WAL/FULL single file | 16/16 | 4 | 32 / 32 | n/a | n/a | 782 | 3,912 | 4,642 | 7,428 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 1 | 24 | 147 | 736 | 1,234 | 1,974 |
-| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 4 | 24 | 159 | 794 | 1,357 | 2,172 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 1 | 64 | 244 | 1,219 | 3,210 | 5,135 |
-| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 4 | 64 | 245 | 1,225 | 3,412 | 5,459 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 1 | 96 | 237 | 1,183 | 2,766 | 4,426 |
-| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 4 | 96 | 228 | 1,139 | 2,697 | 4,315 |
+| SQLite WAL/FULL single file | 4/4 | 4 | 32 / 32 | n/a | n/a | 406 | 2,031 | 2,241 | 3,586 |
+| SQLite WAL/FULL single file | 16/16 | 4 | 32 / 32 | n/a | n/a | 775 | 3,877 | 4,695 | 7,512 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 1 | 24 | 143 | 716 | 1,234 | 1,975 |
+| Postgres Docker postgres:18.3 | 4/4 | 4 | 32 / 32 | 4 | 24 | 156 | 779 | 1,297 | 2,075 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 1 | 64 | 257 | 1,286 | 3,190 | 5,104 |
+| Postgres Docker postgres:18.3 | 16/16 | 4 | 32 / 32 | 4 | 64 | 261 | 1,305 | 3,403 | 5,444 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 1 | 96 | 228 | 1,141 | 2,663 | 4,262 |
+| Postgres Docker postgres:18.3 | 32/32 | 4 | 32 / 32 | 4 | 96 | 246 | 1,230 | 2,845 | 4,552 |
 
 `npm run benchmark:postgres:diagnose` enables query profiling plus lightweight
 sampling of pool pressure, active Postgres wait events, WAL/database deltas,
 Node CPU, and event loop utilization.
 
-A profiled run of the 16/16, 4-partition Postgres row measured 4.47
-processing SQL calls per activation. Profiling adds overhead, so use the table
-above for normal throughput comparisons.
+Profiling adds overhead, so use the table above for normal throughput
+comparisons and the diagnostic output for query-shape investigation.
 
 The no-delay workload is mostly local DB/CPU-bound. Higher activation
 concurrency can improve throughput when it gives the runtime enough completed

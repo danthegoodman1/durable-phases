@@ -4,6 +4,7 @@ import { runSqliteBenchmark, type BenchmarkOptions } from "../src/benchmarks/sql
 
 function benchmarkOptions(overrides: Partial<BenchmarkOptions> = {}): BenchmarkOptions {
   return {
+    mode: "mixed",
     workflows: 6,
     workers: 2,
     shards: 2,
@@ -13,6 +14,7 @@ function benchmarkOptions(overrides: Partial<BenchmarkOptions> = {}): BenchmarkO
     batch: 4,
     maxRounds: 100,
     keepDb: false,
+    profileQueries: false,
     json: true,
     ...overrides,
   }
@@ -23,6 +25,8 @@ describe("SQLite benchmark", () => {
     const result = await runSqliteBenchmark(benchmarkOptions())
 
     expect(result.completedWorkflows).toBe(6)
+    expect(result.backend).toBe("sqlite")
+    expect(result.mode).toBe("mixed")
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
     expect(result.mixedActions).toBe(48)
@@ -41,6 +45,27 @@ describe("SQLite benchmark", () => {
     expect(result.verifyMs).toBeGreaterThanOrEqual(0)
     expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
     expect(result.dbPath).toBeUndefined()
+  })
+
+  it("reports SQLite query profile and supports isolated benchmark modes", async () => {
+    const result = await runSqliteBenchmark(benchmarkOptions({
+      mode: "bare",
+      workflows: 4,
+      profileQueries: true,
+    }))
+
+    expect(result.mode).toBe("bare")
+    expect(result.expectedActivations).toBe(4)
+    expect(result.queryProfile).toMatchObject({
+      totalQueries: expect.any(Number),
+      byPhase: {
+        processing: {
+          totalQueries: expect.any(Number),
+        },
+      },
+      topProcessingByTotal: expect.any(Array),
+      topProcessingByCount: expect.any(Array),
+    })
   })
 
   it("does not inspect all instances inside the timed processing loop", async () => {

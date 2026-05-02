@@ -10,14 +10,15 @@ import {
 import {
   activityCount,
   createBenchmarkCounters,
-  createBenchmarkWorkflows,
-  mixedActionCount,
-  verifyBenchmarkCounters,
-  verifyBenchmarkOutputs,
   type BenchmarkCounters,
 } from "./workload.js"
+import {
+  createNullBenchmarkWorkload,
+  type NullBenchmarkMode,
+} from "./null.js"
 
 export type BenchmarkOptions = {
+  mode: NullBenchmarkMode
   workflows: number
   workers: number
   shards: number
@@ -27,10 +28,41 @@ export type BenchmarkOptions = {
   batch: number
   maxRounds: number
   keepDb: boolean
+  profileQueries: boolean
   json: boolean
 }
 
+type QueryProfilePhase = "setup" | "processing" | "verify" | "cleanup"
+
+type SqliteQueryProfileEntry = {
+  phase: QueryProfilePhase | "all"
+  count: number
+  totalMs: number
+  avgMs: number
+  maxMs: number
+  sql: string
+}
+
+export type SqliteQueryProfile = {
+  totalQueries: number
+  queriesPerActivation: number
+  totalSqlMs: number
+  avgQueryMs: number
+  byPhase: Record<QueryProfilePhase, {
+    totalQueries: number
+    queriesPerActivation: number
+    totalSqlMs: number
+    avgQueryMs: number
+  }>
+  topByTotal: SqliteQueryProfileEntry[]
+  topByCount: SqliteQueryProfileEntry[]
+  topProcessingByTotal: SqliteQueryProfileEntry[]
+  topProcessingByCount: SqliteQueryProfileEntry[]
+}
+
 export type BenchmarkResult = {
+  backend: "sqlite"
+  mode: NullBenchmarkMode
   options: BenchmarkOptions
   elapsedMs: number
   setupMs: number
@@ -49,11 +81,13 @@ export type BenchmarkResult = {
   processingMixedActionsPerSecond: number
   processingWorkflowsPerSecond: number
   counters: BenchmarkCounters
+  queryProfile?: SqliteQueryProfile
   dbPath?: string
   dbBytes?: number
 }
 
 const defaultOptions: BenchmarkOptions = {
+  mode: "mixed",
   workflows: 250,
   workers: 4,
   shards: 4,
@@ -63,6 +97,7 @@ const defaultOptions: BenchmarkOptions = {
   batch: 32,
   maxRounds: 10_000,
   keepDb: false,
+  profileQueries: false,
   json: false,
 }
 
@@ -70,7 +105,7 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))
   if (!options.json) {
     process.stdout.write(
-      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, SQLite WAL/FULL durability...\n\n`,
+      `Running SQLite durability benchmark with ${options.workflows} workflows, ${options.mode} mode, ${options.workers} workers, ${options.shards} shards, activation concurrency ${options.activationConcurrency}, activation prefetch ${options.activationPrefetchLimit}, SQLite WAL/FULL durability...\n\n`,
     )
   }
   const result = await runSqliteBenchmark(options)
@@ -86,17 +121,23 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
   const dbPath = join(tempDir, "bench.sqlite")
   const counters = createBenchmarkCounters()
   const providers: SqliteDurabilityProvider[] = []
-  const { ParentWorkflow, workflows } = createBenchmarkWorkflows(counters, {
+  const workload = createNullBenchmarkWorkload(options.mode, counters, {
     activityDelayMs: options.activityDelayMs,
   })
+  let profilePhase: QueryProfilePhase = "setup"
+  const queryProfiler = options.profileQueries
+    ? createSqliteQueryProfiler(() => profilePhase)
+    : undefined
   let now = new Date("2026-01-01T00:00:00.000Z")
   const clock = () => now
   const runtimes = Array.from({ length: options.workers }, (_value, workerIndex) => {
-    const provider = new SqliteDurabilityProvider(dbPath)
+    const provider = new SqliteDurabilityProvider(dbPath, {
+      sqlProfiler: queryProfiler?.record,
+    })
     providers.push(provider)
     return new DurableRuntime(provider, {
       clock,
-      workflows,
+      workflows: workload.workflows,
       workerId: `bench-worker-${workerIndex}`,
       shardCount: options.shards,
       dispatchShardIds: dispatchShardIdsForWorker(workerIndex, options.workers, options.shards),
@@ -109,7 +150,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
 
   let rounds = 0
   let activations = 0
-  const expectedActivations = options.workflows * 5
+  const expectedActivations = options.workflows * workload.activationsPerWorkflow
   const setupStartedAt = performance.now()
   let setupFinishedAt = setupStartedAt
   let processingStartedAt = setupStartedAt
@@ -118,21 +159,24 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
   try {
     for (let index = 0; index < options.workflows; index += 1) {
       const ref = await runtimes[0].start(
-        ParentWorkflow,
+        workload.RootWorkflow,
         { index },
-        { workflowId: `bench-parent-${index}` },
+        { workflowId: `${options.mode}-bench-${index}` },
       )
       counters.workflowStarts += 1
-      await runtimes[0].signal(
-        ParentWorkflow,
-        ref,
-        "finish",
-        { signalValue: index + 1_000 },
-      )
-      counters.signals += 1
+      if (workload.appendFinishSignal) {
+        await runtimes[0].signal(
+          workload.RootWorkflow,
+          ref,
+          "finish",
+          { signalValue: index + 1_000 },
+        )
+        counters.signals += 1
+      }
     }
 
     setupFinishedAt = performance.now()
+    profilePhase = "processing"
     processingStartedAt = setupFinishedAt
 
     for (; rounds < options.maxRounds; rounds += 1) {
@@ -153,6 +197,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
     }
 
     processingFinishedAt = performance.now()
+    profilePhase = "verify"
     const verifyStartedAt = processingFinishedAt
     if (activations < expectedActivations) {
       throw new Error(
@@ -162,7 +207,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
 
     const instances = await providers[0].listInstances()
     const completedWorkflows = instances.filter(
-      (instance) => instance.workflowName === ParentWorkflow.name && instance.status === "completed",
+      (instance) => instance.workflowName === workload.RootWorkflow.name && instance.status === "completed",
     ).length
     if (completedWorkflows !== options.workflows) {
       throw new Error(
@@ -170,8 +215,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       )
     }
 
-    verifyBenchmarkOutputs(instances, options.workflows)
-    verifyBenchmarkCounters(counters, options.workflows)
+    workload.verify(instances, options.workflows, 0)
     const claims = await providers[0].listActivationClaims()
     const committedWorkers = new Set(
       claims
@@ -179,7 +223,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
         .map((claim) => claim.ownerId)
         .filter((ownerId): ownerId is string => Boolean(ownerId)),
     ).size
-    const mixedActions = mixedActionCount(counters)
+    const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
     const processingMs = processingFinishedAt - processingStartedAt
@@ -189,6 +233,8 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
     const processingSeconds = Math.max(processingMs / 1_000, Number.EPSILON)
 
     return {
+      backend: "sqlite",
+      mode: options.mode,
       options,
       elapsedMs,
       setupMs,
@@ -207,10 +253,12 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
       processingMixedActionsPerSecond: mixedActions / processingSeconds,
       processingWorkflowsPerSecond: completedWorkflows / processingSeconds,
       counters,
+      queryProfile: queryProfiler?.snapshot(activations),
       dbPath: options.keepDb ? dbPath : undefined,
       dbBytes: options.keepDb ? await sqliteStoreBytes(dbPath) : undefined,
     }
   } finally {
+    profilePhase = "cleanup"
     for (const provider of providers) {
       provider.close()
     }
@@ -239,6 +287,8 @@ function parseArgs(args: string[]): BenchmarkOptions {
     if (flag === "--help" || flag === "-h") {
       printHelp()
       process.exit(0)
+    } else if (flag === "--mode") {
+      options.mode = parseMode(nextValue(), flag)
     } else if (flag === "--workflows") {
       options.workflows = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--workers") {
@@ -257,6 +307,8 @@ function parseArgs(args: string[]): BenchmarkOptions {
       options.maxRounds = parsePositiveInteger(nextValue(), flag)
     } else if (flag === "--keep-db") {
       options.keepDb = true
+    } else if (flag === "--profile-queries") {
+      options.profileQueries = true
     } else if (flag === "--json") {
       options.json = true
     } else {
@@ -264,6 +316,20 @@ function parseArgs(args: string[]): BenchmarkOptions {
     }
   }
   return options
+}
+
+function parseMode(value: string, flag: string): NullBenchmarkMode {
+  if (
+    value === "mixed" ||
+    value === "bare" ||
+    value === "activity" ||
+    value === "signal" ||
+    value === "timer" ||
+    value === "child"
+  ) {
+    return value
+  }
+  throw new Error(`${flag} must be mixed, bare, activity, signal, timer, or child`)
 }
 
 function parsePositiveInteger(value: string, flag: string): number {
@@ -288,6 +354,8 @@ function printHelp(): void {
 Runs real TypeScript workflows against the SQLite durability provider.
 
 Options:
+  --mode <mixed|bare|activity|signal|timer|child>
+                    Workload mode. Default: ${defaultOptions.mode}
   --workflows <n>   Parent workflow count. Default: ${defaultOptions.workflows}
   --workers <n>     Logical in-process worker count. Default: ${defaultOptions.workers}
   --shards <n>      Dispatch shard count. Default: ${defaultOptions.shards}
@@ -300,6 +368,7 @@ Options:
   --batch <n>       Max activations per worker drain. Default: ${defaultOptions.batch}
   --max-rounds <n>  Safety cap for drain rounds. Default: ${defaultOptions.maxRounds}
   --keep-db         Keep the temporary SQLite database and print its path.
+  --profile-queries Record SQLite statement timing/count profile.
   --json            Print machine-readable JSON.
 `)
 }
@@ -307,6 +376,7 @@ Options:
 function printResult(result: BenchmarkResult): void {
   const activityTotal = activityCount(result.counters)
   process.stdout.write(`SQLite durability benchmark
+  mode: ${result.mode}
   workflows: ${result.options.workflows}
   workers: ${result.options.workers} logical in-process workers
   committed workers: ${result.committedWorkers}
@@ -338,6 +408,19 @@ Action breakdown:
   activities: ${activityTotal} (${result.counters.bootActivities} boot, ${result.counters.childActivities} child, ${result.counters.finishActivities} finish)
 `)
 
+  if (result.queryProfile) {
+    process.stdout.write(`
+SQLite statement profile:
+  total statements: ${result.queryProfile.totalQueries}
+  statements/activation: ${result.queryProfile.queriesPerActivation.toFixed(2)}
+  processing statements/activation: ${result.queryProfile.byPhase.processing.queriesPerActivation.toFixed(2)}
+  total SQL time: ${formatMs(result.queryProfile.totalSqlMs)}
+
+Top processing statements by total time:
+${formatProfileEntries(result.queryProfile.topProcessingByTotal)}
+`)
+  }
+
   if (result.dbPath) {
     process.stdout.write(`
 SQLite store kept:
@@ -367,6 +450,108 @@ async function sqliteStoreBytes(dbPath: string): Promise<number> {
     paths.map((path) => stat(path).then((info) => info.size).catch(() => 0)),
   )
   return sizes.reduce((total, size) => total + size, 0)
+}
+
+function createSqliteQueryProfiler(phase: () => QueryProfilePhase) {
+  const entries: Array<{ phase: QueryProfilePhase; sql: string; durationMs: number }> = []
+  return {
+    record: (event: { sql: string; durationMs: number }) => {
+      entries.push({
+        phase: phase(),
+        sql: normalizeSql(event.sql),
+        durationMs: event.durationMs,
+      })
+    },
+    snapshot: (activations: number): SqliteQueryProfile => {
+      const all = summarizeEntries(entries, activations)
+      return {
+        totalQueries: all.totalQueries,
+        queriesPerActivation: all.queriesPerActivation,
+        totalSqlMs: all.totalSqlMs,
+        avgQueryMs: all.avgQueryMs,
+        byPhase: {
+          setup: summarizeEntries(entries.filter((entry) => entry.phase === "setup"), activations),
+          processing: summarizeEntries(
+            entries.filter((entry) => entry.phase === "processing"),
+            activations,
+          ),
+          verify: summarizeEntries(entries.filter((entry) => entry.phase === "verify"), activations),
+          cleanup: summarizeEntries(entries.filter((entry) => entry.phase === "cleanup"), activations),
+        },
+        topByTotal: topEntries(entries, "all", "total"),
+        topByCount: topEntries(entries, "all", "count"),
+        topProcessingByTotal: topEntries(
+          entries.filter((entry) => entry.phase === "processing"),
+          "processing",
+          "total",
+        ),
+        topProcessingByCount: topEntries(
+          entries.filter((entry) => entry.phase === "processing"),
+          "processing",
+          "count",
+        ),
+      }
+    },
+  }
+}
+
+function summarizeEntries(
+  entries: Array<{ durationMs: number }>,
+  activations: number,
+): SqliteQueryProfile["byPhase"][QueryProfilePhase] {
+  const totalQueries = entries.length
+  const totalSqlMs = entries.reduce((total, entry) => total + entry.durationMs, 0)
+  return {
+    totalQueries,
+    queriesPerActivation: totalQueries / Math.max(activations, 1),
+    totalSqlMs,
+    avgQueryMs: totalQueries === 0 ? 0 : totalSqlMs / totalQueries,
+  }
+}
+
+function topEntries(
+  entries: Array<{ phase: QueryProfilePhase; sql: string; durationMs: number }>,
+  phase: QueryProfilePhase | "all",
+  order: "total" | "count",
+): SqliteQueryProfileEntry[] {
+  const groups = new Map<string, { count: number; totalMs: number; maxMs: number }>()
+  for (const entry of entries) {
+    const current = groups.get(entry.sql) ?? { count: 0, totalMs: 0, maxMs: 0 }
+    current.count += 1
+    current.totalMs += entry.durationMs
+    current.maxMs = Math.max(current.maxMs, entry.durationMs)
+    groups.set(entry.sql, current)
+  }
+  return [...groups.entries()]
+    .map(([sql, value]) => ({
+      phase,
+      count: value.count,
+      totalMs: value.totalMs,
+      avgMs: value.totalMs / value.count,
+      maxMs: value.maxMs,
+      sql,
+    }))
+    .sort((left, right) =>
+      order === "total"
+        ? right.totalMs - left.totalMs
+        : right.count - left.count || right.totalMs - left.totalMs,
+    )
+    .slice(0, 10)
+}
+
+function normalizeSql(sql: string): string {
+  return sql.trim().replace(/\s+/g, " ")
+}
+
+function formatProfileEntries(entries: SqliteQueryProfileEntry[]): string {
+  if (entries.length === 0) {
+    return "  (none)"
+  }
+  return entries
+    .map((entry) =>
+      `  ${entry.count}x ${formatMs(entry.totalMs)} total, ${formatMs(entry.avgMs)} avg: ${entry.sql}`,
+    )
+    .join("\n")
 }
 
 function formatMs(value: number): string {

@@ -1069,7 +1069,10 @@ They must still preserve equivalent claim fencing and checkpoint-CAS invariants.
 The TypeScript SQLite provider uses WAL mode, foreign keys, `busy_timeout`,
 and `synchronous=FULL`. File-backed SQLite stores are the crash-durable SQLite
 mode. In-memory SQLite stores may be useful for tests and local experiments, but
-they are not crash-durable.
+they are not crash-durable. Its normal hot path uses shard-owned live `tasks`,
+`dispatch_shards.lease_epoch`, compact `workflow_history`, and batched task
+claim/commit transactions; the older ready-event/activation-lease tables are
+compatibility/debug support rather than the primary work-discovery path.
 
 The TypeScript Postgres provider uses a pooled `pg` client, explicit
 transactions, row locks, `FOR UPDATE SKIP LOCKED` for concurrent claims,
