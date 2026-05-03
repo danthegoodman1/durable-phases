@@ -1144,6 +1144,16 @@ async fn sqlite_provider_passes_basic_conformance() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sqlite_shard_file_provider_passes_basic_conformance() {
+    let dir = tempfile::tempdir().unwrap();
+    durable::testing::conformance::assert_basic_provider_conformance(|| {
+        let path = dir.path().to_path_buf();
+        async move { SqliteShardFileDurabilityProvider::new(path, 1) }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn provider_eager_effect_retry_blocks_and_reclaims_activation() {
     let provider = durable::NullDurabilityProvider::new();
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();

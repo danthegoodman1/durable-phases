@@ -177,8 +177,11 @@ npm run benchmark:full-parity -- --provider all --mode all --workflows 20 --work
 
 Latest local TS/Rust/Go parity smoke, `20` workflows, `2` workers, `2` shards,
 with Postgres using local Docker and `physicalPartitions=2`. The SQLite rows
-were refreshed with `repeat 3` after the Rust SQLite writer optimization;
-non-SQLite rows are from the prior `repeat 1` smoke.
+were refreshed with `repeat 3` after the Rust SQLite writer optimization. The
+Postgres `mixed` row also reflects the corrected Go mixed workload shape. The
+SQLite shard-file and Postgres `mixed` Rust cells were refreshed with `repeat 5`
+after the Rust provider performance pass; other non-SQLite rows are from the
+prior `repeat 1` smoke.
 Throughput columns are `processingWorkflowsPerSecond`; multiplier columns are
 relative to TypeScript. All rows reported `correct=true`.
 
@@ -196,13 +199,13 @@ relative to TypeScript. All rows reported `correct=true`.
 | SQLite single-file | signal | 669.84 | 7,802.72 | 11.65x | 883.02 | 1.32x |
 | SQLite single-file | timer | 665.41 | 7,291.62 | 10.96x | 1,558.81 | 2.34x |
 | SQLite single-file | child | 331.01 | 3,233.61 | 9.77x | 591.07 | 1.79x |
-| SQLite shard-file | mixed | 210.87 | 2,383.62 | 11.30x | 590.60 | 2.80x |
+| SQLite shard-file | mixed | 210.87 | 2,618.86 | 12.42x | 590.60 | 2.80x |
 | SQLite shard-file | bare | 661.47 | 8,261.76 | 12.49x | 2,605.52 | 3.94x |
 | SQLite shard-file | activity | 634.13 | 7,946.62 | 12.53x | 2,261.20 | 3.57x |
 | SQLite shard-file | signal | 662.98 | 8,484.31 | 12.80x | 1,309.73 | 1.98x |
 | SQLite shard-file | timer | 679.10 | 8,083.53 | 11.90x | 2,199.02 | 3.24x |
 | SQLite shard-file | child | 338.89 | 3,367.41 | 9.94x | 928.84 | 2.74x |
-| Postgres | mixed | 195.01 | 734.09 | 3.76x | 724.59 | 3.72x |
+| Postgres | mixed | 185.67 | 749.20 | 4.04x | 615.64 | 3.32x |
 | Postgres | bare | 606.29 | 2,292.31 | 3.78x | 1,250.35 | 2.06x |
 | Postgres | activity | 567.70 | 2,375.57 | 4.18x | 1,915.16 | 3.37x |
 | Postgres | signal | 581.93 | 2,666.37 | 4.58x | 1,241.35 | 2.13x |

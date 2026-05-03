@@ -130,16 +130,33 @@ func (w benchWorkflow) DispatchEvent(ctx context.Context, dctx *durable.Context,
 	switch event.Kind {
 	case "signal":
 		w.counters.Signals++
+		if w.mode == "mixed" {
+			return durable.Go(durable.PhaseSnapshot{
+				Name: "waiting_timer",
+				Data: map[string]any{
+					"child":  phase.Data,
+					"signal": event.Payload,
+				},
+			}), nil
+		}
 		w.counters.Workflows++
 		return durable.Complete(event.Payload), nil
 	case "timer":
 		w.counters.Timers++
+		if w.mode == "mixed" {
+			if _, err := durable.Activity[map[string]any](ctx, dctx, "finish_activity", func(context.Context) (map[string]any, error) {
+				w.counters.Activities++
+				return common.(map[string]any), nil
+			}); err != nil {
+				return durable.Fail(err), nil
+			}
+		}
 		w.counters.Workflows++
 		return durable.Complete(common), nil
 	case "child":
 		w.counters.ChildCompletions++
 		if w.mode == "mixed" {
-			return durable.Go(durable.PhaseSnapshot{Name: "waiting_timer", Data: phase.Data}), nil
+			return durable.Go(durable.PhaseSnapshot{Name: "waiting_signal", Data: phase.Data}), nil
 		}
 		w.counters.Workflows++
 		if event.Event == nil {
@@ -224,7 +241,7 @@ func main() {
 			fatal(err)
 		}
 		refs = append(refs, ref)
-		if opts.mode == "signal" {
+		if opts.mode == "signal" || opts.mode == "mixed" {
 			if _, err := runtime.Signal(ctx, workflow, ref, "finish", map[string]any{"index": float64(i)}); err != nil {
 				fatal(err)
 			}

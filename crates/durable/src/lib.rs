@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -3041,6 +3040,10 @@ enum JournalOperation {
         session: OpenShardInput,
         input: ClaimShardTasksInput,
     },
+    ClaimShardAndTasks {
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    },
     CreateInstance(CreateInstanceInput),
     CreateChildInstance(CreateChildInstanceInput),
     AppendSignal(AppendSignalInput),
@@ -3383,18 +3386,9 @@ impl DurabilityProvider for SqliteDurabilityProvider {
             input.clone(),
         )
         .await?;
-        if let Some((lease, _)) = &output {
-            self.append_journal_operation(JournalOperation::ClaimShard(claim))
+        if output.is_some() {
+            self.append_journal_operation(JournalOperation::ClaimShardAndTasks { claim, input })
                 .await?;
-            self.append_journal_operation(JournalOperation::ClaimShardTasks {
-                session: OpenShardInput {
-                    shard_id: lease.shard_id,
-                    owner_id: Some(lease.owner_id.clone()),
-                    lease_epoch: Some(lease.lease_epoch),
-                },
-                input,
-            })
-            .await?;
         }
         Ok(output)
     }
@@ -3864,6 +3858,18 @@ fn apply_journal_operation(
         JournalOperation::ClaimShardTasks { session, input } => {
             provider.claim_tasks_for_session(&session, input)?;
         }
+        JournalOperation::ClaimShardAndTasks { claim, input } => {
+            if let Some(lease) = provider.claim_shard_sync(claim)? {
+                provider.claim_tasks_for_session(
+                    &OpenShardInput {
+                        shard_id: lease.shard_id,
+                        owner_id: Some(lease.owner_id.clone()),
+                        lease_epoch: Some(lease.lease_epoch),
+                    },
+                    input,
+                )?;
+            }
+        }
         JournalOperation::CreateInstance(input) => {
             provider.create_instance(input)?;
         }
@@ -4167,20 +4173,69 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        let mut results = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            results.push(self.commit_checkpoint(input).await?);
+        let input_count = inputs.len();
+        let mut results = vec![None; input_count];
+        let mut groups: HashMap<u32, Vec<(usize, CommitCheckpointInput)>> = HashMap::new();
+
+        for (index, input) in inputs.into_iter().enumerate() {
+            let parent_shard =
+                workflow_partition_shard(&input.workflow_id, &input.run_id, self.shard_count);
+            if input
+                .child_starts
+                .iter()
+                .any(|start| start.partition_shard != parent_shard)
+            {
+                results[index] = Some(CommitCheckpointResult {
+                    ok: false,
+                    sequence: input.expected_sequence,
+                    reason: Some("cross_shard_child_start".to_string()),
+                    retryable: Some(false),
+                    error: Some(SerializedError {
+                            name: None,
+                            message: "SQLite shard-file provider requires commit-local children to stay on the parent shard".to_string(),
+                    }),
+                });
+                continue;
+            }
+            groups.entry(parent_shard).or_default().push((index, input));
         }
-        Ok(CommitActivationsResult { results })
+
+        for (shard_id, group) in groups {
+            let indices = group.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let group_inputs = group
+                .into_iter()
+                .map(|(_, input)| input)
+                .collect::<Vec<_>>();
+            let output = self
+                .provider_for_shard(shard_id)?
+                .commit_activations(group_inputs)
+                .await?;
+            for (index, result) in indices.into_iter().zip(output.results) {
+                results[index] = Some(result);
+            }
+        }
+
+        Ok(CommitActivationsResult {
+            results: results
+                .into_iter()
+                .map(|result| result.expect("all activation commit results are populated"))
+                .collect(),
+        })
     }
 
     async fn record_activation_failures(
         &self,
         inputs: Vec<RecordActivationFailureInput>,
     ) -> Result<(), WorkflowError> {
+        let mut groups: HashMap<u32, Vec<RecordActivationFailureInput>> = HashMap::new();
         for input in inputs {
-            self.provider_for_ref(&input.workflow_id, &input.run_id)?
-                .record_activation_failures(vec![input])
+            let shard_id =
+                workflow_partition_shard(&input.workflow_id, &input.run_id, self.shard_count);
+            groups.entry(shard_id).or_default().push(input);
+        }
+        for (shard_id, group) in groups {
+            self.provider_for_shard(shard_id)?
+                .record_activation_failures(group)
                 .await?;
         }
         Ok(())
@@ -4334,7 +4389,7 @@ pub struct PostgresDurabilityProvider {
 }
 
 struct PostgresClientPool {
-    clients: Vec<Arc<AsyncMutex<tokio_postgres::Client>>>,
+    clients: Vec<Arc<tokio_postgres::Client>>,
     next: AtomicUsize,
 }
 
@@ -4357,7 +4412,7 @@ impl PostgresClientPool {
                     ",
                 )
                 .await?;
-            clients.push(Arc::new(AsyncMutex::new(client)));
+            clients.push(Arc::new(client));
         }
         Ok(Self {
             clients,
@@ -4365,7 +4420,7 @@ impl PostgresClientPool {
         })
     }
 
-    fn next(&self) -> Arc<AsyncMutex<tokio_postgres::Client>> {
+    fn next(&self) -> Arc<tokio_postgres::Client> {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
         self.clients[index].clone()
     }
@@ -4402,8 +4457,7 @@ impl PostgresDurabilityProvider {
     }
 
     async fn initialize_postgres_schema(&self) -> Result<(), WorkflowError> {
-        let client_handle = self.pool.next();
-        let client = client_handle.lock().await;
+        let client = self.pool.next();
         client
             .batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {};",
@@ -4421,13 +4475,9 @@ impl PostgresDurabilityProvider {
                 quote_postgres_identifier(&self.schema)
             ))
             .await?;
-        self.verify_postgres_metadata_locked(
-            &client,
-            "postgres_storage_shape",
-            "rust_append_store_v1",
-        )
-        .await?;
-        self.verify_postgres_metadata_locked(
+        self.verify_postgres_metadata(&client, "postgres_storage_shape", "rust_append_store_v1")
+            .await?;
+        self.verify_postgres_metadata(
             &client,
             "physical_partition_count",
             &self.physical_partitions.to_string(),
@@ -4467,7 +4517,7 @@ impl PostgresDurabilityProvider {
         Ok(())
     }
 
-    async fn verify_postgres_metadata_locked(
+    async fn verify_postgres_metadata(
         &self,
         client: &tokio_postgres::Client,
         key: &str,
@@ -4507,11 +4557,19 @@ impl PostgresDurabilityProvider {
         &self,
         operation: JournalOperation,
     ) -> Result<(), WorkflowError> {
-        let operation_json = serde_json::to_string(&operation)?;
         let shard_id = self.postgres_shard_for_operation(&operation).await?;
+        self.append_postgres_operation_for_shard(shard_id, operation)
+            .await
+    }
+
+    async fn append_postgres_operation_for_shard(
+        &self,
+        shard_id: u32,
+        operation: JournalOperation,
+    ) -> Result<(), WorkflowError> {
+        let operation_json = serde_json::to_string(&operation)?;
         let shard_id_i32 = shard_id as i32;
-        let client_handle = self.pool.next();
-        let client = client_handle.lock().await;
+        let client = self.pool.next();
         let row = client
             .query_one(
                 &format!(
@@ -4557,8 +4615,7 @@ impl PostgresDurabilityProvider {
     }
 
     async fn load_postgres_store(&self) -> Result<Store, WorkflowError> {
-        let client_handle = self.pool.next();
-        let client = client_handle.lock().await;
+        let client = self.pool.next();
         let mut latest_snapshot: Option<(DateTime<Utc>, String)> = None;
         for partition in 0..self.physical_partitions {
             let snapshot = client
@@ -4639,6 +4696,7 @@ impl PostgresDurabilityProvider {
                 .await
                 .ok_or_else(|| WorkflowError::new("unknown activation shard for release")),
             JournalOperation::ClaimShardTasks { session, .. } => Ok(session.shard_id),
+            JournalOperation::ClaimShardAndTasks { claim, .. } => Ok(claim.shard_id),
             JournalOperation::CreateInstance(input) => Ok(input.partition_shard),
             JournalOperation::CreateChildInstance(input) => Ok(input.partition_shard),
             JournalOperation::AppendSignal(input) => {
@@ -4686,9 +4744,13 @@ impl PostgresDurabilityProvider {
     }
 
     async fn shard_for_ref(&self, workflow_id: &str, run_id: &str) -> Result<u32, WorkflowError> {
+        let ref_ = InstanceRef::new(workflow_id.to_string(), run_id.to_string());
+        if let Some(shard_id) = self.inner.directory_get(&ref_)? {
+            return Ok(shard_id);
+        }
         self.inner
             .load_instance(
-                &InstanceRef::new(workflow_id.to_string(), run_id.to_string()),
+                &ref_,
                 LoadInstanceOptions {
                     include_effects: false,
                 },
@@ -4776,18 +4838,9 @@ impl DurabilityProvider for PostgresDurabilityProvider {
             input.clone(),
         )
         .await?;
-        if let Some((lease, _)) = &output {
-            self.append_postgres_operation(JournalOperation::ClaimShard(claim))
+        if output.is_some() {
+            self.append_postgres_operation(JournalOperation::ClaimShardAndTasks { claim, input })
                 .await?;
-            self.append_postgres_operation(JournalOperation::ClaimShardTasks {
-                session: OpenShardInput {
-                    shard_id: lease.shard_id,
-                    owner_id: Some(lease.owner_id.clone()),
-                    lease_epoch: Some(lease.lease_epoch),
-                },
-                input,
-            })
-            .await?;
         }
         Ok(output)
     }
@@ -5026,7 +5079,10 @@ impl ShardDurabilitySession for PostgresShardSession {
         };
         let output = self.inner.claim_tasks(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::ClaimShardTasks { session, input })
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::ClaimShardTasks { session, input },
+            )
             .await?;
         Ok(output)
     }
@@ -5042,7 +5098,10 @@ impl ShardDurabilitySession for PostgresShardSession {
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         let output = self.inner.append_signal(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::AppendSignal(input))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::AppendSignal(input),
+            )
             .await?;
         Ok(output)
     }
@@ -5050,7 +5109,10 @@ impl ShardDurabilitySession for PostgresShardSession {
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
         self.inner.cancel_child(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::CancelChild(input))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::CancelChild(input),
+            )
             .await
     }
 
@@ -5079,11 +5141,14 @@ impl ShardDurabilitySession for PostgresShardSession {
                     WorkflowError::new(format!("reserved effect missing: {effect_id}"))
                 })?;
             self.provider
-                .append_postgres_operation(JournalOperation::PutEffectRecord {
-                    workflow_id: input.workflow_id,
-                    run_id: input.run_id,
-                    effect,
-                })
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::PutEffectRecord {
+                        workflow_id: input.workflow_id,
+                        run_id: input.run_id,
+                        effect,
+                    },
+                )
                 .await?;
         }
         Ok(output)
@@ -5092,21 +5157,30 @@ impl ShardDurabilitySession for PostgresShardSession {
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
         self.inner.heartbeat_effect(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::HeartbeatEffect(input))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::HeartbeatEffect(input),
+            )
             .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
         self.inner.complete_effect(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::CompleteEffect(input))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::CompleteEffect(input),
+            )
             .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
         let output = self.inner.fail_effect(input.clone()).await?;
         self.provider
-            .append_postgres_operation(JournalOperation::FailEffect(input))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::FailEffect(input),
+            )
             .await?;
         Ok(output)
     }
@@ -5118,7 +5192,10 @@ impl ShardDurabilitySession for PostgresShardSession {
         let output = self.inner.commit_checkpoint(input.clone()).await?;
         if output.ok {
             self.provider
-                .append_postgres_operation(JournalOperation::CommitCheckpoint(input))
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::CommitCheckpoint(input),
+                )
                 .await?;
         }
         Ok(output)
@@ -5131,7 +5208,10 @@ impl ShardDurabilitySession for PostgresShardSession {
         let output = self.inner.commit_activations(inputs.clone()).await?;
         if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
             self.provider
-                .append_postgres_operation(JournalOperation::CommitActivations(inputs))
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::CommitActivations(inputs),
+                )
                 .await?;
         }
         Ok(output)
@@ -5148,7 +5228,10 @@ impl ShardDurabilitySession for PostgresShardSession {
             .record_activation_failures(inputs.clone())
             .await?;
         self.provider
-            .append_postgres_operation(JournalOperation::RecordActivationFailures(inputs))
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::RecordActivationFailures(inputs),
+            )
             .await
     }
 
@@ -5161,10 +5244,13 @@ impl ShardDurabilitySession for PostgresShardSession {
             .release_activation(activation_id, worker_id)
             .await?;
         self.provider
-            .append_postgres_operation(JournalOperation::ReleaseActivation {
-                activation_id: activation_id.to_string(),
-                worker_id: worker_id.to_string(),
-            })
+            .append_postgres_operation_for_shard(
+                self.shard_id(),
+                JournalOperation::ReleaseActivation {
+                    activation_id: activation_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                },
+            )
             .await
     }
 
@@ -5172,12 +5258,15 @@ impl ShardDurabilitySession for PostgresShardSession {
         self.inner.heartbeat(now, lease_ms).await?;
         if let Some(owner_id) = self.owner_id() {
             self.provider
-                .append_postgres_operation(JournalOperation::HeartbeatShard {
-                    shard_id: self.shard_id(),
-                    owner_id: owner_id.to_string(),
-                    now,
-                    lease_ms,
-                })
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::HeartbeatShard {
+                        shard_id: self.shard_id(),
+                        owner_id: owner_id.to_string(),
+                        now,
+                        lease_ms,
+                    },
+                )
                 .await?;
         }
         Ok(())
@@ -5187,10 +5276,13 @@ impl ShardDurabilitySession for PostgresShardSession {
         self.inner.release().await?;
         if let Some(owner_id) = self.owner_id() {
             self.provider
-                .append_postgres_operation(JournalOperation::ReleaseShard {
-                    shard_id: self.shard_id(),
-                    owner_id: owner_id.to_string(),
-                })
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::ReleaseShard {
+                        shard_id: self.shard_id(),
+                        owner_id: owner_id.to_string(),
+                    },
+                )
                 .await?;
         }
         Ok(())
