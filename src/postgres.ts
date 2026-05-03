@@ -155,35 +155,51 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
 
   async claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null> {
     this.assertOpen()
-    await this.ensureShardHeadForShard(input.shardId)
     const leaseUntil = addMs(input.now, input.leaseMs)
-    const result = await this.query<{
+    const updateResult = await this.query<{
       owner_id: string
       lease_until: Date | string
       lease_epoch: string | number
     }>(
       `
-      INSERT INTO ${this.qSchema()}.dispatch_shards (shard_id, owner_id, lease_until, lease_epoch)
-      VALUES ($1, $2, $3::timestamptz, 1)
-      ON CONFLICT (shard_id) DO UPDATE SET
-        owner_id = EXCLUDED.owner_id,
-        lease_until = EXCLUDED.lease_until,
+      UPDATE ${this.qSchema()}.dispatch_shards
+      SET owner_id = $2,
+        lease_until = $3::timestamptz,
         lease_epoch = CASE
-          WHEN ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
-            AND ${this.qSchema()}.dispatch_shards.lease_until IS NOT NULL
-            AND ${this.qSchema()}.dispatch_shards.lease_until > $4::timestamptz
-          THEN ${this.qSchema()}.dispatch_shards.lease_epoch
-          ELSE ${this.qSchema()}.dispatch_shards.lease_epoch + 1
+          WHEN owner_id = $2
+            AND lease_until IS NOT NULL
+            AND lease_until > $4::timestamptz
+          THEN lease_epoch
+          ELSE lease_epoch + 1
         END
-      WHERE ${this.qSchema()}.dispatch_shards.owner_id IS NULL
-        OR ${this.qSchema()}.dispatch_shards.owner_id = EXCLUDED.owner_id
-        OR ${this.qSchema()}.dispatch_shards.lease_until IS NULL
-        OR ${this.qSchema()}.dispatch_shards.lease_until <= $5::timestamptz
+      WHERE shard_id = $1
+        AND (
+          owner_id IS NULL
+          OR owner_id = $2
+          OR lease_until IS NULL
+          OR lease_until <= $5::timestamptz
+        )
       RETURNING owner_id, lease_until, lease_epoch
       `,
       [input.shardId, input.ownerId, leaseUntil, input.now, input.now],
     )
-    const row = result.rows[0]
+    let row = updateResult.rows[0]
+    if (!row) {
+      const insertResult = await this.query<{
+        owner_id: string
+        lease_until: Date | string
+        lease_epoch: string | number
+      }>(
+        `
+        INSERT INTO ${this.qSchema()}.dispatch_shards (shard_id, owner_id, lease_until, lease_epoch)
+        VALUES ($1, $2, $3::timestamptz, 1)
+        ON CONFLICT (shard_id) DO NOTHING
+        RETURNING owner_id, lease_until, lease_epoch
+        `,
+        [input.shardId, input.ownerId, leaseUntil],
+      )
+      row = insertResult.rows[0]
+    }
     const lease = !row || row.owner_id !== input.ownerId
       ? null
       : {
@@ -733,7 +749,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       CREATE TABLE IF NOT EXISTS ${this.table("shard_journal", partition)} (
         shard_id INTEGER NOT NULL,
         entry_id BIGINT NOT NULL,
-        operation_json JSONB NOT NULL,
+        operation_json TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (shard_id, entry_id)
       );
@@ -922,7 +938,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       inserted AS (
         INSERT INTO ${this.journalTableForShard(shardId)}
           (shard_id, entry_id, operation_json, created_at)
-        SELECT $1, $3, $4::jsonb, $5::timestamptz
+        SELECT $1, $3, $4, $5::timestamptz
         FROM updated_head
         RETURNING entry_id
       )
@@ -1049,21 +1065,6 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
       return
     }
     await client.query(
-      `
-      INSERT INTO ${this.headTableForShard(shardId)} (shard_id, last_entry_id, updated_at)
-      VALUES ($1, 0, now())
-      ON CONFLICT (shard_id) DO NOTHING
-      `,
-      [shardId],
-    )
-    this.ensuredShardHeads.add(shardId)
-  }
-
-  private async ensureShardHeadForShard(shardId: number): Promise<void> {
-    if (this.ensuredShardHeads.has(shardId)) {
-      return
-    }
-    await this.query(
       `
       INSERT INTO ${this.headTableForShard(shardId)} (shard_id, last_entry_id, updated_at)
       VALUES ($1, 0, now())
