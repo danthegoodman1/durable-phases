@@ -1024,3 +1024,89 @@ workflow! {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn benchmark_verification_rejects_skipped_mixed_activity_work() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_counters();
+        WORKFLOW_STARTS.store(1, Ordering::Relaxed);
+        SIGNALS.store(1, Ordering::Relaxed);
+        CHILD_STARTS.store(1, Ordering::Relaxed);
+        CHILD_COMPLETIONS.store(1, Ordering::Relaxed);
+        TIMER_HANDLERS.store(1, Ordering::Relaxed);
+        ACTIVITIES.store(2, Ordering::Relaxed);
+
+        let options = test_options(BenchMode::Mixed, 1);
+        let instances = vec![completed_instance(BenchMode::Mixed, 0, 1_000)];
+        let error = verify_benchmark(&options, &instances, 5).unwrap_err();
+
+        assert!(
+            error
+                .message
+                .contains("counter activities was 2, expected 3"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn benchmark_verification_accepts_child_mode_without_child_activity() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_counters();
+        WORKFLOW_STARTS.store(1, Ordering::Relaxed);
+        CHILD_STARTS.store(1, Ordering::Relaxed);
+        CHILD_COMPLETIONS.store(1, Ordering::Relaxed);
+
+        let options = test_options(BenchMode::Child, 1);
+        let instances = vec![completed_instance(BenchMode::Child, 0, 0)];
+
+        verify_benchmark(&options, &instances, 3).unwrap();
+    }
+
+    fn test_options(mode: BenchMode, workflows: usize) -> BenchOptions {
+        BenchOptions {
+            provider: BenchProvider::Null,
+            mode,
+            workflows,
+            workers: 1,
+            shards: 1,
+            activation_concurrency: 1,
+            activation_prefetch_limit: 1,
+            batch: 1,
+            max_rounds: 10,
+            path: None,
+            postgres_url: None,
+            physical_partitions: 1,
+            json: true,
+        }
+    }
+
+    fn completed_instance(mode: BenchMode, index: usize, value: usize) -> PersistedInstance {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        PersistedInstance {
+            workflow_name: "benchmark_test".to_string(),
+            workflow_version: 1,
+            workflow_id: format!("{}-bench-{index}", mode.as_str()),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            sequence: 1,
+            status: PersistedStatus::Completed,
+            common: None,
+            phase: None,
+            output: Some(json!({ "index": index, "value": value })),
+            error: None,
+            cancel_reason: None,
+            waits: Vec::new(),
+            effects: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            parent: None,
+        }
+    }
+}

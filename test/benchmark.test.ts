@@ -30,6 +30,7 @@ describe("SQLite benchmark", () => {
     expect(result.completedWorkflows).toBe(6)
     expect(result.backend).toBe("sqlite")
     expect(result.mode).toBe("mixed")
+    expect(result.correct).toBe(true)
     expect(result.sqliteLayout).toBe("single-file")
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
@@ -60,6 +61,7 @@ describe("SQLite benchmark", () => {
     }))
 
     expect(result.sqliteLayout).toBe("shard-files")
+    expect(result.correct).toBe(true)
     expect(result.completedWorkflows).toBe(8)
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.counters.childStarts).toBe(8)
@@ -74,6 +76,7 @@ describe("SQLite benchmark", () => {
     }))
 
     expect(result.mode).toBe("bare")
+    expect(result.correct).toBe(true)
     expect(result.expectedActivations).toBe(4)
     expect(result.queryProfile).toMatchObject({
       totalQueries: expect.any(Number),

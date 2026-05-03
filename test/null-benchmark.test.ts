@@ -61,6 +61,7 @@ describe("Null durability benchmark", () => {
 
     expect(result.backend).toBe("null")
     expect(result.mode).toBe("mixed")
+    expect(result.correct).toBe(true)
     expect(result.completedWorkflows).toBe(6)
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
@@ -87,6 +88,7 @@ describe("Null durability benchmark", () => {
 
     expect(result.backend).toBe("null")
     expect(result.mode).toBe("bare")
+    expect(result.correct).toBe(true)
     expect(result.completedWorkflows).toBe(10)
     expect(result.activations).toBe(10)
     expect(result.expectedActivations).toBe(10)
@@ -103,6 +105,7 @@ describe("Null durability benchmark", () => {
     }))
 
     expect(result.completedWorkflows).toBe(4)
+    expect(result.correct).toBe(true)
     expect(result.activations).toBe(4)
     expect(result.options.workflowOffset).toBe(20)
   })
@@ -175,6 +178,7 @@ describe("Null durability benchmark", () => {
 
       expect(result.backend).toBe("null")
       expect(result.mode).toBe(mode)
+      expect(result.correct).toBe(true)
       expect(result.completedWorkflows).toBe(4)
       expect(result.activations).toBe(result.expectedActivations)
       expect(result.processingActivationsPerSecond).toBeGreaterThan(0)
@@ -419,6 +423,7 @@ function fakeChildResult(options: NullBenchmarkOptions) {
   return {
     backend: "null" as const,
     mode: options.mode,
+    correct: true,
     options,
     elapsedMs: 10,
     setupMs: 1,

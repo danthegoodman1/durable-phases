@@ -26,10 +26,10 @@ for (const provider of providers) {
         samples.push(runJson(commandFor(runtime, provider, mode, options)))
       }
       const medianScore = median(samples.map(score))
-      const correct = samples.every((sample) => sample.correct !== false)
+      const correct = samples.every((sample) => sample.correct === true)
       row[runtime] = { workflowsPerSecond: medianScore, correct }
       if (!correct) {
-        failures.push({ provider, mode, runtime, reason: "correct=false" })
+        failures.push({ provider, mode, runtime, reason: "correct-not-true" })
       }
     }
     results.push(row)

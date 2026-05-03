@@ -53,6 +53,7 @@ describeIfPostgres("Postgres benchmark", () => {
 
     expect(result.backend).toBe("postgres")
     expect(result.mode).toBe("mixed")
+    expect(result.correct).toBe(true)
     expect(result.completedWorkflows).toBe(6)
     expect(result.activations).toBe(result.expectedActivations)
     expect(result.expectedActivations).toBe(30)
@@ -122,6 +123,7 @@ describeIfPostgres("Postgres benchmark", () => {
       }),
     )
     expect(result.mode).toBe("bare")
+    expect(result.correct).toBe(true)
     expect(result.completedWorkflows).toBe(4)
     expect(result.expectedActivations).toBe(4)
     expect(result.activations).toBe(4)

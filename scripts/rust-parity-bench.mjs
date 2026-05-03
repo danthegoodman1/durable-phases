@@ -21,6 +21,12 @@ for (const provider of providers) {
       ts.push(runJson(tsCommand(provider, mode, options)))
       rust.push(runJson(rustCommand(provider, mode, options)))
     }
+    if (!ts.every((sample) => sample.correct === true)) {
+      failures.push({ provider, mode, runtime: "ts", reason: "correct-not-true" })
+    }
+    if (!rust.every((sample) => sample.correct === true)) {
+      failures.push({ provider, mode, runtime: "rust", reason: "correct-not-true" })
+    }
     const tsMedian = median(ts.map(score))
     const rustMedian = median(rust.map(score))
     const ratio = tsMedian === 0 ? 1 : rustMedian / tsMedian
@@ -30,7 +36,7 @@ for (const provider of providers) {
       `${provider} ${mode}: TS ${tsMedian.toFixed(2)} workflows/s, Rust ${rustMedian.toFixed(2)} workflows/s, ratio ${ratio.toFixed(3)}\n`,
     )
     if (rustMedian < tsMedian) {
-      failures.push(row)
+      failures.push({ ...row, reason: "rust-slower-than-ts" })
     }
   }
 }
