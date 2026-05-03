@@ -149,19 +149,18 @@ shared Postgres schema with disjoint shard ranges.
 Rust parity is checked by running matching TS and Rust JSON benchmarks on the
 same machine and comparing median `processingWorkflowsPerSecond`. A ratio above
 `1.0x` means Rust is faster than TypeScript for that provider/mode pair.
-The Rust crate no longer exposes the old JSON-file provider; examples and
-restart tests use the null, SQLite, SQLite shard-file, or Postgres providers.
-Rust execution is now routed through shard-owned Tokio actors rather than a
-private global `Arc<Mutex<Store>>`. SQLite writes are owned by a dedicated
-blocking writer, and Postgres uses a round-robin async client pool.
+The Rust crate no longer exposes a JSON-file provider; examples and restart
+tests use the null, SQLite, SQLite shard-file, or Postgres providers. Rust
+execution is routed through shard-owned Tokio actors. SQLite writes are owned
+by a dedicated blocking writer, and Postgres uses a round-robin async client
+pool.
 
 ```bash
 npm run benchmark:rust-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 3 --physical-partitions 2
 npm run benchmark:rust-parity -- --provider null --mode all --workflows 100 --workers 4 --shards 4 --repeat 3
 ```
 
-Latest local parity gate after the Rust shard-actor refactor, `20` workflows,
-`2` workers, `2` shards, repeat `3`:
+Latest local parity gate, `20` workflows, `2` workers, `2` shards, repeat `3`:
 
 | Provider | mixed | bare | activity | signal | timer | child |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -176,19 +175,6 @@ Focused null-provider rerun, `100` workflows, `4` workers, `4` shards, repeat
 | Provider | mixed | bare | activity | signal | timer | child |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Null | 2.565x | 6.388x | 7.489x | 5.712x | 7.034x | 3.861x |
-
-These parity ratios compare Rust to TypeScript. A Rust-only null-provider
-spot check against the previous private mutex-backed Rust slice now also clears
-the old ceiling on `processingWorkflowsPerSecond`:
-
-| Mode | Previous mutex-backed Rust | Shard-actor Rust | Ratio |
-| --- | ---: | ---: | ---: |
-| mixed | 6,918.84 | 6,945.47 | 1.004x |
-| bare | 54,933.74 | 70,663.04 | 1.286x |
-| activity | 60,604.55 | 67,844.54 | 1.119x |
-| signal | 54,774.53 | 57,553.96 | 1.051x |
-| timer | 59,585.88 | 64,301.78 | 1.079x |
-| child | 11,163.41 | 13,675.06 | 1.225x |
 
 ## Provider conformance
 
