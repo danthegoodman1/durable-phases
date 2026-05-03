@@ -109,6 +109,7 @@ export type PostgresBenchmarkDiagnostics = {
 export type PostgresBenchmarkResult = {
   backend: "postgres"
   mode: NullBenchmarkMode
+  correct: boolean
   options: Omit<PostgresBenchmarkOptions, "connectionString"> & {
     connectionString: string
   }
@@ -316,6 +317,7 @@ export async function runPostgresBenchmark(
     }
 
     workload.verify(instances, options.workflows, options.workflowOffset)
+    workload.verifyCounters(counters, options.workflows)
     const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
     const setupMs = setupFinishedAt - setupStartedAt
@@ -328,6 +330,7 @@ export async function runPostgresBenchmark(
     const result: PostgresBenchmarkResult = {
       backend: "postgres",
       mode: options.mode,
+      correct: true,
       options: {
         ...options,
         connectionString: redactConnectionString(options.connectionString),

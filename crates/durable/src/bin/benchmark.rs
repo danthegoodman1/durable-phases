@@ -1,11 +1,12 @@
 use chrono::{DateTime, TimeZone, Utc};
 use durable::{
     complete, go, start, workflow, ChildEvent, ChildHandle, ChildOptions, DrainOptions,
-    DurabilityProvider, DurableRuntime, InstanceRef, ParentClosePolicy, RuntimeOptions,
-    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkflowError,
+    DurabilityProvider, DurableRuntime, InstanceRef, ParentClosePolicy, PersistedInstance,
+    PersistedStatus, RuntimeOptions, SqliteDurabilityProvider, SqliteShardFileDurabilityProvider,
+    StartOptions, WorkflowError,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,19 +184,25 @@ async fn async_main() -> Result<(), WorkflowError> {
     }
     let processing_ms = processing_started_at.elapsed().as_secs_f64() * 1_000.0;
     let verify_started_at = Instant::now();
-    let completed = completed_count(provider.as_ref(), &refs).await?;
+    let root_instances = load_root_instances(provider.as_ref(), &refs).await?;
+    let completed = root_instances
+        .iter()
+        .filter(|instance| instance.status == PersistedStatus::Completed)
+        .count();
     if completed != options.workflows {
         return Err(WorkflowError::new(format!(
             "benchmark did not complete: {completed}/{} workflows completed",
             options.workflows
         )));
     }
+    verify_benchmark(&options, &root_instances, activations)?;
     let verify_ms = verify_started_at.elapsed().as_secs_f64() * 1_000.0;
     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     let mixed_actions = mixed_actions();
     let output = json!({
         "backend": options.provider.as_str(),
         "mode": options.mode.as_str(),
+        "correct": true,
         "options": options.to_json(),
         "elapsedMs": elapsed_ms,
         "setupMs": setup_ms,
@@ -243,7 +250,7 @@ fn register_mode(runtime: &DurableRuntime, mode: BenchMode) -> Result<(), Workfl
         BenchMode::Signal => runtime.register::<SignalWorkflow>(),
         BenchMode::Timer => runtime.register::<TimerWorkflow>(),
         BenchMode::Child => {
-            runtime.register::<BenchChildWorkflow>()?;
+            runtime.register::<BenchChildOnlyWorkflow>()?;
             runtime.register::<ChildParentWorkflow>()
         }
         BenchMode::Mixed => {
@@ -273,6 +280,163 @@ async fn completed_count(
         }
     }
     Ok(completed)
+}
+
+async fn load_root_instances(
+    provider: &dyn DurabilityProvider,
+    refs: &[InstanceRef],
+) -> Result<Vec<PersistedInstance>, WorkflowError> {
+    let mut instances = Vec::with_capacity(refs.len());
+    for ref_ in refs {
+        let instance = provider
+            .load_instance(
+                ref_,
+                durable::LoadInstanceOptions {
+                    include_effects: false,
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                WorkflowError::new(format!(
+                    "missing workflow instance: {}/{}",
+                    ref_.workflow_id, ref_.run_id
+                ))
+            })?;
+        instances.push(instance);
+    }
+    Ok(instances)
+}
+
+fn verify_benchmark(
+    options: &BenchOptions,
+    instances: &[PersistedInstance],
+    activations: usize,
+) -> Result<(), WorkflowError> {
+    let expected_activations = options.workflows * options.mode.activations_per_workflow();
+    if activations != expected_activations {
+        return Err(WorkflowError::new(format!(
+            "benchmark processed {activations} activations, expected {expected_activations}"
+        )));
+    }
+    for (index, instance) in instances.iter().enumerate() {
+        let expected_workflow_id = format!("{}-bench-{index}", options.mode.as_str());
+        if instance.workflow_id != expected_workflow_id {
+            return Err(WorkflowError::new(format!(
+                "unexpected workflow id at index {index}: {}",
+                instance.workflow_id
+            )));
+        }
+        if instance.status != PersistedStatus::Completed {
+            return Err(WorkflowError::new(format!(
+                "workflow {expected_workflow_id} finished with status {:?}",
+                instance.status
+            )));
+        }
+        let output = instance.output.as_ref().ok_or_else(|| {
+            WorkflowError::new(format!("workflow {expected_workflow_id} missing output"))
+        })?;
+        let output_index = output_usize(output, "index", &expected_workflow_id)?;
+        if output_index != index {
+            return Err(WorkflowError::new(format!(
+                "workflow {expected_workflow_id} output index {output_index}, expected {index}"
+            )));
+        }
+        let value = output_usize(output, "value", &expected_workflow_id)?;
+        let expected_value = match options.mode {
+            BenchMode::Mixed => index * 10 + index + 1_000,
+            BenchMode::Signal => index + 1_000,
+            BenchMode::Child => index * 10,
+            BenchMode::Bare | BenchMode::Activity | BenchMode::Timer => index,
+        };
+        if value != expected_value {
+            return Err(WorkflowError::new(format!(
+                "workflow {expected_workflow_id} output value {value}, expected {expected_value}"
+            )));
+        }
+    }
+
+    let workflows = options.workflows as u64;
+    expect_counter(
+        "workflowStarts",
+        WORKFLOW_STARTS.load(Ordering::Relaxed),
+        workflows,
+    )?;
+    expect_counter(
+        "signals",
+        SIGNALS.load(Ordering::Relaxed),
+        if matches!(options.mode, BenchMode::Signal | BenchMode::Mixed) {
+            workflows
+        } else {
+            0
+        },
+    )?;
+    expect_counter(
+        "childStarts",
+        CHILD_STARTS.load(Ordering::Relaxed),
+        if matches!(options.mode, BenchMode::Child | BenchMode::Mixed) {
+            workflows
+        } else {
+            0
+        },
+    )?;
+    expect_counter(
+        "childCompletions",
+        CHILD_COMPLETIONS.load(Ordering::Relaxed),
+        if matches!(options.mode, BenchMode::Child | BenchMode::Mixed) {
+            workflows
+        } else {
+            0
+        },
+    )?;
+    expect_counter(
+        "timerHandlers",
+        TIMER_HANDLERS.load(Ordering::Relaxed),
+        if matches!(options.mode, BenchMode::Timer | BenchMode::Mixed) {
+            workflows
+        } else {
+            0
+        },
+    )?;
+    let expected_activities = match options.mode {
+        BenchMode::Activity => workflows,
+        BenchMode::Mixed => workflows * 3,
+        BenchMode::Bare | BenchMode::Signal | BenchMode::Timer | BenchMode::Child => 0,
+    };
+    expect_counter(
+        "activities",
+        ACTIVITIES.load(Ordering::Relaxed),
+        expected_activities,
+    )?;
+    Ok(())
+}
+
+fn output_usize(
+    output: &JsonValue,
+    field: &str,
+    workflow_id: &str,
+) -> Result<usize, WorkflowError> {
+    let value = output
+        .get(field)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            WorkflowError::new(format!(
+                "workflow {workflow_id} missing numeric output field {field}"
+            ))
+        })?;
+    usize::try_from(value).map_err(|error| {
+        WorkflowError::new(format!(
+            "workflow {workflow_id} output field {field} out of range: {error}"
+        ))
+    })
+}
+
+fn expect_counter(name: &str, actual: u64, expected: u64) -> Result<(), WorkflowError> {
+    if actual != expected {
+        return Err(WorkflowError::new(format!(
+            "counter {name} was {actual}, expected {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn reset_counters() {
@@ -587,7 +751,7 @@ pub struct ChildInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WaitingChild {
     index: usize,
-    handle: ChildHandle<BenchChildWorkflow>,
+    handle: ChildHandle<BenchChildOnlyWorkflow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -704,6 +868,26 @@ workflow! {
 }
 
 workflow! {
+    pub workflow BenchChildOnlyWorkflow {
+        name: "rust_bench_child_only_child",
+        version: 1,
+        input: ChildInput,
+        output: BenchOutput,
+        common: ChildInput,
+
+        initial(input) {
+            start! { common: input.clone(), phase: run(Empty {}) }
+        }
+
+        phase run(_data: Empty) {
+            run async |common| {
+                complete!(BenchOutput { index: common.index, value: common.index * 10 })
+            }
+        }
+    }
+}
+
+workflow! {
     pub workflow BenchChildWorkflow {
         name: "rust_bench_child",
         version: 1,
@@ -742,7 +926,7 @@ workflow! {
 
         phase boot(_data: Empty) {
             run async |ctx, common| {
-                let handle = ctx.child_start::<BenchChildWorkflow>(
+                let handle = ctx.child_start::<BenchChildOnlyWorkflow>(
                     "child",
                     ChildInput { index: common.index },
                     ChildOptions {

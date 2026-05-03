@@ -73,6 +73,7 @@ export type SqliteQueryProfile = {
 export type BenchmarkResult = {
   backend: "sqlite"
   mode: NullBenchmarkMode
+  correct: boolean
   sqliteLayout: BenchmarkOptions["sqliteLayout"]
   options: BenchmarkOptions
   elapsedMs: number
@@ -260,6 +261,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
     }
 
     workload.verify(instances, options.workflows, options.workflowOffset)
+    workload.verifyCounters(counters, options.workflows)
     const claims = await verifier.listActivationClaims()
     const committedWorkers = new Set(
       claims
@@ -279,6 +281,7 @@ export async function runSqliteBenchmark(options: BenchmarkOptions): Promise<Ben
     return {
       backend: "sqlite",
       mode: options.mode,
+      correct: true,
       sqliteLayout: options.sqliteLayout,
       options,
       elapsedMs,

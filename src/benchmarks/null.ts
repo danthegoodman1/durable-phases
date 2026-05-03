@@ -46,6 +46,7 @@ export type NullBenchmarkOptions = {
 export type NullBenchmarkResult = {
   backend: "null"
   mode: NullBenchmarkMode
+  correct: boolean
   options: NullBenchmarkOptions
   elapsedMs: number
   setupMs: number
@@ -194,6 +195,7 @@ export async function runNullBenchmark(
     }
 
     workload.verify(instances, options.workflows, options.workflowOffset)
+    workload.verifyCounters(counters, options.workflows)
 
     const mixedActions = workload.actionCount(counters, activations)
     const verifyFinishedAt = performance.now()
@@ -207,6 +209,7 @@ export async function runNullBenchmark(
     return {
       backend: "null",
       mode: options.mode,
+      correct: true,
       options,
       elapsedMs,
       setupMs,
@@ -287,6 +290,7 @@ export type NullWorkload = {
   activationsPerWorkflow: number
   appendFinishSignal: boolean
   verify(instances: PersistedInstance[], expected: number, offset: number): void
+  verifyCounters(counters: BenchmarkCounters, expected: number): void
   actionCount(counters: BenchmarkCounters, activations: number): number
 }
 
@@ -304,6 +308,7 @@ export function createNullBenchmarkWorkload(
       appendFinishSignal: true,
       verify: (instances, expected, offset) =>
         verifyBenchmarkOutputsForPrefix(instances, expected, offset, "mixed-bench"),
+      verifyCounters: verifyBenchmarkCounters,
       actionCount: (currentCounters) => mixedActionCount(currentCounters),
     }
   }
@@ -337,6 +342,8 @@ export function createNullBenchmarkWorkload(
       appendFinishSignal: false,
       verify: (instances, expected, offset) =>
         verifySimpleOutputs(instances, expected, offset, "bench_activity", "activity-bench"),
+      verifyCounters: (currentCounters, expected) =>
+        verifyExpectedCounters(currentCounters, expected, { bootActivities: expected }),
       actionCount: (currentCounters, activations) => activations + currentCounters.bootActivities,
     }
   }
@@ -369,6 +376,8 @@ export function createNullBenchmarkWorkload(
       appendFinishSignal: true,
       verify: (instances, expected, offset) =>
         verifySignalOutputs(instances, expected, offset),
+      verifyCounters: (currentCounters, expected) =>
+        verifyExpectedCounters(currentCounters, expected, { signals: expected }),
       actionCount: (currentCounters, activations) => activations + currentCounters.signals,
     }
   }
@@ -409,6 +418,8 @@ export function createNullBenchmarkWorkload(
       appendFinishSignal: false,
       verify: (instances, expected, offset) =>
         verifySimpleOutputs(instances, expected, offset, "bench_timer", "timer-bench"),
+      verifyCounters: (currentCounters, expected) =>
+        verifyExpectedCounters(currentCounters, expected, { timerHandlers: expected }),
       actionCount: (currentCounters, activations) => activations + currentCounters.timerHandlers,
     }
   }
@@ -470,6 +481,11 @@ export function createNullBenchmarkWorkload(
       appendFinishSignal: false,
       verify: (instances, expected, offset) =>
         verifyChildOutputs(instances, expected, offset),
+      verifyCounters: (currentCounters, expected) =>
+        verifyExpectedCounters(currentCounters, expected, {
+          childStarts: expected,
+          childCompletions: expected,
+        }),
       actionCount: (currentCounters, activations) =>
         activations + currentCounters.childStarts + currentCounters.childCompletions,
     }
@@ -501,7 +517,31 @@ function createBareBenchmarkWorkload(): NullWorkload {
     activationsPerWorkflow: 1,
     appendFinishSignal: false,
     verify: verifyBareBenchmarkOutputs,
+    verifyCounters: verifyExpectedCounters,
     actionCount: (_counters, activations) => activations,
+  }
+}
+
+function verifyExpectedCounters(
+  counters: BenchmarkCounters,
+  expected: number,
+  overrides: Partial<BenchmarkCounters> = {},
+): void {
+  const expectedCounters: BenchmarkCounters = {
+    workflowStarts: expected,
+    signals: 0,
+    childStarts: 0,
+    childCompletions: 0,
+    timerHandlers: 0,
+    bootActivities: 0,
+    childActivities: 0,
+    finishActivities: 0,
+    ...overrides,
+  }
+  for (const key of Object.keys(expectedCounters) as Array<keyof BenchmarkCounters>) {
+    if (counters[key] !== expectedCounters[key]) {
+      throw new Error(`Expected ${key} to be ${expectedCounters[key]}, got ${counters[key]}`)
+    }
   }
 }
 
