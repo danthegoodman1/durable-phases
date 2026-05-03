@@ -30,6 +30,7 @@
     "benchmark:postgres": "tsx src/benchmarks/postgres.ts",
     "benchmark:postgres:diagnose": "tsx src/benchmarks/postgres.ts --diagnose",
     "benchmark:postgres:processes": "tsx src/benchmarks/postgres-processes.ts",
+    "benchmark:rust-parity": "node scripts/rust-parity-bench.mjs",
     "postgres:up": "docker compose -f docker-compose.postgres.yml up -d --wait",
     "postgres:down": "docker compose -f docker-compose.postgres.yml down -v",
     "test:postgres": "DURABLE_POSTGRES_URL=${DURABLE_POSTGRES_URL:-postgresql://durable:durable@127.0.0.1:55432/durable} vitest run test/postgres-conformance.test.ts test/postgres.test.ts test/postgres-benchmark.test.ts",

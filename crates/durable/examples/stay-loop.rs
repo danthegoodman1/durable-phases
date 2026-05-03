@@ -1,11 +1,11 @@
 /*
- * Shows the bounded unbound-loop pattern with `checkpoint!()`:
- * each immediate activation processes a small chunk, checkpoints progress into
+ * Shows the bounded unbound-loop pattern with `stay!()`:
+ * each immediate activation processes a small chunk, stores progress into
  * phase data, and the runtime re-enters the same run phase until complete.
  */
 
 use durable::{
-    checkpoint, complete, start, workflow, DrainOptions, DurableRuntime, InstanceRef,
+    complete, start, stay, workflow, DrainOptions, DurableRuntime, InstanceRef,
     JsonFileDurabilityProvider, PersistedInstance, PersistedStatus, StartOptions, WorkflowError,
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ struct ProcessBatch {
 
 workflow! {
     workflow BatchWorkflow {
-        name: "demo_checkpoint_loop",
+        name: "demo_stay_loop",
         version: 1,
         input: BatchInput,
         output: BatchOutput,
@@ -77,7 +77,7 @@ workflow! {
                     })
                     .await?;
 
-                checkpoint!(process_batch(ProcessBatch {
+                stay!(process_batch(ProcessBatch {
                     cursor: data.cursor + processed_chunk.len(),
                     items: data.items,
                     processed: {
@@ -91,8 +91,8 @@ workflow! {
     }
 }
 
-pub async fn run_checkpoint_loop_demo() -> Result<(), WorkflowError> {
-    let path = reset_demo_store("checkpoint-loop")?;
+pub async fn run_stay_loop_demo() -> Result<(), WorkflowError> {
+    let path = reset_demo_store("stay-loop")?;
     let provider = JsonFileDurabilityProvider::new(path)?;
     let runtime = DurableRuntime::new(provider.clone());
 
@@ -115,13 +115,13 @@ pub async fn run_checkpoint_loop_demo() -> Result<(), WorkflowError> {
         .await?;
 
     runtime.drain(DrainOptions::default()).await?;
-    print_committed("checkpoint loop: completed", &provider, &ref_)
+    print_committed("stay loop: completed", &provider, &ref_)
 }
 
 #[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), WorkflowError> {
-    run_checkpoint_loop_demo().await
+    run_stay_loop_demo().await
 }
 
 fn demo_store_path(name: &str) -> PathBuf {

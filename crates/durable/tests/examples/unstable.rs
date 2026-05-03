@@ -5,7 +5,7 @@
  * instead of running the side effect again.
  */
 
-use durable::{complete, start, workflow, WorkflowError};
+use durable::{complete, start, workflow, ActivityDurability, ActivityOptions, WorkflowError};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -52,10 +52,17 @@ workflow! {
 
         phase unstable(data: UnstablePhase) {
             run async |ctx| {
-                let result: UnstableOutput = ctx.activity("side_effect_once", || async {
-                    UNSTABLE_ACTIVITY_CALLS.fetch_add(1, Ordering::SeqCst);
-                    Ok(UnstableOutput { ok: true })
-                }).await?;
+                let result: UnstableOutput = ctx.activity_with_options(
+                    "side_effect_once",
+                    ActivityOptions {
+                        durability: ActivityDurability::Eager,
+                        ..ActivityOptions::default()
+                    },
+                    |_| async {
+                        UNSTABLE_ACTIVITY_CALLS.fetch_add(1, Ordering::SeqCst);
+                        Ok(UnstableOutput { ok: true })
+                    },
+                ).await?;
 
                 if UNSTABLE_SHOULD_THROW.swap(false, Ordering::SeqCst) {
                     return Err(WorkflowError::new("boom after durable effect"));

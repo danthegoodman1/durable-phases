@@ -2,14 +2,13 @@
  * Shows the core durable workflow patterns from the TypeScript demos in one
  * compact Rust workflow:
  * immediate run-phase handoffs around a durable signal, durable timer waits
- * with `stay!()`, the bounded unbound-loop pattern with `checkpoint!()`, and
+ * with `stay!()`, the bounded unbound-loop pattern with `stay!()`, and
  * a local child workflow wait that survives runtime reconstruction.
  */
 
 use chrono::{DateTime, Duration, Utc};
 use durable::{
-    checkpoint, complete, go, start, stay, workflow, ChildEvent, ChildHandle, ChildOptions,
-    InstanceSnapshot,
+    complete, go, start, stay, workflow, ChildEvent, ChildHandle, ChildOptions, InstanceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -258,7 +257,7 @@ workflow! {
                         Ok(format!("{item}!"))
                     }).await?;
 
-                    return checkpoint!(processing(Processing {
+                    return stay!(processing(Processing {
                         items: data.items,
                         cursor: data.cursor + 1,
                         processed: {

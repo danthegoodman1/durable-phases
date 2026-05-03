@@ -11,12 +11,15 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializedError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub message: String,
 }
 
@@ -53,6 +56,18 @@ impl From<std::io::Error> for WorkflowError {
     }
 }
 
+impl From<rusqlite::Error> for WorkflowError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<tokio_postgres::Error> for WorkflowError {
+    fn from(error: tokio_postgres::Error) -> Self {
+        Self::new(format!("{error:?}"))
+    }
+}
+
 impl From<&str> for WorkflowError {
     fn from(message: &str) -> Self {
         Self::new(message)
@@ -68,6 +83,7 @@ impl From<String> for WorkflowError {
 impl From<WorkflowError> for SerializedError {
     fn from(error: WorkflowError) -> Self {
         Self {
+            name: None,
             message: error.message,
         }
     }
@@ -294,14 +310,39 @@ pub enum ChildEvent<W: Workflow> {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityOptions {
+    pub durability: ActivityDurability,
     pub heartbeat_timeout_ms: Option<u64>,
+    pub start_to_close_timeout_ms: Option<u64>,
+    pub max_attempts: Option<u32>,
+    pub max_elapsed_ms: Option<u64>,
+    pub initial_interval_ms: Option<u64>,
+    pub max_interval_ms: Option<u64>,
+    pub backoff_coefficient: Option<u32>,
+    pub non_retryable_error_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityDurability {
+    #[default]
+    Commit,
+    Eager,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChildOptions {
     pub workflow_id: Option<String>,
+    pub durability: ChildDurability,
     pub parent_close_policy: ParentClosePolicy,
     pub conflict_policy: ConflictPolicy,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildDurability {
+    #[default]
+    Commit,
+    Eager,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,17 +363,42 @@ pub enum ConflictPolicy {
     TerminateExisting,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone)]
 pub struct ActivityContext {
+    provider: Option<Arc<dyn DurabilityProvider>>,
+    workflow_id: String,
+    run_id: String,
+    activation_id: String,
+    worker_id: String,
+    effect_id: String,
+    attempt_id: String,
     pub idempotency_key: String,
     pub last_heartbeat_details: Option<JsonValue>,
 }
 
 impl ActivityContext {
-    pub async fn heartbeat<T>(&mut self, _details: T) -> Result<(), WorkflowError>
+    pub async fn heartbeat<T>(&mut self, details: T) -> Result<(), WorkflowError>
     where
         T: Serialize + Send,
     {
+        let Some(provider) = &self.provider else {
+            self.last_heartbeat_details = Some(serde_json::to_value(details)?);
+            return Ok(());
+        };
+        let details = serde_json::to_value(details)?;
+        provider
+            .heartbeat_effect(HeartbeatEffectInput {
+                workflow_id: self.workflow_id.clone(),
+                run_id: self.run_id.clone(),
+                activation_id: self.activation_id.clone(),
+                worker_id: self.worker_id.clone(),
+                effect_id: self.effect_id.clone(),
+                attempt_id: self.attempt_id.clone(),
+                now: Utc::now(),
+                details: Some(details.clone()),
+            })
+            .await?;
+        self.last_heartbeat_details = Some(details);
         Ok(())
     }
 }
@@ -703,6 +769,7 @@ pub struct PersistedInstance {
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub partition_shard: u32,
     pub sequence: u64,
     pub status: PersistedStatus,
     pub common: Option<JsonValue>,
@@ -774,8 +841,29 @@ pub struct EffectRecord {
     pub key: String,
     pub idempotency_key: String,
     pub status: EffectStatus,
+    pub attempt: Option<u32>,
+    pub attempt_id: Option<String>,
+    pub attempt_owner_id: Option<String>,
+    pub attempt_started_at: Option<DateTime<Utc>>,
+    pub start_to_close_timeout_ms: Option<u64>,
+    pub start_to_close_deadline: Option<DateTime<Utc>>,
+    pub heartbeat_timeout_ms: Option<u64>,
+    pub heartbeat_deadline: Option<DateTime<Utc>>,
+    pub max_attempts: Option<u32>,
+    pub max_elapsed_ms: Option<u64>,
+    pub initial_interval_ms: Option<u64>,
+    pub max_interval_ms: Option<u64>,
+    pub backoff_coefficient: Option<u32>,
+    pub first_attempt_started_at: Option<DateTime<Utc>>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_failure: Option<SerializedError>,
+    pub non_retryable_error_names: Vec<String>,
+    pub timed_out_at: Option<DateTime<Utc>>,
+    pub timeout_kind: Option<ActivityTimeoutKind>,
     pub result: Option<JsonValue>,
     pub error: Option<SerializedError>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub heartbeat_details: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -784,6 +872,13 @@ pub enum EffectStatus {
     Pending,
     Completed,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityTimeoutKind {
+    Heartbeat,
+    StartToClose,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -798,6 +893,7 @@ pub struct ChildRecord {
     pub workflow_id: String,
     pub run_id: String,
     pub status: ChildStatus,
+    pub parent_close_policy: ParentClosePolicy,
     pub completed_at: Option<DateTime<Utc>>,
     pub output: Option<JsonValue>,
     pub error: Option<SerializedError>,
@@ -810,6 +906,47 @@ pub enum ChildStatus {
     Started,
     Completed,
     Failed,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MemoryTaskKind {
+    Migration,
+    Run,
+    Event,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemoryTask {
+    task_id: String,
+    activation_id: String,
+    workflow_name: String,
+    workflow_version: u32,
+    workflow_id: String,
+    run_id: String,
+    partition_shard: u32,
+    sequence: u64,
+    kind: MemoryTaskKind,
+    wait_name: Option<String>,
+    event: Option<ReadyEvent>,
+    ready_at: DateTime<Utc>,
+    sort_key: String,
+    claim_owner_id: Option<String>,
+    claim_epoch: Option<u64>,
+    lease_until: Option<DateTime<Utc>>,
+    blocked_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompletedActivationClaim {
+    activation_id: String,
+    workflow_id: String,
+    run_id: String,
+    sequence: u64,
+    kind: MemoryTaskKind,
+    owner_id: Option<String>,
+    completed_by_sequence: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -817,6 +954,10 @@ struct Store {
     instances: HashMap<String, PersistedInstance>,
     signals: Vec<SignalRecord>,
     children: Vec<ChildRecord>,
+    tasks: HashMap<String, MemoryTask>,
+    claimed_sequence_epochs: HashMap<String, u64>,
+    completed_activation_claims: Vec<CompletedActivationClaim>,
+    shard_leases: HashMap<u32, ShardLease>,
     next_signal_id: u64,
     next_effect_id: u64,
     next_child_id: u64,
@@ -828,6 +969,10 @@ impl Default for Store {
             instances: HashMap::new(),
             signals: Vec::new(),
             children: Vec::new(),
+            tasks: HashMap::new(),
+            claimed_sequence_epochs: HashMap::new(),
+            completed_activation_claims: Vec::new(),
+            shard_leases: HashMap::new(),
             next_signal_id: 1,
             next_effect_id: 1,
             next_child_id: 1,
@@ -837,7 +982,7 @@ impl Default for Store {
 
 #[derive(Clone)]
 pub struct JsonFileDurabilityProvider {
-    file_path: PathBuf,
+    file_path: Option<PathBuf>,
     state: Arc<Mutex<Store>>,
 }
 
@@ -852,9 +997,27 @@ impl JsonFileDurabilityProvider {
         };
 
         Ok(Self {
-            file_path,
+            file_path: Some(file_path),
             state: Arc::new(Mutex::new(state)),
         })
+    }
+
+    fn in_memory() -> Self {
+        Self {
+            file_path: None,
+            state: Arc::new(Mutex::new(Store::default())),
+        }
+    }
+
+    fn from_store(state: Store) -> Self {
+        Self {
+            file_path: None,
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn snapshot_store(&self) -> Result<Store, WorkflowError> {
+        Ok(self.lock()?.clone())
     }
 
     pub fn create_instance(
@@ -883,27 +1046,27 @@ impl JsonFileDurabilityProvider {
             }
         }
 
-        state.instances.insert(
-            key,
-            PersistedInstance {
-                workflow_name: input.workflow_name,
-                workflow_version: input.workflow_version,
-                workflow_id: input.workflow_id.clone(),
-                run_id: input.run_id.clone(),
-                sequence: 0,
-                status: PersistedStatus::Running,
-                common: Some(input.common),
-                phase: Some(input.phase),
-                output: None,
-                error: None,
-                cancel_reason: None,
-                waits: input.waits,
-                effects: Vec::new(),
-                created_at: input.now,
-                updated_at: input.now,
-                parent: input.parent,
-            },
-        );
+        let instance = PersistedInstance {
+            workflow_name: input.workflow_name,
+            workflow_version: input.workflow_version,
+            workflow_id: input.workflow_id.clone(),
+            run_id: input.run_id.clone(),
+            partition_shard: input.partition_shard,
+            sequence: 0,
+            status: PersistedStatus::Running,
+            common: Some(input.common),
+            phase: Some(input.phase),
+            output: None,
+            error: None,
+            cancel_reason: None,
+            waits: input.waits,
+            effects: Vec::new(),
+            created_at: input.now,
+            updated_at: input.now,
+            parent: input.parent,
+        };
+        state.instances.insert(key, instance.clone());
+        replace_tasks_for_instance(&mut state, &instance);
 
         self.save_locked(&state)?;
         Ok(InstanceRef::new(input.workflow_id, input.run_id))
@@ -935,31 +1098,31 @@ impl JsonFileDurabilityProvider {
         let child_record_id = format!("child-{}", state.next_child_id);
         state.next_child_id += 1;
 
-        state.instances.insert(
-            instance_key,
-            PersistedInstance {
-                workflow_name: input.workflow_name.clone(),
-                workflow_version: input.workflow_version,
-                workflow_id: input.workflow_id.clone(),
-                run_id: input.run_id.clone(),
-                sequence: 0,
-                status: PersistedStatus::Running,
-                common: Some(input.common),
-                phase: Some(input.phase),
-                output: None,
-                error: None,
-                cancel_reason: None,
-                waits: input.waits,
-                effects: Vec::new(),
-                created_at: input.now,
-                updated_at: input.now,
-                parent: Some(ParentLink {
-                    workflow_id: input.parent_workflow_id.clone(),
-                    run_id: input.parent_run_id.clone(),
-                    child_record_id: child_record_id.clone(),
-                }),
-            },
-        );
+        let child_instance = PersistedInstance {
+            workflow_name: input.workflow_name.clone(),
+            workflow_version: input.workflow_version,
+            workflow_id: input.workflow_id.clone(),
+            run_id: input.run_id.clone(),
+            partition_shard: input.partition_shard,
+            sequence: 0,
+            status: PersistedStatus::Running,
+            common: Some(input.common),
+            phase: Some(input.phase),
+            output: None,
+            error: None,
+            cancel_reason: None,
+            waits: input.waits,
+            effects: Vec::new(),
+            created_at: input.now,
+            updated_at: input.now,
+            parent: Some(ParentLink {
+                workflow_id: input.parent_workflow_id.clone(),
+                run_id: input.parent_run_id.clone(),
+                child_record_id: child_record_id.clone(),
+            }),
+        };
+        state.instances.insert(instance_key, child_instance.clone());
+        replace_tasks_for_instance(&mut state, &child_instance);
 
         state.children.push(ChildRecord {
             child_record_id: child_record_id.clone(),
@@ -972,6 +1135,7 @@ impl JsonFileDurabilityProvider {
             workflow_id: input.workflow_id,
             run_id: input.run_id,
             status: ChildStatus::Started,
+            parent_close_policy: input.parent_close_policy,
             completed_at: None,
             output: None,
             error: None,
@@ -986,6 +1150,12 @@ impl JsonFileDurabilityProvider {
 
         self.save_locked(&state)?;
         Ok(handle)
+    }
+
+    pub fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        let mut state = self.lock()?;
+        cancel_child_in_state(&mut state, input);
+        self.save_locked(&state)
     }
 
     pub fn load_instance(
@@ -1046,6 +1216,9 @@ impl JsonFileDurabilityProvider {
         };
         state.next_signal_id += 1;
         state.signals.push(signal.clone());
+        if let Some(instance) = state.instances.get(&key).cloned() {
+            refresh_signal_tasks_for_instance(&mut state, &instance);
+        }
         self.save_locked(&state)?;
         Ok(signal)
     }
@@ -1056,59 +1229,130 @@ impl JsonFileDurabilityProvider {
         run_id: &str,
         activation_id: &str,
         key: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        options: ActivityOptions,
+        max_attempts: Option<u32>,
     ) -> Result<EffectReservation, WorkflowError> {
         let mut state = self.lock()?;
+        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
         let key_for_instance = instance_key(workflow_id, run_id);
 
-        {
-            let instance = state.instances.get(&key_for_instance).ok_or_else(|| {
+        let existing = state
+            .instances
+            .get(&key_for_instance)
+            .ok_or_else(|| {
                 WorkflowError::new(format!("unknown workflow instance: {workflow_id}/{run_id}"))
-            })?;
+            })?
+            .effects
+            .iter()
+            .find(|effect| effect.activation_id == activation_id && effect.key == key)
+            .cloned();
 
-            if let Some(existing) = instance
-                .effects
-                .iter()
-                .find(|effect| effect.activation_id == activation_id && effect.key == key)
-            {
-                return match existing.status {
-                    EffectStatus::Completed => Ok(EffectReservation::Completed {
+        if let Some(existing) = &existing {
+            match existing.status {
+                EffectStatus::Completed => {
+                    return Ok(EffectReservation::Completed {
                         result: existing.result.clone().unwrap_or(JsonValue::Null),
-                    }),
-                    EffectStatus::Failed => Ok(EffectReservation::Failed {
+                    });
+                }
+                EffectStatus::Failed => {
+                    return Ok(EffectReservation::Failed {
                         error: existing.error.clone().unwrap_or(SerializedError {
+                            name: None,
                             message: "effect failed".to_string(),
                         }),
-                    }),
-                    EffectStatus::Pending => Ok(EffectReservation::Reserved {
-                        effect_id: existing.effect_id.clone(),
-                        idempotency_key: existing.idempotency_key.clone(),
-                        heartbeat_details: None,
-                    }),
-                };
+                    });
+                }
+                EffectStatus::Pending => {
+                    if existing
+                        .next_attempt_at
+                        .is_some_and(|next_attempt_at| next_attempt_at > now)
+                    {
+                        return Err(WorkflowError::new(format!(
+                            "effect retry is not ready: {}",
+                            existing.effect_id
+                        )));
+                    }
+                }
             }
         }
 
-        let effect_id = format!("effect-{}", state.next_effect_id);
-        state.next_effect_id += 1;
         let idempotency_key = format!("{workflow_id}/{run_id}/{activation_id}/{key}");
+        let allocated_effect_id = if existing.is_none() {
+            let effect_id = format!("effect-{}", state.next_effect_id);
+            state.next_effect_id += 1;
+            Some(effect_id)
+        } else {
+            None
+        };
         let instance = state.instances.get_mut(&key_for_instance).ok_or_else(|| {
             WorkflowError::new(format!("unknown workflow instance: {workflow_id}/{run_id}"))
         })?;
-        instance.effects.push(EffectRecord {
+        let existing_index = instance
+            .effects
+            .iter()
+            .position(|effect| effect.activation_id == activation_id && effect.key == key);
+        let attempt = existing_index
+            .and_then(|index| instance.effects[index].attempt)
+            .unwrap_or(1);
+        let effect_id = if let Some(index) = existing_index {
+            instance.effects[index].effect_id.clone()
+        } else {
+            allocated_effect_id.expect("new effect id allocated")
+        };
+        let first_attempt_started_at = existing_index
+            .and_then(|index| instance.effects[index].first_attempt_started_at)
+            .unwrap_or(now);
+        let attempt_id = format!("attempt-{}", Uuid::new_v4());
+        let heartbeat_details =
+            existing_index.and_then(|index| instance.effects[index].heartbeat_details.clone());
+        let effect = EffectRecord {
             effect_id: effect_id.clone(),
             activation_id: activation_id.to_string(),
             key: key.to_string(),
-            idempotency_key: idempotency_key.clone(),
+            idempotency_key: existing_index
+                .map(|index| instance.effects[index].idempotency_key.clone())
+                .unwrap_or_else(|| idempotency_key.clone()),
             status: EffectStatus::Pending,
+            attempt: Some(attempt),
+            attempt_id: Some(attempt_id.clone()),
+            attempt_owner_id: Some(worker_id.to_string()),
+            attempt_started_at: Some(now),
+            start_to_close_timeout_ms: options.start_to_close_timeout_ms,
+            start_to_close_deadline: deadline_from(now, options.start_to_close_timeout_ms),
+            heartbeat_timeout_ms: options.heartbeat_timeout_ms,
+            heartbeat_deadline: deadline_from(now, options.heartbeat_timeout_ms),
+            max_attempts: max_attempts.or(options.max_attempts).or(Some(1)),
+            max_elapsed_ms: options.max_elapsed_ms,
+            initial_interval_ms: options.initial_interval_ms.or(Some(1_000)),
+            max_interval_ms: options.max_interval_ms.or(Some(30_000)),
+            backoff_coefficient: options.backoff_coefficient.or(Some(2)),
+            first_attempt_started_at: Some(first_attempt_started_at),
+            next_attempt_at: None,
+            last_failure: existing_index
+                .and_then(|index| instance.effects[index].last_failure.clone()),
+            non_retryable_error_names: options.non_retryable_error_names,
+            timed_out_at: None,
+            timeout_kind: None,
             result: None,
             error: None,
-        });
+            heartbeat_at: None,
+            heartbeat_details: heartbeat_details.clone(),
+        };
+        if let Some(index) = existing_index {
+            instance.effects[index] = effect;
+        } else {
+            instance.effects.push(effect);
+        }
 
         self.save_locked(&state)?;
         Ok(EffectReservation::Reserved {
             effect_id,
             idempotency_key,
-            heartbeat_details: None,
+            attempt,
+            attempt_id,
+            heartbeat_details,
         })
     }
 
@@ -1117,18 +1361,54 @@ impl JsonFileDurabilityProvider {
         workflow_id: &str,
         run_id: &str,
         effect_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
         result: JsonValue,
     ) -> Result<(), WorkflowError> {
         let mut state = self.lock()?;
+        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
         let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
         let effect = instance
             .effects
             .iter_mut()
             .find(|effect| effect.effect_id == effect_id)
             .ok_or_else(|| WorkflowError::new(format!("unknown effect: {effect_id}")))?;
+        assert_mutable_effect(effect, attempt_id, worker_id)?;
         effect.status = EffectStatus::Completed;
         effect.result = Some(result);
         effect.error = None;
+        effect.attempt_id = None;
+        effect.attempt_owner_id = None;
+        effect.attempt_started_at = None;
+        effect.start_to_close_deadline = None;
+        effect.heartbeat_deadline = None;
+        effect.next_attempt_at = None;
+        self.save_locked(&state)
+    }
+
+    pub fn heartbeat_effect(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+        effect_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        details: Option<JsonValue>,
+    ) -> Result<(), WorkflowError> {
+        let mut state = self.lock()?;
+        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
+        let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
+        let effect = instance
+            .effects
+            .iter_mut()
+            .find(|effect| effect.effect_id == effect_id)
+            .ok_or_else(|| WorkflowError::new(format!("unknown effect: {effect_id}")))?;
+        assert_mutable_effect(effect, attempt_id, worker_id)?;
+        effect.heartbeat_at = Some(now);
+        effect.heartbeat_details = details;
+        effect.heartbeat_deadline = deadline_from(now, effect.heartbeat_timeout_ms);
         self.save_locked(&state)
     }
 
@@ -1137,18 +1417,58 @@ impl JsonFileDurabilityProvider {
         workflow_id: &str,
         run_id: &str,
         effect_id: &str,
+        attempt_id: &str,
+        worker_id: &str,
         error: SerializedError,
-    ) -> Result<(), WorkflowError> {
+        now: DateTime<Utc>,
+        retryable: Option<bool>,
+    ) -> Result<FailEffectResult, WorkflowError> {
         let mut state = self.lock()?;
+        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
+        let release_activation_id;
+        let blocked_until;
         let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
         let effect = instance
             .effects
             .iter_mut()
             .find(|effect| effect.effect_id == effect_id)
             .ok_or_else(|| WorkflowError::new(format!("unknown effect: {effect_id}")))?;
-        effect.status = EffectStatus::Failed;
-        effect.error = Some(error);
-        self.save_locked(&state)
+        assert_mutable_effect(effect, attempt_id, worker_id)?;
+        let decision = retry_decision_for_effect(effect, &error, now, retryable.unwrap_or(true));
+        match &decision {
+            FailEffectResult::RetryScheduled {
+                next_attempt_at,
+                next_attempt,
+            } => {
+                effect.status = EffectStatus::Pending;
+                effect.error = Some(error.clone());
+                effect.last_failure = Some(error);
+                effect.next_attempt_at = Some(*next_attempt_at);
+                effect.attempt = Some(*next_attempt);
+                effect.attempt_id = None;
+                effect.attempt_owner_id = None;
+                effect.attempt_started_at = None;
+                effect.start_to_close_deadline = None;
+                effect.heartbeat_deadline = None;
+                release_activation_id = effect.activation_id.clone();
+                blocked_until = Some(*next_attempt_at);
+            }
+            FailEffectResult::Failed => {
+                effect.status = EffectStatus::Failed;
+                effect.error = Some(error.clone());
+                effect.last_failure = Some(error);
+                effect.attempt_id = None;
+                effect.attempt_owner_id = None;
+                effect.attempt_started_at = None;
+                effect.start_to_close_deadline = None;
+                effect.heartbeat_deadline = None;
+                release_activation_id = effect.activation_id.clone();
+                blocked_until = None;
+            }
+        }
+        release_tasks_for_activation(&mut state, &release_activation_id, blocked_until);
+        self.save_locked(&state)?;
+        Ok(decision)
     }
 
     pub fn commit_checkpoint(
@@ -1162,6 +1482,9 @@ impl JsonFileDurabilityProvider {
                 return Ok(CommitCheckpointResult {
                     ok: false,
                     sequence: 0,
+                    reason: Some("not_found".to_string()),
+                    retryable: Some(true),
+                    error: None,
                 });
             };
 
@@ -1169,6 +1492,9 @@ impl JsonFileDurabilityProvider {
                 return Ok(CommitCheckpointResult {
                     ok: false,
                     sequence: instance.sequence,
+                    reason: Some("not_running".to_string()),
+                    retryable: Some(true),
+                    error: None,
                 });
             }
 
@@ -1176,6 +1502,9 @@ impl JsonFileDurabilityProvider {
                 return Ok(CommitCheckpointResult {
                     ok: false,
                     sequence: instance.sequence,
+                    reason: Some("stale_sequence".to_string()),
+                    retryable: Some(true),
+                    error: None,
                 });
             }
 
@@ -1193,6 +1522,9 @@ impl JsonFileDurabilityProvider {
                 return Ok(CommitCheckpointResult {
                     ok: false,
                     sequence: current_sequence,
+                    reason: Some("signal_not_consumable".to_string()),
+                    retryable: Some(true),
+                    error: None,
                 });
             }
             index
@@ -1211,6 +1543,9 @@ impl JsonFileDurabilityProvider {
                 return Ok(CommitCheckpointResult {
                     ok: false,
                     sequence: current_sequence,
+                    reason: Some("child_not_consumable".to_string()),
+                    retryable: Some(true),
+                    error: None,
                 });
             }
             index
@@ -1218,8 +1553,48 @@ impl JsonFileDurabilityProvider {
             None
         };
 
+        for start in &input.child_starts {
+            let child_key = instance_key(&start.workflow_id, &start.run_id);
+            if state.instances.contains_key(&child_key)
+                && start.conflict_policy != ConflictPolicy::TerminateExisting
+            {
+                return Ok(CommitCheckpointResult {
+                    ok: false,
+                    sequence: current_sequence,
+                    reason: Some("existing_child_instance".to_string()),
+                    retryable: Some(false),
+                    error: Some(SerializedError {
+                        name: None,
+                        message: format!(
+                            "child workflow instance already exists: {}/{}",
+                            start.workflow_id, start.run_id
+                        ),
+                    }),
+                });
+            }
+        }
+
+        let mut checkpoint_effects = Vec::new();
+        for effect in &input.effects {
+            let effect_id = format!("effect-{}", state.next_effect_id);
+            state.next_effect_id += 1;
+            let idempotency_key = format!(
+                "{}/{}/{}/{}",
+                input.workflow_id,
+                input.run_id,
+                input.activation_id,
+                effect.key()
+            );
+            checkpoint_effects.push(effect.to_record(
+                effect_id,
+                input.activation_id.clone(),
+                idempotency_key,
+                input.now,
+            ));
+        }
+
         let next_sequence = current_sequence + 1;
-        let (parent, instance_status, output, error, cancel_reason) = {
+        let (parent, instance_status, output, error, cancel_reason, updated_instance) = {
             let instance = state
                 .instances
                 .get_mut(&key)
@@ -1265,12 +1640,20 @@ impl JsonFileDurabilityProvider {
                 }
             }
 
+            if !input.effects.is_empty() {
+                instance
+                    .effects
+                    .retain(|effect| effect.activation_id != input.activation_id);
+                instance.effects.extend(checkpoint_effects);
+            }
+
             (
                 instance.parent.clone(),
                 instance.status.clone(),
                 instance.output.clone(),
                 instance.error.clone(),
                 instance.cancel_reason.clone(),
+                instance.clone(),
             )
         };
 
@@ -1280,6 +1663,57 @@ impl JsonFileDurabilityProvider {
 
         if let Some(index) = child_index {
             state.children[index].delivered_by_sequence = Some(next_sequence);
+        }
+
+        for start in input.child_starts {
+            let child_record_id = format!("child-{}", state.next_child_id);
+            state.next_child_id += 1;
+            let child_key = instance_key(&start.workflow_id, &start.run_id);
+            if start.conflict_policy == ConflictPolicy::TerminateExisting {
+                delete_instance_records(&mut state, &start.workflow_id, &start.run_id);
+            }
+            let child_instance = PersistedInstance {
+                workflow_name: start.workflow_name.clone(),
+                workflow_version: start.workflow_version,
+                workflow_id: start.workflow_id.clone(),
+                run_id: start.run_id.clone(),
+                partition_shard: start.partition_shard,
+                sequence: 0,
+                status: PersistedStatus::Running,
+                common: Some(start.common),
+                phase: Some(start.phase),
+                output: None,
+                error: None,
+                cancel_reason: None,
+                waits: start.waits,
+                effects: Vec::new(),
+                created_at: input.now,
+                updated_at: input.now,
+                parent: Some(ParentLink {
+                    workflow_id: input.workflow_id.clone(),
+                    run_id: input.run_id.clone(),
+                    child_record_id: child_record_id.clone(),
+                }),
+            };
+            state.instances.insert(child_key, child_instance.clone());
+            replace_tasks_for_instance(&mut state, &child_instance);
+            state.children.push(ChildRecord {
+                child_record_id,
+                parent_workflow_id: input.workflow_id.clone(),
+                parent_run_id: input.run_id.clone(),
+                activation_id: input.activation_id.clone(),
+                key: start.key,
+                workflow_name: start.workflow_name,
+                workflow_version: start.workflow_version,
+                workflow_id: start.workflow_id,
+                run_id: start.run_id,
+                status: ChildStatus::Started,
+                parent_close_policy: start.parent_close_policy,
+                completed_at: None,
+                output: None,
+                error: None,
+                delivered_by_sequence: None,
+            });
         }
 
         if let Some(parent) = parent {
@@ -1299,6 +1733,7 @@ impl JsonFileDurabilityProvider {
                             PersistedStatus::Canceled => {
                                 child_record.status = ChildStatus::Failed;
                                 child_record.error = Some(SerializedError {
+                                    name: None,
                                     message: cancel_reason
                                         .unwrap_or_else(|| "child canceled".to_string()),
                                 });
@@ -1306,6 +1741,7 @@ impl JsonFileDurabilityProvider {
                             PersistedStatus::Failed => {
                                 child_record.status = ChildStatus::Failed;
                                 child_record.error = error.or(Some(SerializedError {
+                                    name: None,
                                     message: "child failed".to_string(),
                                 }));
                             }
@@ -1313,13 +1749,46 @@ impl JsonFileDurabilityProvider {
                         }
                     }
                 }
+                let parent_key = instance_key(&parent.workflow_id, &parent.run_id);
+                if let Some(parent_instance) = state.instances.get(&parent_key).cloned() {
+                    refresh_child_tasks_for_instance(&mut state, &parent_instance);
+                }
             }
         }
+
+        if matches!(
+            instance_status,
+            PersistedStatus::Canceled | PersistedStatus::Failed
+        ) {
+            apply_parent_close_policy(
+                &mut state,
+                &input.workflow_id,
+                &input.run_id,
+                input.now,
+                next_sequence,
+            );
+        }
+
+        replace_tasks_for_instance(&mut state, &updated_instance);
+        state
+            .completed_activation_claims
+            .push(CompletedActivationClaim {
+                activation_id: input.activation_id.clone(),
+                workflow_id: input.workflow_id.clone(),
+                run_id: input.run_id.clone(),
+                sequence: current_sequence,
+                kind: MemoryTaskKind::Event,
+                owner_id: None,
+                completed_by_sequence: next_sequence,
+            });
 
         self.save_locked(&state)?;
         Ok(CommitCheckpointResult {
             ok: true,
             sequence: next_sequence,
+            reason: None,
+            retryable: None,
+            error: None,
         })
     }
 
@@ -1354,24 +1823,3029 @@ impl JsonFileDurabilityProvider {
     }
 
     fn save_locked(&self, state: &Store) -> Result<(), WorkflowError> {
-        if let Some(parent) = self.file_path.parent() {
+        let Some(file_path) = &self.file_path else {
+            return Ok(());
+        };
+        if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp_path = self
-            .file_path
-            .with_extension(format!("{}.tmp", std::process::id()));
+        let tmp_path = file_path.with_extension(format!("{}.tmp", std::process::id()));
         fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
-        fs::rename(tmp_path, &self.file_path)?;
+        fs::rename(tmp_path, file_path)?;
+        Ok(())
+    }
+
+    fn claim_shard_sync(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        let mut state = self.lock()?;
+        if let Some(existing) = state.shard_leases.get(&input.shard_id) {
+            if existing.owner_id != input.owner_id && existing.lease_until > input.now {
+                return Ok(None);
+            }
+        }
+        let epoch = state
+            .shard_leases
+            .get(&input.shard_id)
+            .map(|lease| {
+                if lease.owner_id == input.owner_id && lease.lease_until > input.now {
+                    lease.lease_epoch
+                } else {
+                    lease.lease_epoch + 1
+                }
+            })
+            .unwrap_or(1);
+        let lease = ShardLease {
+            shard_id: input.shard_id,
+            owner_id: input.owner_id,
+            lease_until: input.now + chrono::Duration::milliseconds(input.lease_ms as i64),
+            lease_epoch: epoch,
+        };
+        state.shard_leases.insert(input.shard_id, lease.clone());
+        self.save_locked(&state)?;
+        Ok(Some(lease))
+    }
+
+    fn heartbeat_shard_sync(
+        &self,
+        shard_id: u32,
+        owner_id: &str,
+        now: DateTime<Utc>,
+        lease_ms: u64,
+    ) -> Result<(), WorkflowError> {
+        let mut state = self.lock()?;
+        let lease = state
+            .shard_leases
+            .get_mut(&shard_id)
+            .ok_or_else(|| WorkflowError::new(format!("lost shard lease: {shard_id}")))?;
+        if lease.owner_id != owner_id || lease.lease_until < now {
+            return Err(WorkflowError::new(format!("lost shard lease: {shard_id}")));
+        }
+        lease.lease_until = now + chrono::Duration::milliseconds(lease_ms as i64);
+        self.save_locked(&state)
+    }
+
+    fn release_shard_sync(&self, shard_id: u32, owner_id: &str) -> Result<(), WorkflowError> {
+        let mut state = self.lock()?;
+        if let Some(lease) = state.shard_leases.get_mut(&shard_id) {
+            if lease.owner_id == owner_id {
+                lease.lease_until = DateTime::<Utc>::from(std::time::UNIX_EPOCH);
+            }
+        }
+        self.save_locked(&state)
+    }
+
+    fn release_activation_sync(
+        &self,
+        activation_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkflowError> {
+        let mut state = self.lock()?;
+        let mut released_sequences = Vec::new();
+        for task in state.tasks.values_mut() {
+            if task.activation_id == activation_id
+                && task.claim_owner_id.as_deref() == Some(worker_id)
+            {
+                task.claim_owner_id = None;
+                task.claim_epoch = None;
+                task.lease_until = None;
+                released_sequences.push(sequence_key_for_task(task));
+            }
+        }
+        for sequence in released_sequences {
+            state.claimed_sequence_epochs.remove(&sequence);
+        }
+        self.save_locked(&state)
+    }
+}
+
+#[derive(Clone)]
+pub struct NullDurabilityProvider {
+    inner: JsonFileDurabilityProvider,
+}
+
+impl NullDurabilityProvider {
+    pub fn new() -> Self {
+        Self {
+            inner: JsonFileDurabilityProvider::in_memory(),
+        }
+    }
+}
+
+impl Default for NullDurabilityProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const DEFAULT_SQLITE_SNAPSHOT_INTERVAL: u64 = 512;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "input", rename_all = "snake_case")]
+enum JournalOperation {
+    ClaimShard(ClaimShardInput),
+    HeartbeatShard {
+        shard_id: u32,
+        owner_id: String,
+        now: DateTime<Utc>,
+        lease_ms: u64,
+    },
+    ReleaseShard {
+        shard_id: u32,
+        owner_id: String,
+    },
+    ReleaseActivation {
+        activation_id: String,
+        worker_id: String,
+    },
+    ClaimShardTasks {
+        session: OpenShardInput,
+        input: ClaimShardTasksInput,
+    },
+    CreateInstance(CreateInstanceInput),
+    CreateChildInstance(CreateChildInstanceInput),
+    AppendSignal(AppendSignalInput),
+    CancelChild(CancelChildInput),
+    ReserveEffect(ReserveEffectInput),
+    HeartbeatEffect(HeartbeatEffectInput),
+    CompleteEffect(CompleteEffectInput),
+    FailEffect(FailEffectInput),
+    CommitCheckpoint(CommitCheckpointInput),
+}
+
+#[derive(Clone)]
+pub struct SqliteDurabilityProvider {
+    inner: JsonFileDurabilityProvider,
+    connection: Arc<Mutex<rusqlite::Connection>>,
+    snapshot_interval: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteDurabilityOptions {
+    pub snapshot_interval: u64,
+}
+
+impl Default for SqliteDurabilityOptions {
+    fn default() -> Self {
+        Self {
+            snapshot_interval: DEFAULT_SQLITE_SNAPSHOT_INTERVAL,
+        }
+    }
+}
+
+impl SqliteDurabilityProvider {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, WorkflowError> {
+        Self::new_with_options(path, SqliteDurabilityOptions::default())
+    }
+
+    pub fn new_with_options(
+        path: impl AsRef<Path>,
+        options: SqliteDurabilityOptions,
+    ) -> Result<Self, WorkflowError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection = rusqlite::Connection::open(&path)?;
+        configure_sqlite(&connection)?;
+        ensure_sqlite_schema(&connection)?;
+        let state = load_sqlite_store(&connection)?;
+        Ok(Self {
+            inner: JsonFileDurabilityProvider {
+                file_path: None,
+                state: Arc::new(Mutex::new(state)),
+            },
+            connection: Arc::new(Mutex::new(connection)),
+            snapshot_interval: options.snapshot_interval.max(1),
+        })
+    }
+
+    pub fn pragma_string(&self, pragma: &str) -> Result<String, WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
+        let value = connection.query_row(&format!("PRAGMA {pragma}"), [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(value)
+    }
+
+    pub fn pragma_i64(&self, pragma: &str) -> Result<i64, WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
+        let value =
+            connection.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))?;
+        Ok(value)
+    }
+
+    fn append_journal_operation(&self, operation: JournalOperation) -> Result<(), WorkflowError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
+        let operation_json = serde_json::to_string(&operation)?;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let tx = connection.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO shard_journal (operation_json, created_at) VALUES (?1, ?2)",
+            rusqlite::params![operation_json, now],
+        )?;
+        let entry_id = tx.last_insert_rowid() as u64;
+        if entry_id % self.snapshot_interval == 0 {
+            let snapshot = serde_json::to_string(&self.inner.snapshot_store()?)?;
+            tx.execute(
+                "INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET
+                   last_entry_id = excluded.last_entry_id,
+                   snapshot_json = excluded.snapshot_json,
+                   created_at = excluded.created_at",
+                rusqlite::params![entry_id, snapshot, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        self.inner.load_instance(ref_)
+    }
+
+    pub fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        self.inner.list_children()
+    }
+
+    pub fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        self.inner.list_signals()
+    }
+}
+
+#[async_trait]
+impl DurabilityProvider for SqliteDurabilityProvider {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        let output = self.inner.claim_shard_sync(input.clone())?;
+        if output.is_some() {
+            self.append_journal_operation(JournalOperation::ClaimShard(input))?;
+        }
+        Ok(output)
+    }
+
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
+        Arc::new(SqliteShardSession {
+            provider: self.clone(),
+            inner: <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(
+                &self.inner,
+                input,
+            ),
+        })
+    }
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError> {
+        let output = self.inner.create_instance(input.clone())?;
+        self.append_journal_operation(JournalOperation::CreateInstance(input))?;
+        Ok(output)
+    }
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError> {
+        let output = self.inner.create_child_instance(input.clone())?;
+        self.append_journal_operation(JournalOperation::CreateChildInstance(input))?;
+        Ok(output)
+    }
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
+            &self.inner,
+            ref_,
+            options,
+        )
+        .await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::AppendSignal(input))?;
+        Ok(output)
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::CancelChild(input))
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        if matches!(output, EffectReservation::Reserved { .. }) {
+            self.append_journal_operation(JournalOperation::ReserveEffect(input))?;
+        }
+        Ok(output)
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::HeartbeatEffect(input))
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::CompleteEffect(input))
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::FailEffect(input))?;
+        Ok(output)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        if output.ok {
+            self.append_journal_operation(JournalOperation::CommitCheckpoint(input))?;
+        }
+        Ok(output)
+    }
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
+        self.inner.list_instances()
+    }
+
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        self.inner.list_signals()
+    }
+
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        self.inner.list_children()
+    }
+}
+
+struct SqliteShardSession {
+    provider: SqliteDurabilityProvider,
+    inner: Arc<dyn ShardDurabilitySession>,
+}
+
+#[async_trait]
+impl ShardDurabilitySession for SqliteShardSession {
+    fn shard_id(&self) -> u32 {
+        self.inner.shard_id()
+    }
+
+    fn owner_id(&self) -> Option<&str> {
+        self.inner.owner_id()
+    }
+
+    fn lease_epoch(&self) -> Option<u64> {
+        self.inner.lease_epoch()
+    }
+
+    async fn claim_tasks(
+        &self,
+        input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError> {
+        let session = OpenShardInput {
+            shard_id: self.shard_id(),
+            owner_id: self.owner_id().map(str::to_string),
+            lease_epoch: self.lease_epoch(),
+        };
+        let output = self.inner.claim_tasks(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::ClaimShardTasks { session, input })?;
+        Ok(output)
+    }
+
+    async fn read_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        self.inner.read_instance(ref_, options).await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        let output = self.inner.append_signal(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::AppendSignal(input))?;
+        Ok(output)
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        self.inner.cancel_child(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::CancelChild(input))
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        let output = self.inner.get_or_reserve_effect(input.clone()).await?;
+        if matches!(output, EffectReservation::Reserved { .. }) {
+            self.provider
+                .append_journal_operation(JournalOperation::ReserveEffect(input))?;
+        }
+        Ok(output)
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        self.inner.heartbeat_effect(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::HeartbeatEffect(input))
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        self.inner.complete_effect(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::CompleteEffect(input))
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        let output = self.inner.fail_effect(input.clone()).await?;
+        self.provider
+            .append_journal_operation(JournalOperation::FailEffect(input))?;
+        Ok(output)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        let output = self.inner.commit_checkpoint(input.clone()).await?;
+        if output.ok {
+            self.provider
+                .append_journal_operation(JournalOperation::CommitCheckpoint(input))?;
+        }
+        Ok(output)
+    }
+
+    async fn release_activation(
+        &self,
+        activation_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkflowError> {
+        self.inner
+            .release_activation(activation_id, worker_id)
+            .await?;
+        self.provider
+            .append_journal_operation(JournalOperation::ReleaseActivation {
+                activation_id: activation_id.to_string(),
+                worker_id: worker_id.to_string(),
+            })
+    }
+
+    async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError> {
+        self.inner.heartbeat(now, lease_ms).await?;
+        if let Some(owner_id) = self.owner_id() {
+            self.provider
+                .append_journal_operation(JournalOperation::HeartbeatShard {
+                    shard_id: self.shard_id(),
+                    owner_id: owner_id.to_string(),
+                    now,
+                    lease_ms,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn release(&self) -> Result<(), WorkflowError> {
+        self.inner.release().await?;
+        if let Some(owner_id) = self.owner_id() {
+            self.provider
+                .append_journal_operation(JournalOperation::ReleaseShard {
+                    shard_id: self.shard_id(),
+                    owner_id: owner_id.to_string(),
+                })?;
+        }
         Ok(())
     }
 }
 
+fn configure_sqlite(connection: &rusqlite::Connection) -> Result<(), WorkflowError> {
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
+    Ok(())
+}
+
+fn ensure_sqlite_schema(connection: &rusqlite::Connection) -> Result<(), WorkflowError> {
+    let journal_columns = sqlite_table_columns(connection, "shard_journal")?;
+    if !journal_columns.is_empty()
+        && !journal_columns
+            .iter()
+            .any(|column| column == "operation_json")
+    {
+        connection.execute_batch(
+            "
+            DROP TABLE IF EXISTS shard_journal;
+            DROP TABLE IF EXISTS shard_snapshots;
+            ",
+        )?;
+    }
+
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS shard_journal (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS shard_snapshots (
+            snapshot_id INTEGER PRIMARY KEY CHECK (snapshot_id = 1),
+            last_entry_id INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS shard_journal_entry ON shard_journal(entry_id);
+        ",
+    )?;
+    Ok(())
+}
+
+fn load_sqlite_store(connection: &rusqlite::Connection) -> Result<Store, WorkflowError> {
+    let snapshot = connection.query_row(
+        "SELECT last_entry_id, snapshot_json FROM shard_snapshots WHERE snapshot_id = 1",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+    );
+    let (last_entry_id, store) = match snapshot {
+        Ok((last_entry_id, raw)) => (last_entry_id, serde_json::from_str(&raw)?),
+        Err(rusqlite::Error::QueryReturnedNoRows) => (0, Store::default()),
+        Err(error) => return Err(error.into()),
+    };
+    let provider = JsonFileDurabilityProvider::from_store(store);
+    let mut statement = connection.prepare(
+        "SELECT operation_json FROM shard_journal WHERE entry_id > ?1 ORDER BY entry_id ASC",
+    )?;
+    let rows = statement.query_map([last_entry_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let operation = serde_json::from_str::<JournalOperation>(&row?)?;
+        apply_journal_operation(&provider, operation)?;
+    }
+    provider.snapshot_store()
+}
+
+fn sqlite_table_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> Result<Vec<String>, WorkflowError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn apply_journal_operation(
+    provider: &JsonFileDurabilityProvider,
+    operation: JournalOperation,
+) -> Result<(), WorkflowError> {
+    match operation {
+        JournalOperation::ClaimShard(input) => {
+            provider.claim_shard_sync(input)?;
+        }
+        JournalOperation::HeartbeatShard {
+            shard_id,
+            owner_id,
+            now,
+            lease_ms,
+        } => provider.heartbeat_shard_sync(shard_id, &owner_id, now, lease_ms)?,
+        JournalOperation::ReleaseShard { shard_id, owner_id } => {
+            provider.release_shard_sync(shard_id, &owner_id)?;
+        }
+        JournalOperation::ReleaseActivation {
+            activation_id,
+            worker_id,
+        } => {
+            provider.release_activation_sync(&activation_id, &worker_id)?;
+        }
+        JournalOperation::ClaimShardTasks { session, input } => {
+            let session = JsonFileShardSession {
+                provider: provider.clone(),
+                shard_id: session.shard_id,
+                owner_id: session.owner_id,
+                lease_epoch: session.lease_epoch,
+            };
+            claim_tasks_for_provider(provider, &session, input)?;
+        }
+        JournalOperation::CreateInstance(input) => {
+            provider.create_instance(input)?;
+        }
+        JournalOperation::CreateChildInstance(input) => {
+            provider.create_child_instance(input)?;
+        }
+        JournalOperation::AppendSignal(input) => {
+            provider.append_signal(
+                input.workflow_id,
+                input.run_id,
+                input.r#type,
+                input.payload,
+                input.received_at,
+            )?;
+        }
+        JournalOperation::CancelChild(input) => {
+            provider.cancel_child(input)?;
+        }
+        JournalOperation::ReserveEffect(input) => {
+            provider.get_or_reserve_effect(
+                &input.workflow_id,
+                &input.run_id,
+                &input.activation_id,
+                &input.key,
+                &input.worker_id,
+                input.now,
+                input.options,
+                input.max_attempts,
+            )?;
+        }
+        JournalOperation::HeartbeatEffect(input) => {
+            provider.heartbeat_effect(
+                &input.workflow_id,
+                &input.run_id,
+                &input.effect_id,
+                &input.attempt_id,
+                &input.worker_id,
+                input.now,
+                input.details,
+            )?;
+        }
+        JournalOperation::CompleteEffect(input) => {
+            provider.complete_effect(
+                &input.workflow_id,
+                &input.run_id,
+                &input.effect_id,
+                &input.attempt_id,
+                &input.worker_id,
+                input.now,
+                input.result,
+            )?;
+        }
+        JournalOperation::FailEffect(input) => {
+            provider.fail_effect(
+                &input.workflow_id,
+                &input.run_id,
+                &input.effect_id,
+                &input.attempt_id,
+                &input.worker_id,
+                input.error,
+                input.now,
+                input.retryable,
+            )?;
+        }
+        JournalOperation::CommitCheckpoint(input) => {
+            let result = provider.commit_checkpoint(input)?;
+            if !result.ok {
+                return Err(WorkflowError::new(format!(
+                    "journal replay hit checkpoint conflict: {:?}",
+                    result
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct SqliteShardFileDurabilityProvider {
+    directory: PathBuf,
+    shard_count: u32,
+    providers: Arc<Mutex<HashMap<u32, SqliteDurabilityProvider>>>,
+}
+
+impl SqliteShardFileDurabilityProvider {
+    pub fn new(directory: impl AsRef<Path>, shard_count: u32) -> Result<Self, WorkflowError> {
+        if shard_count == 0 {
+            return Err(WorkflowError::new("shard_count must be positive"));
+        }
+        let directory = directory.as_ref().to_path_buf();
+        fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory,
+            shard_count,
+            providers: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn provider_for_shard(&self, shard_id: u32) -> Result<SqliteDurabilityProvider, WorkflowError> {
+        if shard_id >= self.shard_count {
+            return Err(WorkflowError::new(format!(
+                "shard {shard_id} outside configured shard count {}",
+                self.shard_count
+            )));
+        }
+        let mut providers = self
+            .providers
+            .lock()
+            .map_err(|_| WorkflowError::new("sqlite shard provider lock poisoned"))?;
+        if let Some(provider) = providers.get(&shard_id) {
+            return Ok(provider.clone());
+        }
+        let provider =
+            SqliteDurabilityProvider::new(self.directory.join(format!("shard-{shard_id}.sqlite")))?;
+        providers.insert(shard_id, provider.clone());
+        Ok(provider)
+    }
+
+    fn provider_for_ref(
+        &self,
+        workflow_id: &str,
+        run_id: &str,
+    ) -> Result<SqliteDurabilityProvider, WorkflowError> {
+        self.provider_for_shard(workflow_partition_shard(
+            workflow_id,
+            run_id,
+            self.shard_count,
+        ))
+    }
+}
+
+#[async_trait]
+impl DurabilityProvider for SqliteShardFileDurabilityProvider {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        self.provider_for_shard(input.shard_id)?
+            .claim_shard(input)
+            .await
+    }
+
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
+        match self.provider_for_shard(input.shard_id) {
+            Ok(provider) => provider.open_shard(input),
+            Err(error) => Arc::new(FailedShardSession { error }),
+        }
+    }
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError> {
+        self.provider_for_shard(input.partition_shard)?
+            .create_instance(input)
+            .await
+    }
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError> {
+        let parent_shard = workflow_partition_shard(
+            &input.parent_workflow_id,
+            &input.parent_run_id,
+            self.shard_count,
+        );
+        if input.partition_shard != parent_shard {
+            return Err(WorkflowError::new(
+                "SQLite shard-file provider requires local child workflow starts to be shard-affine",
+            ));
+        }
+        self.provider_for_shard(input.partition_shard)?
+            .create_child_instance(input)
+            .await
+    }
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        let provider = self.provider_for_ref(&ref_.workflow_id, &ref_.run_id)?;
+        <SqliteDurabilityProvider as DurabilityProvider>::load_instance(&provider, ref_, options)
+            .await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        self.provider_for_ref(&input.workflow_id, &input.run_id)?
+            .append_signal(input)
+            .await
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        self.provider_for_ref(&input.parent_workflow_id, &input.parent_run_id)?
+            .cancel_child(input)
+            .await
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        self.provider_for_ref(&input.workflow_id, &input.run_id)?
+            .get_or_reserve_effect(input)
+            .await
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        self.provider_for_ref(&input.workflow_id, &input.run_id)?
+            .heartbeat_effect(input)
+            .await
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        self.provider_for_ref(&input.workflow_id, &input.run_id)?
+            .complete_effect(input)
+            .await
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        self.provider_for_ref(&input.workflow_id, &input.run_id)?
+            .fail_effect(input)
+            .await
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        let parent_shard =
+            workflow_partition_shard(&input.workflow_id, &input.run_id, self.shard_count);
+        if input
+            .child_starts
+            .iter()
+            .any(|start| start.partition_shard != parent_shard)
+        {
+            return Ok(CommitCheckpointResult {
+                ok: false,
+                sequence: input.expected_sequence,
+                reason: Some("cross_shard_child_start".to_string()),
+                retryable: Some(false),
+                error: Some(SerializedError {
+                            name: None,
+                            message: "SQLite shard-file provider requires commit-local children to stay on the parent shard".to_string(),
+                }),
+            });
+        }
+        self.provider_for_shard(parent_shard)?
+            .commit_checkpoint(input)
+            .await
+    }
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
+        let mut output = Vec::new();
+        for shard_id in 0..self.shard_count {
+            output.extend(self.provider_for_shard(shard_id)?.list_instances().await?);
+        }
+        Ok(output)
+    }
+
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        let mut output = Vec::new();
+        for shard_id in 0..self.shard_count {
+            let provider = self.provider_for_shard(shard_id)?;
+            output.extend(
+                <SqliteDurabilityProvider as DurabilityProvider>::list_signals(&provider).await?,
+            );
+        }
+        output.sort_by(compare_signal_records);
+        Ok(output)
+    }
+
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        let mut output = Vec::new();
+        for shard_id in 0..self.shard_count {
+            let provider = self.provider_for_shard(shard_id)?;
+            output.extend(
+                <SqliteDurabilityProvider as DurabilityProvider>::list_children(&provider).await?,
+            );
+        }
+        output.sort_by(|left, right| left.child_record_id.cmp(&right.child_record_id));
+        Ok(output)
+    }
+}
+
+struct FailedShardSession {
+    error: WorkflowError,
+}
+
+#[async_trait]
+impl ShardDurabilitySession for FailedShardSession {
+    fn shard_id(&self) -> u32 {
+        0
+    }
+
+    fn owner_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn lease_epoch(&self) -> Option<u64> {
+        None
+    }
+
+    async fn claim_tasks(
+        &self,
+        _input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn read_instance(
+        &self,
+        _ref_: &InstanceRef,
+        _options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn append_signal(
+        &self,
+        _input: AppendSignalInput,
+    ) -> Result<SignalRecord, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn cancel_child(&self, _input: CancelChildInput) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        _input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn heartbeat_effect(&self, _input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn complete_effect(&self, _input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn fail_effect(
+        &self,
+        _input: FailEffectInput,
+    ) -> Result<FailEffectResult, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        _input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn release_activation(
+        &self,
+        _activation_id: &str,
+        _worker_id: &str,
+    ) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn heartbeat(&self, _now: DateTime<Utc>, _lease_ms: u64) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn release(&self) -> Result<(), WorkflowError> {
+        Err(self.error.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
+pub struct PostgresDurabilityProviderOptions {
+    pub connection_string: String,
+    pub schema: Option<String>,
+    pub physical_partitions: u32,
+    pub snapshot_interval: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct PostgresDurabilityProvider {
+    inner: JsonFileDurabilityProvider,
+    client: Arc<AsyncMutex<tokio_postgres::Client>>,
+    schema: String,
+    physical_partitions: u32,
+    snapshot_interval: u64,
+}
+
+impl PostgresDurabilityProvider {
+    pub async fn create(options: PostgresDurabilityProviderOptions) -> Result<Self, WorkflowError> {
+        if options.physical_partitions == 0 {
+            return Err(WorkflowError::new("physical_partitions must be positive"));
+        }
+        let schema = normalize_postgres_schema(options.schema)?;
+        let (client, connection) =
+            tokio_postgres::connect(&options.connection_string, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("durable Postgres connection error: {error}");
+            }
+        });
+        let provider = Self {
+            inner: JsonFileDurabilityProvider::in_memory(),
+            client: Arc::new(AsyncMutex::new(client)),
+            schema,
+            physical_partitions: options.physical_partitions,
+            snapshot_interval: options
+                .snapshot_interval
+                .unwrap_or(DEFAULT_SQLITE_SNAPSHOT_INTERVAL),
+        };
+        provider.initialize_postgres_schema().await?;
+        let state = provider.load_postgres_store().await?;
+        Ok(Self {
+            inner: JsonFileDurabilityProvider::from_store(state),
+            ..provider
+        })
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    async fn initialize_postgres_schema(&self) -> Result<(), WorkflowError> {
+        let client = self.client.lock().await;
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {};",
+                quote_postgres_identifier(&self.schema)
+            ))
+            .await?;
+        client
+            .batch_execute(&format!(
+                "
+                CREATE TABLE IF NOT EXISTS {}.provider_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                ",
+                quote_postgres_identifier(&self.schema)
+            ))
+            .await?;
+        self.verify_postgres_metadata_locked(
+            &client,
+            "postgres_storage_shape",
+            "rust_append_store_v1",
+        )
+        .await?;
+        self.verify_postgres_metadata_locked(
+            &client,
+            "physical_partition_count",
+            &self.physical_partitions.to_string(),
+        )
+        .await?;
+        for partition in 0..self.physical_partitions {
+            client
+                .batch_execute(&format!(
+                    "
+                    CREATE TABLE IF NOT EXISTS {} (
+                        shard_id INTEGER PRIMARY KEY,
+                        last_entry_id BIGINT NOT NULL DEFAULT 0,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS {} (
+                        shard_id INTEGER NOT NULL,
+                        entry_id BIGINT NOT NULL,
+                        operation_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (shard_id, entry_id)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS {} (
+                        shard_id INTEGER PRIMARY KEY,
+                        last_entry_id BIGINT NOT NULL,
+                        snapshot_json TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL
+                    );
+                    ",
+                    self.postgres_table("shard_heads", partition),
+                    self.postgres_table("shard_journal", partition),
+                    self.postgres_table("shard_snapshots", partition),
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_postgres_metadata_locked(
+        &self,
+        client: &tokio_postgres::Client,
+        key: &str,
+        expected: &str,
+    ) -> Result<(), WorkflowError> {
+        let table = format!(
+            "{}.provider_metadata",
+            quote_postgres_identifier(&self.schema)
+        );
+        let row = client
+            .query_opt(
+                &format!("SELECT value FROM {table} WHERE key = $1"),
+                &[&key],
+            )
+            .await?;
+        if let Some(row) = row {
+            let actual: String = row.get(0);
+            if actual != expected {
+                return Err(WorkflowError::new(format!(
+                    "PostgresDurabilityProvider metadata mismatch for {key}: expected {expected}, found {actual}"
+                )));
+            }
+            return Ok(());
+        }
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
+                ),
+                &[&key, &expected],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn append_postgres_operation(
+        &self,
+        operation: JournalOperation,
+    ) -> Result<(), WorkflowError> {
+        let operation_json = serde_json::to_string(&operation)?;
+        let shard_id = self.postgres_shard_for_operation(&operation)?;
+        let shard_id_i32 = shard_id as i32;
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                &format!(
+                    "
+                    WITH next_head AS (
+                        INSERT INTO {} AS h (shard_id, last_entry_id, updated_at)
+                        VALUES ($1, 1, NOW())
+                        ON CONFLICT (shard_id) DO UPDATE
+                        SET last_entry_id = h.last_entry_id + 1,
+                            updated_at = NOW()
+                        RETURNING last_entry_id
+                    )
+                    INSERT INTO {} (shard_id, entry_id, operation_json, created_at)
+                    SELECT $1, last_entry_id, $2, NOW()
+                    FROM next_head
+                    RETURNING entry_id
+                    ",
+                    self.postgres_head_table_for_shard(shard_id),
+                    self.postgres_journal_table_for_shard(shard_id)
+                ),
+                &[&shard_id_i32, &operation_json],
+            )
+            .await?;
+        let next_entry_id: i64 = row.get(0);
+        if self.snapshot_interval > 0 && next_entry_id as u64 % self.snapshot_interval == 0 {
+            let snapshot = serde_json::to_string(&self.inner.snapshot_store()?)?;
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (shard_id, last_entry_id, snapshot_json, created_at)
+                         VALUES ($1, $2, $3, NOW())
+                         ON CONFLICT (shard_id) DO UPDATE SET
+                           last_entry_id = EXCLUDED.last_entry_id,
+                           snapshot_json = EXCLUDED.snapshot_json,
+                           created_at = EXCLUDED.created_at",
+                        self.postgres_snapshot_table_for_shard(shard_id)
+                    ),
+                    &[&shard_id_i32, &next_entry_id, &snapshot],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn load_postgres_store(&self) -> Result<Store, WorkflowError> {
+        let client = self.client.lock().await;
+        let mut latest_snapshot: Option<(DateTime<Utc>, String)> = None;
+        for partition in 0..self.physical_partitions {
+            let snapshot = client
+                .query_opt(
+                    &format!(
+                        "SELECT snapshot_json, created_at FROM {} ORDER BY created_at DESC LIMIT 1",
+                        self.postgres_table("shard_snapshots", partition)
+                    ),
+                    &[],
+                )
+                .await?;
+            if let Some(row) = snapshot {
+                let raw: String = row.get(0);
+                let created_at: DateTime<Utc> = row.get(1);
+                if latest_snapshot
+                    .as_ref()
+                    .is_none_or(|(current, _)| created_at > *current)
+                {
+                    latest_snapshot = Some((created_at, raw));
+                }
+            }
+        }
+        let (snapshot_created_at, store) = if let Some((created_at, raw)) = latest_snapshot {
+            (Some(created_at), serde_json::from_str(&raw)?)
+        } else {
+            (None, Store::default())
+        };
+        let provider = JsonFileDurabilityProvider::from_store(store);
+        let mut rows = Vec::new();
+        for partition in 0..self.physical_partitions {
+            let table = self.postgres_table("shard_journal", partition);
+            let partition_rows = if let Some(created_at) = snapshot_created_at {
+                client
+                    .query(
+                        &format!(
+                            "SELECT shard_id, entry_id, operation_json, created_at FROM {table} WHERE created_at > $1 ORDER BY created_at ASC, shard_id ASC, entry_id ASC"
+                        ),
+                        &[&created_at],
+                    )
+                    .await?
+            } else {
+                client
+                    .query(
+                        &format!(
+                            "SELECT shard_id, entry_id, operation_json, created_at FROM {table} ORDER BY created_at ASC, shard_id ASC, entry_id ASC"
+                        ),
+                        &[],
+                    )
+                    .await?
+            };
+            for row in partition_rows {
+                rows.push((
+                    row.get::<_, DateTime<Utc>>(3),
+                    row.get::<_, i32>(0),
+                    row.get::<_, i64>(1),
+                    row.get::<_, String>(2),
+                ));
+            }
+        }
+        rows.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
+        for row in rows {
+            let operation = serde_json::from_str::<JournalOperation>(&row.3)?;
+            apply_journal_operation(&provider, operation)?;
+        }
+        provider.snapshot_store()
+    }
+
+    fn postgres_shard_for_operation(
+        &self,
+        operation: &JournalOperation,
+    ) -> Result<u32, WorkflowError> {
+        match operation {
+            JournalOperation::ClaimShard(input) => Ok(input.shard_id),
+            JournalOperation::HeartbeatShard { shard_id, .. }
+            | JournalOperation::ReleaseShard { shard_id, .. } => Ok(*shard_id),
+            JournalOperation::ReleaseActivation { activation_id, .. } => self
+                .shard_for_activation(activation_id)
+                .ok_or_else(|| WorkflowError::new("unknown activation shard for release")),
+            JournalOperation::ClaimShardTasks { session, .. } => Ok(session.shard_id),
+            JournalOperation::CreateInstance(input) => Ok(input.partition_shard),
+            JournalOperation::CreateChildInstance(input) => Ok(input.partition_shard),
+            JournalOperation::AppendSignal(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+            JournalOperation::CancelChild(input) => {
+                self.shard_for_ref(&input.parent_workflow_id, &input.parent_run_id)
+            }
+            JournalOperation::ReserveEffect(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+            JournalOperation::HeartbeatEffect(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+            JournalOperation::CompleteEffect(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+            JournalOperation::FailEffect(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+            JournalOperation::CommitCheckpoint(input) => {
+                self.shard_for_ref(&input.workflow_id, &input.run_id)
+            }
+        }
+    }
+
+    fn shard_for_ref(&self, workflow_id: &str, run_id: &str) -> Result<u32, WorkflowError> {
+        self.inner
+            .load_instance(&InstanceRef::new(
+                workflow_id.to_string(),
+                run_id.to_string(),
+            ))?
+            .map(|instance| instance.partition_shard)
+            .ok_or_else(|| {
+                WorkflowError::new(format!(
+                    "unknown workflow instance for shard routing: {workflow_id}/{run_id}"
+                ))
+            })
+    }
+
+    fn shard_for_activation(&self, activation_id: &str) -> Option<u32> {
+        self.inner.snapshot_store().ok().and_then(|store| {
+            store
+                .tasks
+                .values()
+                .find(|task| task.activation_id == activation_id)
+                .map(|task| task.partition_shard)
+        })
+    }
+
+    fn postgres_table(&self, base: &str, partition: u32) -> String {
+        format!(
+            "{}.{}",
+            quote_postgres_identifier(&self.schema),
+            quote_postgres_identifier(&format!(
+                "{}_{}",
+                base,
+                postgres_partition_suffix(partition)
+            ))
+        )
+    }
+
+    fn postgres_head_table_for_shard(&self, shard_id: u32) -> String {
+        self.postgres_table(
+            "shard_heads",
+            self.postgres_physical_partition_for_shard(shard_id),
+        )
+    }
+
+    fn postgres_journal_table_for_shard(&self, shard_id: u32) -> String {
+        self.postgres_table(
+            "shard_journal",
+            self.postgres_physical_partition_for_shard(shard_id),
+        )
+    }
+
+    fn postgres_snapshot_table_for_shard(&self, shard_id: u32) -> String {
+        self.postgres_table(
+            "shard_snapshots",
+            self.postgres_physical_partition_for_shard(shard_id),
+        )
+    }
+
+    fn postgres_physical_partition_for_shard(&self, shard_id: u32) -> u32 {
+        shard_id % self.physical_partitions
+    }
+}
+
+#[async_trait]
+impl DurabilityProvider for PostgresDurabilityProvider {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        let output = self.inner.claim_shard_sync(input.clone())?;
+        if output.is_some() {
+            self.append_postgres_operation(JournalOperation::ClaimShard(input))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
+        Arc::new(PostgresShardSession {
+            provider: self.clone(),
+            inner: <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(
+                &self.inner,
+                input,
+            ),
+        })
+    }
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError> {
+        let output = self.inner.create_instance(input.clone())?;
+        self.append_postgres_operation(JournalOperation::CreateInstance(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError> {
+        if let Some(parent) = self.inner.load_instance(&InstanceRef::new(
+            input.parent_workflow_id.clone(),
+            input.parent_run_id.clone(),
+        ))? {
+            if input.partition_shard != parent.partition_shard {
+                return Err(WorkflowError::new(
+                    "Postgres provider requires local child workflow starts to be shard-affine",
+                ));
+            }
+        }
+        let output = self.inner.create_child_instance(input.clone())?;
+        self.append_postgres_operation(JournalOperation::CreateChildInstance(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
+            &self.inner,
+            ref_,
+            options,
+        )
+        .await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::AppendSignal(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::CancelChild(input))
+            .await
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        if matches!(output, EffectReservation::Reserved { .. }) {
+            self.append_postgres_operation(JournalOperation::ReserveEffect(input))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::HeartbeatEffect(input))
+            .await
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::CompleteEffect(input))
+            .await
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::FailEffect(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        let parent = self.inner.load_instance(&InstanceRef::new(
+            input.workflow_id.clone(),
+            input.run_id.clone(),
+        ))?;
+        if let Some(parent) = parent {
+            if input
+                .child_starts
+                .iter()
+                .any(|start| start.partition_shard != parent.partition_shard)
+            {
+                return Ok(CommitCheckpointResult {
+                    ok: false,
+                    sequence: input.expected_sequence,
+                    reason: Some("cross_shard_child_start".to_string()),
+                    retryable: Some(false),
+                    error: Some(SerializedError {
+                            name: None,
+                            message: "Postgres provider requires commit-local children to stay on the parent shard".to_string(),
+                    }),
+                });
+            }
+        }
+        let output = <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(
+            &self.inner,
+            input.clone(),
+        )
+        .await?;
+        if output.ok {
+            self.append_postgres_operation(JournalOperation::CommitCheckpoint(input))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_instances(&self.inner).await
+    }
+
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_signals(&self.inner).await
+    }
+
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_children(&self.inner).await
+    }
+}
+
+#[derive(Clone)]
+struct PostgresShardSession {
+    provider: PostgresDurabilityProvider,
+    inner: Arc<dyn ShardDurabilitySession>,
+}
+
+#[async_trait]
+impl ShardDurabilitySession for PostgresShardSession {
+    fn shard_id(&self) -> u32 {
+        self.inner.shard_id()
+    }
+
+    fn owner_id(&self) -> Option<&str> {
+        self.inner.owner_id()
+    }
+
+    fn lease_epoch(&self) -> Option<u64> {
+        self.inner.lease_epoch()
+    }
+
+    async fn claim_tasks(
+        &self,
+        input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError> {
+        let session = OpenShardInput {
+            shard_id: self.shard_id(),
+            owner_id: self.owner_id().map(str::to_string),
+            lease_epoch: self.lease_epoch(),
+        };
+        let output = self.inner.claim_tasks(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::ClaimShardTasks { session, input })
+            .await?;
+        Ok(output)
+    }
+
+    async fn read_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        self.inner.read_instance(ref_, options).await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        let output = self.inner.append_signal(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::AppendSignal(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        self.inner.cancel_child(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::CancelChild(input))
+            .await
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        let output = self.inner.get_or_reserve_effect(input.clone()).await?;
+        if matches!(output, EffectReservation::Reserved { .. }) {
+            self.provider
+                .append_postgres_operation(JournalOperation::ReserveEffect(input))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        self.inner.heartbeat_effect(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::HeartbeatEffect(input))
+            .await
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        self.inner.complete_effect(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::CompleteEffect(input))
+            .await
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        let output = self.inner.fail_effect(input.clone()).await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::FailEffect(input))
+            .await?;
+        Ok(output)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        let output = self.inner.commit_checkpoint(input.clone()).await?;
+        if output.ok {
+            self.provider
+                .append_postgres_operation(JournalOperation::CommitCheckpoint(input))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn release_activation(
+        &self,
+        activation_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkflowError> {
+        self.inner
+            .release_activation(activation_id, worker_id)
+            .await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::ReleaseActivation {
+                activation_id: activation_id.to_string(),
+                worker_id: worker_id.to_string(),
+            })
+            .await
+    }
+
+    async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError> {
+        self.inner.heartbeat(now, lease_ms).await?;
+        if let Some(owner_id) = self.owner_id() {
+            self.provider
+                .append_postgres_operation(JournalOperation::HeartbeatShard {
+                    shard_id: self.shard_id(),
+                    owner_id: owner_id.to_string(),
+                    now,
+                    lease_ms,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn release(&self) -> Result<(), WorkflowError> {
+        self.inner.release().await?;
+        if let Some(owner_id) = self.owner_id() {
+            self.provider
+                .append_postgres_operation(JournalOperation::ReleaseShard {
+                    shard_id: self.shard_id(),
+                    owner_id: owner_id.to_string(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn normalize_postgres_schema(schema: Option<String>) -> Result<String, WorkflowError> {
+    let schema = schema.unwrap_or_else(|| format!("durable_{}", Uuid::new_v4().simple()));
+    let mut chars = schema.chars();
+    let Some(first) = chars.next() else {
+        return Err(WorkflowError::new(
+            "PostgresDurabilityProvider schema must be non-empty",
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(WorkflowError::new(
+            "PostgresDurabilityProvider schema must be a valid identifier",
+        ));
+    }
+    Ok(schema)
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn postgres_partition_suffix(partition: u32) -> String {
+    format!("p{partition:02}")
+}
+
+#[derive(Clone)]
+struct JsonFileShardSession {
+    provider: JsonFileDurabilityProvider,
+    shard_id: u32,
+    owner_id: Option<String>,
+    lease_epoch: Option<u64>,
+}
+
+#[async_trait]
+impl ShardDurabilitySession for JsonFileShardSession {
+    fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    fn owner_id(&self) -> Option<&str> {
+        self.owner_id.as_deref()
+    }
+
+    fn lease_epoch(&self) -> Option<u64> {
+        self.lease_epoch
+    }
+
+    async fn claim_tasks(
+        &self,
+        input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError> {
+        claim_tasks_for_provider(&self.provider, self, input)
+    }
+
+    async fn read_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
+            &self.provider,
+            ref_,
+            options,
+        )
+        .await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(&self.provider, input)
+            .await
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(&self.provider, input)
+            .await
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+            &self.provider,
+            input,
+        )
+        .await
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(&self.provider, input)
+            .await
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(&self.provider, input)
+            .await
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(&self.provider, input).await
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(&self.provider, input)
+            .await
+    }
+
+    async fn release_activation(
+        &self,
+        activation_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkflowError> {
+        self.provider
+            .release_activation_sync(activation_id, worker_id)?;
+        Ok(())
+    }
+
+    async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError> {
+        if let Some(owner_id) = &self.owner_id {
+            self.provider
+                .heartbeat_shard_sync(self.shard_id, owner_id, now, lease_ms)?;
+        }
+        Ok(())
+    }
+
+    async fn release(&self) -> Result<(), WorkflowError> {
+        if let Some(owner_id) = &self.owner_id {
+            self.provider.release_shard_sync(self.shard_id, owner_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DurabilityProvider for JsonFileDurabilityProvider {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        self.claim_shard_sync(input)
+    }
+
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
+        Arc::new(JsonFileShardSession {
+            provider: self.clone(),
+            shard_id: input.shard_id,
+            owner_id: input.owner_id,
+            lease_epoch: input.lease_epoch,
+        })
+    }
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError> {
+        JsonFileDurabilityProvider::create_instance(self, input)
+    }
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError> {
+        JsonFileDurabilityProvider::create_child_instance(self, input)
+    }
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        let mut instance = JsonFileDurabilityProvider::load_instance(self, ref_)?;
+        if !options.include_effects {
+            if let Some(instance) = &mut instance {
+                instance.effects.clear();
+            }
+        }
+        Ok(instance)
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        JsonFileDurabilityProvider::append_signal(
+            self,
+            input.workflow_id,
+            input.run_id,
+            input.r#type,
+            input.payload,
+            input.received_at,
+        )
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        JsonFileDurabilityProvider::cancel_child(self, input)
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        JsonFileDurabilityProvider::get_or_reserve_effect(
+            self,
+            &input.workflow_id,
+            &input.run_id,
+            &input.activation_id,
+            &input.key,
+            &input.worker_id,
+            input.now,
+            input.options,
+            input.max_attempts,
+        )
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        JsonFileDurabilityProvider::heartbeat_effect(
+            self,
+            &input.workflow_id,
+            &input.run_id,
+            &input.effect_id,
+            &input.attempt_id,
+            &input.worker_id,
+            input.now,
+            input.details,
+        )
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        JsonFileDurabilityProvider::complete_effect(
+            self,
+            &input.workflow_id,
+            &input.run_id,
+            &input.effect_id,
+            &input.attempt_id,
+            &input.worker_id,
+            input.now,
+            input.result,
+        )
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        JsonFileDurabilityProvider::fail_effect(
+            self,
+            &input.workflow_id,
+            &input.run_id,
+            &input.effect_id,
+            &input.attempt_id,
+            &input.worker_id,
+            input.error,
+            input.now,
+            input.retryable,
+        )
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        JsonFileDurabilityProvider::commit_checkpoint(self, input)
+    }
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
+        JsonFileDurabilityProvider::list_instances(self)
+    }
+
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        JsonFileDurabilityProvider::list_signals(self)
+    }
+
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        JsonFileDurabilityProvider::list_children(self)
+    }
+}
+
+#[async_trait]
+impl DurabilityProvider for NullDurabilityProvider {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::claim_shard(&self.inner, input).await
+    }
+
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(&self.inner, input)
+    }
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::create_instance(&self.inner, input)
+            .await
+    }
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::create_child_instance(
+            &self.inner,
+            input,
+        )
+        .await
+    }
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
+            &self.inner,
+            ref_,
+            options,
+        )
+        .await
+    }
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(&self.inner, input).await
+    }
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(&self.inner, input).await
+    }
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+            &self.inner,
+            input,
+        )
+        .await
+    }
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input)
+            .await
+    }
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(&self.inner, input)
+            .await
+    }
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(&self.inner, input).await
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(&self.inner, input)
+            .await
+    }
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_instances(&self.inner).await
+    }
+
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_signals(&self.inner).await
+    }
+
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        <JsonFileDurabilityProvider as DurabilityProvider>::list_children(&self.inner).await
+    }
+}
+
+fn replace_tasks_for_instance(state: &mut Store, instance: &PersistedInstance) {
+    delete_tasks_for_ref(state, &instance.workflow_id, &instance.run_id);
+    if instance.status != PersistedStatus::Running {
+        return;
+    }
+    for wait in &instance.waits {
+        insert_task_for_wait(state, instance, wait);
+    }
+}
+
+fn refresh_signal_tasks_for_instance(state: &mut Store, instance: &PersistedInstance) {
+    let ids = state
+        .tasks
+        .values()
+        .filter(|task| {
+            task.workflow_id == instance.workflow_id
+                && task.run_id == instance.run_id
+                && task.sequence == instance.sequence
+                && matches!(task.event, Some(ReadyEvent::Signal { .. }))
+        })
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        delete_task(state, &id);
+    }
+    for wait in &instance.waits {
+        if matches!(wait, DurableWait::Signal { .. }) {
+            insert_task_for_wait(state, instance, wait);
+        }
+    }
+}
+
+fn refresh_child_tasks_for_instance(state: &mut Store, instance: &PersistedInstance) {
+    let ids = state
+        .tasks
+        .values()
+        .filter(|task| {
+            task.workflow_id == instance.workflow_id
+                && task.run_id == instance.run_id
+                && task.sequence == instance.sequence
+                && matches!(task.event, Some(ReadyEvent::Child { .. }))
+        })
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        delete_task(state, &id);
+    }
+    for wait in &instance.waits {
+        if matches!(wait, DurableWait::Child { .. }) {
+            insert_task_for_wait(state, instance, wait);
+        }
+    }
+}
+
+fn refresh_migration_tasks(
+    state: &mut Store,
+    shard_id: u32,
+    now: DateTime<Utc>,
+    workflows: &HashMap<String, u32>,
+) {
+    let instances = state.instances.values().cloned().collect::<Vec<_>>();
+    for instance in instances {
+        if instance.partition_shard != shard_id || instance.status != PersistedStatus::Running {
+            continue;
+        }
+        let Some(worker_version) = workflows.get(&instance.workflow_name).copied() else {
+            continue;
+        };
+        if instance.workflow_version >= worker_version {
+            let ids = state
+                .tasks
+                .values()
+                .filter(|task| {
+                    task.workflow_id == instance.workflow_id
+                        && task.run_id == instance.run_id
+                        && task.sequence == instance.sequence
+                        && task.kind == MemoryTaskKind::Migration
+                })
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<_>>();
+            for id in ids {
+                delete_task(state, &id);
+            }
+            continue;
+        }
+        let has_current_task = state.tasks.values().any(|task| {
+            task.workflow_id == instance.workflow_id
+                && task.run_id == instance.run_id
+                && task.sequence == instance.sequence
+        });
+        if has_current_task {
+            continue;
+        }
+        insert_task(
+            state,
+            &instance,
+            InsertTaskInput {
+                kind: MemoryTaskKind::Migration,
+                event_id: format!("migration-{worker_version}"),
+                ready_at: now,
+                wait_name: None,
+                event: None,
+                task_suffix: None,
+                sort_key: task_sort_key(&[
+                    format_time(now),
+                    "migration".to_string(),
+                    instance.workflow_name.clone(),
+                    instance.workflow_id.clone(),
+                    instance.run_id.clone(),
+                ]),
+            },
+        );
+    }
+}
+
+fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &DurableWait) {
+    match wait {
+        DurableWait::Run { name, ready_at } => {
+            insert_task(
+                state,
+                instance,
+                InsertTaskInput {
+                    kind: MemoryTaskKind::Run,
+                    event_id: name.clone(),
+                    ready_at: *ready_at,
+                    wait_name: None,
+                    event: None,
+                    task_suffix: None,
+                    sort_key: task_sort_key(&[
+                        format_time(*ready_at),
+                        "run".to_string(),
+                        name.clone(),
+                        instance.workflow_id.clone(),
+                        instance.run_id.clone(),
+                    ]),
+                },
+            );
+        }
+        DurableWait::Timer { name, fire_at } => {
+            insert_task(
+                state,
+                instance,
+                InsertTaskInput {
+                    kind: MemoryTaskKind::Event,
+                    event_id: format!("{}:{}", name, format_time(*fire_at)),
+                    ready_at: *fire_at,
+                    wait_name: Some(name.clone()),
+                    event: Some(ReadyEvent::Timer {
+                        fired_at: *fire_at,
+                        occurred_at: *fire_at,
+                    }),
+                    task_suffix: None,
+                    sort_key: task_sort_key(&[
+                        format_time(*fire_at),
+                        "timer".to_string(),
+                        name.clone(),
+                        format!("{}:{}", name, format_time(*fire_at)),
+                    ]),
+                },
+            );
+        }
+        DurableWait::Signal { name, r#type, .. } => {
+            let Some(signal) = state
+                .signals
+                .iter()
+                .filter(|candidate| {
+                    candidate.workflow_id == instance.workflow_id
+                        && candidate.run_id == instance.run_id
+                        && candidate.r#type == *r#type
+                        && candidate.consumed_by_sequence.is_none()
+                })
+                .min_by(compare_signals)
+                .cloned()
+            else {
+                return;
+            };
+            insert_task(
+                state,
+                instance,
+                InsertTaskInput {
+                    kind: MemoryTaskKind::Event,
+                    event_id: signal.signal_id.clone(),
+                    ready_at: signal.received_at,
+                    wait_name: Some(name.clone()),
+                    event: Some(ReadyEvent::Signal {
+                        signal_id: signal.signal_id.clone(),
+                        payload: signal.payload.clone(),
+                        occurred_at: signal.received_at,
+                    }),
+                    task_suffix: Some(name.clone()),
+                    sort_key: task_sort_key(&[
+                        format_time(signal.received_at),
+                        "signal".to_string(),
+                        name.clone(),
+                        signal.signal_id,
+                    ]),
+                },
+            );
+        }
+        DurableWait::Child {
+            name,
+            workflow_name,
+            workflow_version,
+            workflow_id,
+            run_id,
+        } => {
+            let Some(child) = state
+                .children
+                .iter()
+                .filter(|record| {
+                    record.parent_workflow_id == instance.workflow_id
+                        && record.parent_run_id == instance.run_id
+                        && record.workflow_name == *workflow_name
+                        && record.workflow_version == *workflow_version
+                        && record.workflow_id == *workflow_id
+                        && record.run_id == *run_id
+                        && record.status != ChildStatus::Started
+                        && record.delivered_by_sequence.is_none()
+                })
+                .min_by(|left, right| {
+                    (
+                        left.completed_at.unwrap_or(instance.updated_at),
+                        left.child_record_id.as_str(),
+                    )
+                        .cmp(&(
+                            right.completed_at.unwrap_or(instance.updated_at),
+                            right.child_record_id.as_str(),
+                        ))
+                })
+                .cloned()
+            else {
+                return;
+            };
+            let occurred_at = child.completed_at.unwrap_or(instance.updated_at);
+            insert_task(
+                state,
+                instance,
+                InsertTaskInput {
+                    kind: MemoryTaskKind::Event,
+                    event_id: child.child_record_id.clone(),
+                    ready_at: occurred_at,
+                    wait_name: Some(name.clone()),
+                    event: Some(ReadyEvent::Child {
+                        child_record_id: child.child_record_id.clone(),
+                        occurred_at,
+                        event: match child.status {
+                            ChildStatus::Completed => ChildEventValue::Ok {
+                                output: child.output.clone().unwrap_or(JsonValue::Null),
+                            },
+                            ChildStatus::Failed | ChildStatus::Started | ChildStatus::Abandoned => {
+                                ChildEventValue::Err {
+                                    error: child.error.clone().unwrap_or(SerializedError {
+                                        name: None,
+                                        message: "child failed".to_string(),
+                                    }),
+                                }
+                            }
+                        },
+                    }),
+                    task_suffix: None,
+                    sort_key: task_sort_key(&[
+                        format_time(occurred_at),
+                        "child".to_string(),
+                        name.clone(),
+                        child.child_record_id,
+                    ]),
+                },
+            );
+        }
+    }
+}
+
+struct InsertTaskInput {
+    kind: MemoryTaskKind,
+    event_id: String,
+    ready_at: DateTime<Utc>,
+    wait_name: Option<String>,
+    event: Option<ReadyEvent>,
+    task_suffix: Option<String>,
+    sort_key: String,
+}
+
+fn insert_task(state: &mut Store, instance: &PersistedInstance, input: InsertTaskInput) {
+    let activation_kind = match &input.event {
+        Some(ReadyEvent::Signal { .. }) => "signal",
+        Some(ReadyEvent::Timer { .. }) => "timer",
+        Some(ReadyEvent::Child { .. }) => "child",
+        None => match input.kind {
+            MemoryTaskKind::Migration => "migration",
+            MemoryTaskKind::Run => "run",
+            MemoryTaskKind::Event => "event",
+        },
+    };
+    let activation_id = activation_id(instance, activation_kind, &input.event_id);
+    let task_id = input
+        .task_suffix
+        .map(|suffix| format!("{activation_id}/{suffix}"))
+        .unwrap_or_else(|| activation_id.clone());
+    delete_task(state, &task_id);
+    state.tasks.insert(
+        task_id.clone(),
+        MemoryTask {
+            task_id,
+            activation_id,
+            workflow_name: instance.workflow_name.clone(),
+            workflow_version: instance.workflow_version,
+            workflow_id: instance.workflow_id.clone(),
+            run_id: instance.run_id.clone(),
+            partition_shard: instance.partition_shard,
+            sequence: instance.sequence,
+            kind: input.kind,
+            wait_name: input.wait_name,
+            event: input.event,
+            ready_at: input.ready_at,
+            sort_key: input.sort_key,
+            claim_owner_id: None,
+            claim_epoch: None,
+            lease_until: None,
+            blocked_until: None,
+        },
+    );
+}
+
+fn delete_tasks_for_ref(state: &mut Store, workflow_id: &str, run_id: &str) {
+    let ids = state
+        .tasks
+        .values()
+        .filter(|task| task.workflow_id == workflow_id && task.run_id == run_id)
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        delete_task(state, &id);
+    }
+}
+
+fn delete_instance_records(state: &mut Store, workflow_id: &str, run_id: &str) {
+    state.instances.remove(&instance_key(workflow_id, run_id));
+    delete_tasks_for_ref(state, workflow_id, run_id);
+    state
+        .signals
+        .retain(|signal| signal.workflow_id != workflow_id || signal.run_id != run_id);
+    state.children.retain(|child| {
+        (child.parent_workflow_id != workflow_id || child.parent_run_id != run_id)
+            && (child.workflow_id != workflow_id || child.run_id != run_id)
+    });
+}
+
+fn cancel_child_in_state(state: &mut Store, input: CancelChildInput) {
+    let Some(index) = state.children.iter().position(|record| {
+        record.parent_workflow_id == input.parent_workflow_id
+            && record.parent_run_id == input.parent_run_id
+            && record.workflow_id == input.workflow_id
+            && record.run_id == input.run_id
+            && record.status == ChildStatus::Started
+    }) else {
+        return;
+    };
+
+    let child_workflow_id = state.children[index].workflow_id.clone();
+    let child_run_id = state.children[index].run_id.clone();
+    let mut delete_child_tasks = false;
+    if let Some(child_instance) = state
+        .instances
+        .get_mut(&instance_key(&child_workflow_id, &child_run_id))
+    {
+        if child_instance.status == PersistedStatus::Running {
+            child_instance.status = PersistedStatus::Canceled;
+            child_instance.cancel_reason = Some("Child canceled by parent".to_string());
+            child_instance.waits.clear();
+            child_instance.updated_at = input.now;
+            delete_child_tasks = true;
+        }
+    }
+    if delete_child_tasks {
+        delete_tasks_for_ref(state, &child_workflow_id, &child_run_id);
+    }
+
+    let child = &mut state.children[index];
+    child.status = ChildStatus::Failed;
+    child.completed_at = Some(input.now);
+    child.error = Some(SerializedError {
+        name: Some("ChildCanceled".to_string()),
+        message: "Child canceled by parent".to_string(),
+    });
+
+    if let Some(parent) = state
+        .instances
+        .get(&instance_key(
+            &input.parent_workflow_id,
+            &input.parent_run_id,
+        ))
+        .cloned()
+    {
+        if parent.status == PersistedStatus::Running {
+            refresh_child_tasks_for_instance(state, &parent);
+        }
+    }
+}
+
+fn apply_parent_close_policy(
+    state: &mut Store,
+    parent_workflow_id: &str,
+    parent_run_id: &str,
+    now: DateTime<Utc>,
+    delivered_by_sequence: u64,
+) {
+    let child_record_ids = state
+        .children
+        .iter()
+        .filter(|record| {
+            record.parent_workflow_id == parent_workflow_id
+                && record.parent_run_id == parent_run_id
+                && record.status == ChildStatus::Started
+        })
+        .map(|record| record.child_record_id.clone())
+        .collect::<Vec<_>>();
+
+    for child_record_id in child_record_ids {
+        let Some(index) = state
+            .children
+            .iter()
+            .position(|record| record.child_record_id == child_record_id)
+        else {
+            continue;
+        };
+        if state.children[index].parent_close_policy == ParentClosePolicy::Abandon {
+            state.children[index].status = ChildStatus::Abandoned;
+            state.children[index].delivered_by_sequence = Some(delivered_by_sequence);
+            continue;
+        }
+        cancel_child_tree_for_parent_close(state, &child_record_id, now, delivered_by_sequence);
+    }
+}
+
+fn cancel_child_tree_for_parent_close(
+    state: &mut Store,
+    child_record_id: &str,
+    now: DateTime<Utc>,
+    delivered_by_sequence: u64,
+) {
+    let Some(index) = state
+        .children
+        .iter()
+        .position(|record| record.child_record_id == child_record_id)
+    else {
+        return;
+    };
+    let child_workflow_id = state.children[index].workflow_id.clone();
+    let child_run_id = state.children[index].run_id.clone();
+
+    let mut delete_child_tasks = false;
+    if let Some(child_instance) = state
+        .instances
+        .get_mut(&instance_key(&child_workflow_id, &child_run_id))
+    {
+        if child_instance.status == PersistedStatus::Running {
+            child_instance.status = PersistedStatus::Canceled;
+            child_instance.cancel_reason =
+                Some("Child canceled because parent canceled".to_string());
+            child_instance.waits.clear();
+            child_instance.updated_at = now;
+            delete_child_tasks = true;
+        }
+    }
+    if delete_child_tasks {
+        delete_tasks_for_ref(state, &child_workflow_id, &child_run_id);
+    }
+
+    let child = &mut state.children[index];
+    child.status = ChildStatus::Failed;
+    child.completed_at = Some(now);
+    child.error = Some(SerializedError {
+        name: Some("ParentClosed".to_string()),
+        message: "Child canceled because parent canceled".to_string(),
+    });
+    child.delivered_by_sequence = Some(delivered_by_sequence);
+
+    let descendants = state
+        .children
+        .iter()
+        .filter(|record| {
+            record.parent_workflow_id == child_workflow_id
+                && record.parent_run_id == child_run_id
+                && record.status == ChildStatus::Started
+        })
+        .map(|record| record.child_record_id.clone())
+        .collect::<Vec<_>>();
+    for descendant_id in descendants {
+        let Some(descendant_index) = state
+            .children
+            .iter()
+            .position(|record| record.child_record_id == descendant_id)
+        else {
+            continue;
+        };
+        if state.children[descendant_index].parent_close_policy == ParentClosePolicy::Abandon {
+            state.children[descendant_index].status = ChildStatus::Abandoned;
+            state.children[descendant_index].delivered_by_sequence = Some(delivered_by_sequence);
+            continue;
+        }
+        cancel_child_tree_for_parent_close(state, &descendant_id, now, delivered_by_sequence);
+    }
+}
+
+fn delete_task(state: &mut Store, task_id: &str) {
+    if let Some(task) = state.tasks.remove(task_id) {
+        state
+            .claimed_sequence_epochs
+            .remove(&sequence_key_for_task(&task));
+    }
+}
+
+fn sequence_key_for_task(task: &MemoryTask) -> String {
+    format!("{}\0{}\0{}", task.workflow_id, task.run_id, task.sequence)
+}
+
+fn task_sort_key(parts: &[String]) -> String {
+    parts.join("\0")
+}
+
+fn deadline_from(now: DateTime<Utc>, timeout_ms: Option<u64>) -> Option<DateTime<Utc>> {
+    timeout_ms.map(|timeout_ms| now + chrono::Duration::milliseconds(timeout_ms as i64))
+}
+
+fn assert_mutable_effect(
+    effect: &EffectRecord,
+    attempt_id: &str,
+    worker_id: &str,
+) -> Result<(), WorkflowError> {
+    if effect.status != EffectStatus::Pending {
+        return Err(WorkflowError::new(format!(
+            "effect is already terminal: {}",
+            effect.effect_id
+        )));
+    }
+    if effect.attempt_id.as_deref() != Some(attempt_id)
+        || effect.attempt_owner_id.as_deref() != Some(worker_id)
+    {
+        return Err(WorkflowError::new(format!(
+            "lost effect attempt: {}/{}",
+            effect.effect_id, attempt_id
+        )));
+    }
+    Ok(())
+}
+
+fn retry_decision_for_effect(
+    effect: &EffectRecord,
+    error: &SerializedError,
+    now: DateTime<Utc>,
+    retryable: bool,
+) -> FailEffectResult {
+    let attempt = effect.attempt.unwrap_or(1);
+    let max_attempts = effect.max_attempts.unwrap_or(1);
+    let non_retryable = error.name.as_ref().is_some_and(|name| {
+        effect
+            .non_retryable_error_names
+            .iter()
+            .any(|candidate| candidate == name)
+    });
+    if !retryable || non_retryable || attempt >= max_attempts {
+        return FailEffectResult::Failed;
+    }
+    let initial_interval_ms = effect.initial_interval_ms.unwrap_or(1_000);
+    let max_interval_ms = effect.max_interval_ms.unwrap_or(30_000);
+    let backoff_coefficient = effect.backoff_coefficient.unwrap_or(2).max(1);
+    let multiplier = backoff_coefficient.saturating_pow(attempt.saturating_sub(1));
+    let delay_ms = max_interval_ms.min(initial_interval_ms.saturating_mul(multiplier as u64));
+    let next_attempt_at = now + chrono::Duration::milliseconds(delay_ms as i64);
+    if let (Some(first), Some(max_elapsed_ms)) =
+        (effect.first_attempt_started_at, effect.max_elapsed_ms)
+    {
+        let deadline = first + chrono::Duration::milliseconds(max_elapsed_ms as i64);
+        if next_attempt_at > deadline {
+            return FailEffectResult::Failed;
+        }
+    }
+    FailEffectResult::RetryScheduled {
+        next_attempt_at,
+        next_attempt: attempt + 1,
+    }
+}
+
+fn release_tasks_for_activation(
+    state: &mut Store,
+    activation_id: &str,
+    blocked_until: Option<DateTime<Utc>>,
+) {
+    let mut sequences = Vec::new();
+    for task in state.tasks.values_mut() {
+        if task.activation_id == activation_id {
+            task.claim_owner_id = None;
+            task.claim_epoch = None;
+            task.lease_until = None;
+            task.blocked_until = blocked_until;
+            sequences.push(sequence_key_for_task(task));
+        }
+    }
+    for sequence in sequences {
+        state.claimed_sequence_epochs.remove(&sequence);
+    }
+}
+
+fn expire_activity_timeouts(
+    state: &mut Store,
+    now: DateTime<Utc>,
+    activation_filter: Option<&str>,
+    owner_filter: Option<&str>,
+    shard_filter: Option<u32>,
+) {
+    let tasks = state.tasks.values().cloned().collect::<Vec<_>>();
+    let mut releases = Vec::new();
+    for instance in state.instances.values_mut() {
+        for effect in &mut instance.effects {
+            if effect.status != EffectStatus::Pending || effect.attempt_id.is_none() {
+                continue;
+            }
+            if activation_filter.is_some_and(|activation_id| activation_id != effect.activation_id)
+            {
+                continue;
+            }
+            let task = tasks
+                .iter()
+                .find(|task| task.activation_id == effect.activation_id);
+            if shard_filter
+                .is_some_and(|shard_id| task.map(|task| task.partition_shard) != Some(shard_id))
+            {
+                continue;
+            }
+            if let Some(owner_id) = owner_filter {
+                let owner_matches = task
+                    .and_then(|task| task.claim_owner_id.as_deref())
+                    .is_some_and(|claim_owner| claim_owner == owner_id)
+                    && task
+                        .and_then(|task| task.lease_until)
+                        .is_some_and(|lease_until| lease_until >= now);
+                if !owner_matches {
+                    continue;
+                }
+            }
+            let timeout_kind = if effect
+                .start_to_close_deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                Some(ActivityTimeoutKind::StartToClose)
+            } else if effect
+                .heartbeat_deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                Some(ActivityTimeoutKind::Heartbeat)
+            } else {
+                None
+            };
+            let Some(timeout_kind) = timeout_kind else {
+                continue;
+            };
+            let error = SerializedError {
+                name: Some("ActivityTimeoutError".to_string()),
+                message: match timeout_kind {
+                    ActivityTimeoutKind::Heartbeat => {
+                        format!("Activity {} failed due to heartbeat timeout", effect.key)
+                    }
+                    ActivityTimeoutKind::StartToClose => {
+                        format!(
+                            "Activity {} failed due to start-to-close timeout",
+                            effect.key
+                        )
+                    }
+                },
+            };
+            let decision = retry_decision_for_effect(effect, &error, now, true);
+            effect.timed_out_at = Some(now);
+            effect.timeout_kind = Some(timeout_kind);
+            effect.error = Some(error.clone());
+            effect.last_failure = Some(error);
+            effect.attempt_id = None;
+            effect.attempt_owner_id = None;
+            effect.attempt_started_at = None;
+            effect.start_to_close_deadline = None;
+            effect.heartbeat_deadline = None;
+            match decision {
+                FailEffectResult::RetryScheduled {
+                    next_attempt_at,
+                    next_attempt,
+                } => {
+                    effect.status = EffectStatus::Pending;
+                    effect.next_attempt_at = Some(next_attempt_at);
+                    effect.attempt = Some(next_attempt);
+                    releases.push((effect.activation_id.clone(), Some(next_attempt_at)));
+                }
+                FailEffectResult::Failed => {
+                    effect.status = EffectStatus::Failed;
+                    releases.push((effect.activation_id.clone(), None));
+                }
+            }
+        }
+    }
+    for (activation_id, blocked_until) in releases {
+        release_tasks_for_activation(state, &activation_id, blocked_until);
+    }
+}
+
+fn claim_tasks_for_provider(
+    provider: &JsonFileDurabilityProvider,
+    session: &JsonFileShardSession,
+    input: ClaimShardTasksInput,
+) -> Result<ClaimShardTasksResult, WorkflowError> {
+    if input.limit == 0 {
+        return Err(WorkflowError::new("limit must be positive"));
+    }
+    let Some(owner_id) = &session.owner_id else {
+        return Err(WorkflowError::new(format!(
+            "shard {} is not opened with an owner",
+            session.shard_id
+        )));
+    };
+    let mut state = provider.lock()?;
+    let lease = state
+        .shard_leases
+        .get(&session.shard_id)
+        .ok_or_else(|| WorkflowError::new(format!("lost shard lease: {}", session.shard_id)))?;
+    if lease.owner_id != *owner_id || lease.lease_until < input.now {
+        return Err(WorkflowError::new(format!(
+            "lost shard lease: {}",
+            session.shard_id
+        )));
+    }
+    if let Some(epoch) = session.lease_epoch {
+        if epoch != lease.lease_epoch {
+            return Err(WorkflowError::new(format!(
+                "lost shard lease: {}",
+                session.shard_id
+            )));
+        }
+    }
+    let lease_epoch = lease.lease_epoch;
+
+    expire_activity_timeouts(
+        &mut state,
+        input.now,
+        None,
+        Some(owner_id),
+        Some(session.shard_id),
+    );
+    refresh_migration_tasks(&mut state, session.shard_id, input.now, &input.workflows);
+
+    let mut candidates = state
+        .tasks
+        .values()
+        .filter(|task| task.partition_shard == session.shard_id)
+        .filter(|task| task.ready_at <= input.now)
+        .filter(|task| {
+            task.blocked_until
+                .map_or(true, |blocked| blocked <= input.now)
+        })
+        .filter(|task| {
+            input
+                .workflows
+                .get(&task.workflow_name)
+                .is_some_and(|version| task.workflow_version <= *version)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+    let mut claims = Vec::new();
+    let mut claimed_sequences = std::collections::HashSet::new();
+    for candidate in candidates {
+        if claims.len() >= input.limit {
+            break;
+        }
+        let sequence_key = sequence_key_for_task(&candidate);
+        if claimed_sequences.contains(&sequence_key) {
+            continue;
+        }
+        if let Some(existing_epoch) = state.claimed_sequence_epochs.get(&sequence_key).copied() {
+            if existing_epoch == lease_epoch {
+                continue;
+            }
+            state.claimed_sequence_epochs.remove(&sequence_key);
+        }
+        let has_unexpired_claim = state.tasks.values().any(|task| {
+            task.workflow_id == candidate.workflow_id
+                && task.run_id == candidate.run_id
+                && task.sequence == candidate.sequence
+                && task
+                    .lease_until
+                    .is_some_and(|lease_until| lease_until > input.now)
+                && task.claim_owner_id.is_some()
+        });
+        if has_unexpired_claim {
+            continue;
+        }
+
+        let Some(instance) = state
+            .instances
+            .get(&instance_key(&candidate.workflow_id, &candidate.run_id))
+            .cloned()
+        else {
+            delete_task(&mut state, &candidate.task_id);
+            continue;
+        };
+        if instance.status != PersistedStatus::Running || instance.sequence != candidate.sequence {
+            delete_task(&mut state, &candidate.task_id);
+            continue;
+        }
+
+        if let Some(task) = state.tasks.get_mut(&candidate.task_id) {
+            task.claim_owner_id = Some(owner_id.clone());
+            task.claim_epoch = Some(lease_epoch);
+            task.lease_until =
+                Some(input.now + chrono::Duration::milliseconds(input.lease_ms as i64));
+        }
+        state
+            .claimed_sequence_epochs
+            .insert(sequence_key.clone(), lease_epoch);
+        claimed_sequences.insert(sequence_key);
+
+        let lease_until = input.now + chrono::Duration::milliseconds(input.lease_ms as i64);
+        let activation = match candidate.kind {
+            MemoryTaskKind::Migration => ClaimedActivation::Migration {
+                activation_id: candidate.activation_id.clone(),
+                workflow_name: candidate.workflow_name.clone(),
+                workflow_id: candidate.workflow_id.clone(),
+                run_id: candidate.run_id.clone(),
+                sequence: candidate.sequence,
+                activation_time: input.now,
+                lease_until,
+            },
+            MemoryTaskKind::Run => ClaimedActivation::Run {
+                activation_id: candidate.activation_id.clone(),
+                workflow_name: candidate.workflow_name.clone(),
+                workflow_id: candidate.workflow_id.clone(),
+                run_id: candidate.run_id.clone(),
+                sequence: candidate.sequence,
+                activation_time: input.now,
+                lease_until,
+            },
+            MemoryTaskKind::Event => ClaimedActivation::Event {
+                activation_id: candidate.activation_id.clone(),
+                workflow_name: candidate.workflow_name.clone(),
+                workflow_id: candidate.workflow_id.clone(),
+                run_id: candidate.run_id.clone(),
+                sequence: candidate.sequence,
+                activation_time: input.now,
+                wait_name: candidate.wait_name.clone().unwrap_or_default(),
+                event: candidate
+                    .event
+                    .clone()
+                    .ok_or_else(|| WorkflowError::new("event task missing event"))?,
+                lease_until,
+            },
+        };
+        let effects = instance
+            .effects
+            .iter()
+            .filter(|effect| effect.activation_id == candidate.activation_id)
+            .cloned()
+            .collect();
+        claims.push(ClaimedActivationWithInstance {
+            activation,
+            instance,
+            effects,
+            lease: ActivationClaimLease::Shard {
+                shard_id: session.shard_id,
+                epoch: lease_epoch,
+            },
+        });
+    }
+
+    let next_wake_at = state
+        .tasks
+        .values()
+        .filter(|task| task.partition_shard == session.shard_id)
+        .filter(|task| {
+            input
+                .workflows
+                .get(&task.workflow_name)
+                .is_some_and(|version| task.workflow_version <= *version)
+        })
+        .filter_map(|task| {
+            if let Some(blocked) = task.blocked_until {
+                if blocked > input.now {
+                    return Some(blocked);
+                }
+            }
+            (task.ready_at > input.now).then_some(task.ready_at)
+        })
+        .min();
+
+    provider.save_locked(&state)?;
+    Ok(ClaimShardTasksResult {
+        claims,
+        next_wake_at,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateInstanceInput {
     pub workflow_name: String,
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub partition_shard: u32,
     pub common: JsonValue,
     pub phase: PhaseSnapshot,
     pub waits: Vec<DurableWait>,
@@ -1380,12 +4854,13 @@ pub struct CreateInstanceInput {
     pub conflict_policy: Option<ConflictPolicy>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateChildInstanceInput {
     pub workflow_name: String,
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub partition_shard: u32,
     pub common: JsonValue,
     pub phase: PhaseSnapshot,
     pub waits: Vec<DurableWait>,
@@ -1393,7 +4868,11 @@ pub struct CreateChildInstanceInput {
     pub parent_workflow_id: String,
     pub parent_run_id: String,
     pub activation_id: String,
+    pub worker_id: String,
+    pub lease_now: DateTime<Utc>,
     pub key: String,
+    pub parent_close_policy: ParentClosePolicy,
+    pub conflict_policy: ConflictPolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1404,11 +4883,13 @@ pub struct ChildHandleValue {
     pub run_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EffectReservation {
     Reserved {
         effect_id: String,
         idempotency_key: String,
+        attempt: u32,
+        attempt_id: String,
         heartbeat_details: Option<JsonValue>,
     },
     Completed {
@@ -1419,7 +4900,7 @@ pub enum EffectReservation {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommitCheckpointInput {
     pub workflow_id: String,
     pub run_id: String,
@@ -1431,12 +4912,371 @@ pub struct CommitCheckpointInput {
     pub now: DateTime<Utc>,
     pub consume_signal_id: Option<String>,
     pub consume_child_record_id: Option<String>,
+    pub effects: Vec<CheckpointEffectMutation>,
+    pub child_starts: Vec<CheckpointChildStart>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CancelChildInput {
+    pub parent_workflow_id: String,
+    pub parent_run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub workflow_id: String,
+    pub run_id: String,
+    pub now: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CommitCheckpointResult {
     pub ok: bool,
     pub sequence: u64,
+    pub reason: Option<String>,
+    pub retryable: Option<bool>,
+    pub error: Option<SerializedError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CheckpointEffectMutation {
+    Completed { key: String, result: JsonValue },
+    Failed { key: String, error: SerializedError },
+}
+
+impl CheckpointEffectMutation {
+    fn key(&self) -> &str {
+        match self {
+            Self::Completed { key, .. } | Self::Failed { key, .. } => key,
+        }
+    }
+
+    fn to_record(
+        &self,
+        effect_id: String,
+        activation_id: String,
+        idempotency_key: String,
+        now: DateTime<Utc>,
+    ) -> EffectRecord {
+        let (status, result, error) = match self {
+            Self::Completed { result, .. } => (EffectStatus::Completed, Some(result.clone()), None),
+            Self::Failed { error, .. } => (EffectStatus::Failed, None, Some(error.clone())),
+        };
+        EffectRecord {
+            effect_id,
+            activation_id,
+            key: self.key().to_string(),
+            idempotency_key,
+            status,
+            attempt: Some(1),
+            attempt_id: None,
+            attempt_owner_id: None,
+            attempt_started_at: None,
+            start_to_close_timeout_ms: None,
+            start_to_close_deadline: None,
+            heartbeat_timeout_ms: None,
+            heartbeat_deadline: None,
+            max_attempts: Some(1),
+            max_elapsed_ms: None,
+            initial_interval_ms: Some(1_000),
+            max_interval_ms: Some(30_000),
+            backoff_coefficient: Some(2),
+            first_attempt_started_at: Some(now),
+            next_attempt_at: None,
+            last_failure: error.clone(),
+            non_retryable_error_names: Vec::new(),
+            timed_out_at: None,
+            timeout_kind: None,
+            result,
+            error,
+            heartbeat_at: None,
+            heartbeat_details: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointChildStart {
+    pub key: String,
+    pub workflow_name: String,
+    pub workflow_version: u32,
+    pub workflow_id: String,
+    pub run_id: String,
+    pub partition_shard: u32,
+    pub common: JsonValue,
+    pub phase: PhaseSnapshot,
+    pub waits: Vec<DurableWait>,
+    pub parent_close_policy: ParentClosePolicy,
+    pub conflict_policy: ConflictPolicy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardLease {
+    pub shard_id: u32,
+    pub owner_id: String,
+    pub lease_until: DateTime<Utc>,
+    pub lease_epoch: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimShardInput {
+    pub shard_id: u32,
+    pub owner_id: String,
+    pub now: DateTime<Utc>,
+    pub lease_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenShardInput {
+    pub shard_id: u32,
+    pub owner_id: Option<String>,
+    pub lease_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimShardTasksInput {
+    pub workflows: HashMap<String, u32>,
+    pub shard_count: u32,
+    pub now: DateTime<Utc>,
+    pub lease_ms: u64,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimShardTasksResult {
+    pub claims: Vec<ClaimedActivationWithInstance>,
+    pub next_wake_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimedActivationWithInstance {
+    pub activation: ClaimedActivation,
+    pub instance: PersistedInstance,
+    pub effects: Vec<EffectRecord>,
+    pub lease: ActivationClaimLease,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ActivationClaimLease {
+    Activation,
+    Shard { shard_id: u32, epoch: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ClaimedActivation {
+    Migration {
+        activation_id: String,
+        workflow_name: String,
+        workflow_id: String,
+        run_id: String,
+        sequence: u64,
+        activation_time: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    },
+    Run {
+        activation_id: String,
+        workflow_name: String,
+        workflow_id: String,
+        run_id: String,
+        sequence: u64,
+        activation_time: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    },
+    Event {
+        activation_id: String,
+        workflow_name: String,
+        workflow_id: String,
+        run_id: String,
+        sequence: u64,
+        activation_time: DateTime<Utc>,
+        wait_name: String,
+        event: ReadyEvent,
+        lease_until: DateTime<Utc>,
+    },
+}
+
+impl ClaimedActivation {
+    pub fn activation_id(&self) -> &str {
+        match self {
+            Self::Migration { activation_id, .. }
+            | Self::Run { activation_id, .. }
+            | Self::Event { activation_id, .. } => activation_id,
+        }
+    }
+
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Migration { sequence, .. }
+            | Self::Run { sequence, .. }
+            | Self::Event { sequence, .. } => *sequence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppendSignalInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub r#type: String,
+    pub payload: JsonValue,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoadInstanceOptions {
+    pub include_effects: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReserveEffectInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub key: String,
+    pub now: DateTime<Utc>,
+    pub options: ActivityOptions,
+    pub max_attempts: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatEffectInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub effect_id: String,
+    pub attempt_id: String,
+    pub now: DateTime<Utc>,
+    pub details: Option<JsonValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompleteEffectInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub effect_id: String,
+    pub attempt_id: String,
+    pub result: JsonValue,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FailEffectInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub effect_id: String,
+    pub attempt_id: String,
+    pub error: SerializedError,
+    pub now: DateTime<Utc>,
+    pub retryable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FailEffectResult {
+    Failed,
+    RetryScheduled {
+        next_attempt_at: DateTime<Utc>,
+        next_attempt: u32,
+    },
+}
+
+#[async_trait]
+pub trait ShardDurabilitySession: Send + Sync {
+    fn shard_id(&self) -> u32;
+    fn owner_id(&self) -> Option<&str>;
+    fn lease_epoch(&self) -> Option<u64>;
+
+    async fn claim_tasks(
+        &self,
+        input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError>;
+
+    async fn read_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError>;
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError>;
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError>;
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError>;
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError>;
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError>;
+
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError>;
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError>;
+
+    async fn release_activation(
+        &self,
+        activation_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkflowError>;
+
+    async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError>;
+    async fn release(&self) -> Result<(), WorkflowError>;
+}
+
+#[async_trait]
+pub trait DurabilityProvider: Send + Sync {
+    async fn claim_shard(
+        &self,
+        input: ClaimShardInput,
+    ) -> Result<Option<ShardLease>, WorkflowError>;
+    fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession>;
+
+    async fn create_instance(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceRef, WorkflowError>;
+
+    async fn create_child_instance(
+        &self,
+        input: CreateChildInstanceInput,
+    ) -> Result<ChildHandleValue, WorkflowError>;
+
+    async fn load_instance(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError>;
+
+    async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError>;
+
+    async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError>;
+
+    async fn get_or_reserve_effect(
+        &self,
+        input: ReserveEffectInput,
+    ) -> Result<EffectReservation, WorkflowError>;
+
+    async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError>;
+
+    async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError>;
+    async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError>;
+
+    async fn commit_checkpoint(
+        &self,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError>;
+
+    async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError>;
+    async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError>;
+    async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1459,33 +5299,75 @@ pub enum InstanceStatusValue {
 
 #[derive(Clone)]
 pub struct DurableRuntime {
-    provider: JsonFileDurabilityProvider,
+    provider: Arc<dyn DurabilityProvider>,
     workflows: Arc<Mutex<HashMap<String, Arc<dyn ErasedWorkflow>>>>,
     clock: Clock,
+    options: RuntimeOptions,
 }
 
 impl DurableRuntime {
-    pub fn new(provider: JsonFileDurabilityProvider) -> Self {
+    pub fn new<P>(provider: P) -> Self
+    where
+        P: DurabilityProvider + 'static,
+    {
+        Self::from_provider(Arc::new(provider))
+    }
+
+    pub fn from_provider(provider: Arc<dyn DurabilityProvider>) -> Self {
         Self {
             provider,
             workflows: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(Utc::now),
+            options: RuntimeOptions::default(),
         }
     }
 
-    pub fn with_clock(
-        provider: JsonFileDurabilityProvider,
+    pub fn from_provider_with_options(
+        provider: Arc<dyn DurabilityProvider>,
+        options: RuntimeOptions,
         clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
     ) -> Self {
         Self {
             provider,
             workflows: Arc::new(Mutex::new(HashMap::new())),
             clock: Arc::new(clock),
+            options,
         }
     }
 
-    pub fn provider(&self) -> &JsonFileDurabilityProvider {
-        &self.provider
+    pub fn with_clock<P>(
+        provider: P,
+        clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    ) -> Self
+    where
+        P: DurabilityProvider + 'static,
+    {
+        Self {
+            provider: Arc::new(provider),
+            workflows: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(clock),
+            options: RuntimeOptions::default(),
+        }
+    }
+
+    pub fn with_options<P>(
+        provider: P,
+        options: RuntimeOptions,
+        clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    ) -> Self
+    where
+        P: DurabilityProvider + 'static,
+    {
+        Self {
+            provider: Arc::new(provider),
+            workflows: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(clock),
+            options,
+        }
+    }
+
+    pub fn provider(&self) -> Arc<dyn DurabilityProvider> {
+        self.provider.clone()
     }
 
     pub fn register<W>(&self) -> Result<(), WorkflowError>
@@ -1522,18 +5404,25 @@ impl DurableRuntime {
         let run_id = options.run_id.unwrap_or_else(|| "run-1".to_string());
         let waits = workflow.materialize_waits(&start.common, &start.phase, now)?;
 
-        self.provider.create_instance(CreateInstanceInput {
-            workflow_name: W::NAME.to_string(),
-            workflow_version: W::VERSION,
-            workflow_id,
-            run_id,
-            common: start.common,
-            phase: start.phase,
-            waits,
-            now,
-            parent: None,
-            conflict_policy: options.conflict_policy,
-        })
+        self.provider
+            .create_instance(CreateInstanceInput {
+                workflow_name: W::NAME.to_string(),
+                workflow_version: W::VERSION,
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+                partition_shard: workflow_partition_shard(
+                    &workflow_id,
+                    &run_id,
+                    self.options.shard_count,
+                ),
+                common: start.common,
+                phase: start.phase,
+                waits,
+                now,
+                parent: None,
+                conflict_policy: options.conflict_policy,
+            })
+            .await
     }
 
     pub async fn signal<T>(
@@ -1545,13 +5434,15 @@ impl DurableRuntime {
     where
         T: Serialize,
     {
-        self.provider.append_signal(
-            ref_.workflow_id.clone(),
-            ref_.run_id.clone(),
-            signal_type.into(),
-            serde_json::to_value(payload)?,
-            self.now(),
-        )
+        self.provider
+            .append_signal(AppendSignalInput {
+                workflow_id: ref_.workflow_id.clone(),
+                run_id: ref_.run_id.clone(),
+                r#type: signal_type.into(),
+                payload: serde_json::to_value(payload)?,
+                received_at: self.now(),
+            })
+            .await
     }
 
     pub async fn query<W, Q>(&self, ref_: &InstanceRef, name: &str) -> Result<Q, WorkflowError>
@@ -1561,7 +5452,7 @@ impl DurableRuntime {
     {
         self.register::<W>()?;
         let workflow = self.workflow(W::NAME)?;
-        let instance = self.require_instance(ref_)?;
+        let instance = self.require_instance(ref_).await?;
         let value = workflow.query_value(name, &instance)?;
         Ok(serde_json::from_value(value)?)
     }
@@ -1571,11 +5462,23 @@ impl DurableRuntime {
         let mut activations = 0;
 
         while activations < max_activations {
-            let Some(activation) = self.next_activation()? else {
+            let remaining = max_activations - activations;
+            let batch_limit = self.options.activation_prefetch_limit.max(1).min(remaining);
+            let batch = self.next_activation_batch(batch_limit).await?;
+            if batch.is_empty() {
                 break;
-            };
-            self.run_activation(activation).await?;
-            activations += 1;
+            }
+            for activation in batch {
+                if let Err(error) = self.run_activation(activation.clone()).await {
+                    let _ = self.release_claimed_activation(&activation).await;
+                    return Err(error);
+                }
+                let _ = self.release_claimed_activation(&activation).await;
+                activations += 1;
+                if activations >= max_activations {
+                    break;
+                }
+            }
         }
 
         Ok(DrainResult { activations })
@@ -1596,203 +5499,162 @@ impl DurableRuntime {
             .ok_or_else(|| WorkflowError::new(format!("unknown workflow: {name}")))
     }
 
-    fn require_instance(&self, ref_: &InstanceRef) -> Result<PersistedInstance, WorkflowError> {
-        self.provider.load_instance(ref_)?.ok_or_else(|| {
-            WorkflowError::new(format!(
-                "unknown workflow instance: {}/{}",
-                ref_.workflow_id, ref_.run_id
-            ))
-        })
+    async fn require_instance(
+        &self,
+        ref_: &InstanceRef,
+    ) -> Result<PersistedInstance, WorkflowError> {
+        self.provider
+            .load_instance(
+                ref_,
+                LoadInstanceOptions {
+                    include_effects: true,
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                WorkflowError::new(format!(
+                    "unknown workflow instance: {}/{}",
+                    ref_.workflow_id, ref_.run_id
+                ))
+            })
     }
 
-    fn next_activation(&self) -> Result<Option<ReadyActivation>, WorkflowError> {
-        let instances = self.provider.list_instances()?;
-        let signals = self.provider.list_signals()?;
-        let children = self.provider.list_children()?;
+    async fn next_activation_batch(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReadyActivation>, WorkflowError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let now = self.now();
+        let workflows = {
+            let workflows = self
+                .workflows
+                .lock()
+                .map_err(|_| WorkflowError::new("workflow registry lock poisoned"))?;
+            workflows
+                .iter()
+                .map(|(name, workflow)| (name.clone(), workflow.version()))
+                .collect::<HashMap<_, _>>()
+        };
+        let shard_ids = if self.options.dispatch_shard_ids.is_empty() {
+            (0..self.options.shard_count).collect::<Vec<_>>()
+        } else {
+            self.options.dispatch_shard_ids.clone()
+        };
+
         let mut ready = Vec::new();
-
-        for instance in instances {
-            if instance.status != PersistedStatus::Running {
-                continue;
+        for shard_id in shard_ids {
+            if ready.len() >= limit {
+                break;
             }
-
-            let Ok(workflow) = self.workflow(&instance.workflow_name) else {
+            let Some(lease) = self
+                .provider
+                .claim_shard(ClaimShardInput {
+                    shard_id,
+                    owner_id: self.options.worker_id.clone(),
+                    now,
+                    lease_ms: self.options.shard_lease_ms,
+                })
+                .await?
+            else {
                 continue;
             };
-
-            if instance.workflow_version < workflow.version() {
-                ready.push(ReadyActivation {
-                    kind: ReadyActivationKind::Migration,
-                    workflow,
-                    instance: instance.clone(),
-                    activation_id: activation_id(
-                        &instance,
-                        "migration",
-                        &format!(
-                            "{}->{}",
-                            instance.workflow_version,
-                            instance.workflow_version + 1
-                        ),
-                    ),
-                    wait_name: None,
-                    event: None,
-                    sort: vec![
-                        format_time(instance.updated_at),
-                        "migration".to_string(),
-                        instance.workflow_id.clone(),
-                    ],
-                });
-                continue;
-            }
-
-            if instance.workflow_version > workflow.version() {
-                return Err(WorkflowError::new(format!(
-                    "workflow {} instance {}/{} is at newer version {}; worker only has {}",
-                    workflow.name(),
-                    instance.workflow_id,
-                    instance.run_id,
-                    instance.workflow_version,
-                    workflow.version()
-                )));
-            }
-
-            for wait in &instance.waits {
-                match wait {
-                    DurableWait::Run { name, ready_at } => {
-                        ready.push(ReadyActivation {
-                            kind: ReadyActivationKind::Run,
-                            workflow: workflow.clone(),
-                            instance: instance.clone(),
-                            activation_id: activation_id(&instance, "run", name),
-                            wait_name: None,
-                            event: None,
-                            sort: vec![
-                                format_time(*ready_at),
-                                "run".to_string(),
-                                name.clone(),
-                                instance.workflow_id.clone(),
-                            ],
-                        });
-                    }
-                    DurableWait::Signal { name, r#type, .. } => {
-                        let signal = signals
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.workflow_id == instance.workflow_id
-                                    && candidate.run_id == instance.run_id
-                                    && candidate.r#type == *r#type
-                                    && candidate.consumed_by_sequence.is_none()
-                            })
-                            .min_by(compare_signals);
-
-                        if let Some(signal) = signal {
-                            ready.push(ReadyActivation {
-                                kind: ReadyActivationKind::Event,
-                                workflow: workflow.clone(),
-                                instance: instance.clone(),
-                                activation_id: activation_id(
-                                    &instance,
-                                    "signal",
-                                    &signal.signal_id,
-                                ),
-                                wait_name: Some(name.clone()),
-                                event: Some(ReadyEvent::Signal {
-                                    signal_id: signal.signal_id.clone(),
-                                    payload: signal.payload.clone(),
-                                    occurred_at: signal.received_at,
-                                }),
-                                sort: vec![
-                                    format_time(signal.received_at),
-                                    "signal".to_string(),
-                                    name.clone(),
-                                    signal.signal_id.clone(),
-                                ],
-                            });
-                        }
-                    }
-                    DurableWait::Timer { name, fire_at } if *fire_at <= now => {
-                        ready.push(ReadyActivation {
-                            kind: ReadyActivationKind::Event,
-                            workflow: workflow.clone(),
-                            instance: instance.clone(),
-                            activation_id: activation_id(
-                                &instance,
-                                "timer",
-                                &format!("{}:{}", name, format_time(*fire_at)),
-                            ),
-                            wait_name: Some(name.clone()),
-                            event: Some(ReadyEvent::Timer {
-                                fired_at: now,
-                                occurred_at: *fire_at,
-                            }),
-                            sort: vec![
-                                format_time(*fire_at),
-                                "timer".to_string(),
-                                name.clone(),
-                                format!("{}:{}", name, format_time(*fire_at)),
-                            ],
-                        });
-                    }
-                    DurableWait::Timer { .. } => {}
-                    DurableWait::Child {
-                        name,
-                        workflow_id,
-                        run_id,
-                        ..
-                    } => {
-                        let child = children.iter().find(|record| {
-                            record.workflow_id == *workflow_id
-                                && record.run_id == *run_id
-                                && record.status != ChildStatus::Started
-                                && record.delivered_by_sequence.is_none()
-                        });
-
-                        if let Some(child) = child {
-                            let occurred_at = child.completed_at.unwrap_or(now);
-                            ready.push(ReadyActivation {
-                                kind: ReadyActivationKind::Event,
-                                workflow: workflow.clone(),
-                                instance: instance.clone(),
-                                activation_id: activation_id(
-                                    &instance,
-                                    "child",
-                                    &child.child_record_id,
-                                ),
-                                wait_name: Some(name.clone()),
-                                event: Some(ReadyEvent::Child {
-                                    child_record_id: child.child_record_id.clone(),
-                                    occurred_at,
-                                    event: match child.status {
-                                        ChildStatus::Completed => ChildEventValue::Ok {
-                                            output: child.output.clone().unwrap_or(JsonValue::Null),
-                                        },
-                                        ChildStatus::Failed | ChildStatus::Started => {
-                                            ChildEventValue::Err {
-                                                error: child.error.clone().unwrap_or(
-                                                    SerializedError {
-                                                        message: "child failed".to_string(),
-                                                    },
-                                                ),
-                                            }
-                                        }
-                                    },
-                                }),
-                                sort: vec![
-                                    format_time(occurred_at),
-                                    "child".to_string(),
-                                    name.clone(),
-                                    child.child_record_id.clone(),
-                                ],
-                            });
-                        }
+            let session = self.provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let claims = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: workflows.clone(),
+                    shard_count: self.options.shard_count,
+                    now,
+                    lease_ms: self.options.activation_lease_ms,
+                    limit: limit - ready.len(),
+                })
+                .await?;
+            for claim in claims.claims {
+                if let Some(activation) = self.ready_activation_from_claim(claim)? {
+                    ready.push(activation);
+                    if ready.len() >= limit {
+                        break;
                     }
                 }
             }
         }
 
-        ready.sort_by(compare_activations);
-        Ok(ready.into_iter().next())
+        Ok(ready)
+    }
+
+    fn ready_activation_from_claim(
+        &self,
+        claim: ClaimedActivationWithInstance,
+    ) -> Result<Option<ReadyActivation>, WorkflowError> {
+        let lease = claim.lease;
+        match claim.activation {
+            ClaimedActivation::Migration {
+                activation_id,
+                workflow_name,
+                ..
+            } => Ok(Some(ReadyActivation {
+                kind: ReadyActivationKind::Migration,
+                workflow: self.workflow(&workflow_name)?,
+                instance: claim.instance,
+                activation_id,
+                wait_name: None,
+                event: None,
+                lease,
+            })),
+            ClaimedActivation::Run {
+                activation_id,
+                workflow_name,
+                ..
+            } => Ok(Some(ReadyActivation {
+                kind: ReadyActivationKind::Run,
+                workflow: self.workflow(&workflow_name)?,
+                instance: claim.instance,
+                activation_id,
+                wait_name: None,
+                event: None,
+                lease,
+            })),
+            ClaimedActivation::Event {
+                activation_id,
+                workflow_name,
+                wait_name,
+                event,
+                ..
+            } => Ok(Some(ReadyActivation {
+                kind: ReadyActivationKind::Event,
+                workflow: self.workflow(&workflow_name)?,
+                instance: claim.instance,
+                activation_id,
+                wait_name: Some(wait_name),
+                event: Some(event),
+                lease,
+            })),
+        }
+    }
+
+    async fn release_claimed_activation(
+        &self,
+        activation: &ReadyActivation,
+    ) -> Result<(), WorkflowError> {
+        match activation.lease {
+            ActivationClaimLease::Shard { shard_id, epoch } => {
+                let session = self.provider.open_shard(OpenShardInput {
+                    shard_id,
+                    owner_id: Some(self.options.worker_id.clone()),
+                    lease_epoch: Some(epoch),
+                });
+                session
+                    .release_activation(&activation.activation_id, &self.options.worker_id)
+                    .await?;
+                session.release().await
+            }
+            ActivationClaimLease::Activation => Ok(()),
+        }
     }
 
     async fn run_activation(&self, activation: ReadyActivation) -> Result<(), WorkflowError> {
@@ -1800,7 +5662,7 @@ impl DurableRuntime {
             activation.instance.workflow_id.clone(),
             activation.instance.run_id.clone(),
         );
-        let latest = self.require_instance(&ref_)?;
+        let latest = self.require_instance(&ref_).await?;
         if latest.status != PersistedStatus::Running
             || latest.sequence != activation.instance.sequence
         {
@@ -1816,18 +5678,22 @@ impl DurableRuntime {
             } else {
                 Vec::new()
             };
-            self.provider.commit_checkpoint(CommitCheckpointInput {
-                workflow_id: latest.workflow_id,
-                run_id: latest.run_id,
-                expected_sequence: latest.sequence,
-                activation_id: activation.activation_id,
-                workflow_version: activation.workflow.version(),
-                next,
-                waits,
-                now: self.now(),
-                consume_signal_id: None,
-                consume_child_record_id: None,
-            })?;
+            self.provider
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: latest.workflow_id,
+                    run_id: latest.run_id,
+                    expected_sequence: latest.sequence,
+                    activation_id: activation.activation_id,
+                    workflow_version: activation.workflow.version(),
+                    next,
+                    waits,
+                    now: self.now(),
+                    consume_signal_id: None,
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await?;
             return Ok(());
         }
 
@@ -1845,9 +5711,15 @@ impl DurableRuntime {
             registry: self.workflows.clone(),
             workflow_id: latest.workflow_id.clone(),
             run_id: latest.run_id.clone(),
+            partition_shard: latest.partition_shard,
             sequence: latest.sequence,
             activation_id: activation.activation_id.clone(),
+            commit_effects: HashMap::new(),
+            commit_child_starts: HashMap::new(),
+            commit_child_key_by_ref: HashMap::new(),
             clock: self.clock.clone(),
+            worker_id: self.options.worker_id.clone(),
+            shard_count: self.options.shard_count,
         };
 
         let (transition, consume_signal_id, consume_child_record_id) = match activation.kind {
@@ -1899,18 +5771,26 @@ impl DurableRuntime {
             Vec::new()
         };
 
-        self.provider.commit_checkpoint(CommitCheckpointInput {
-            workflow_id: latest.workflow_id,
-            run_id: latest.run_id,
-            expected_sequence: latest.sequence,
-            activation_id: activation.activation_id,
-            workflow_version: activation.workflow.version(),
-            next,
-            waits,
-            now: self.now(),
-            consume_signal_id,
-            consume_child_record_id,
-        })?;
+        self.provider
+            .commit_checkpoint(CommitCheckpointInput {
+                workflow_id: latest.workflow_id,
+                run_id: latest.run_id,
+                expected_sequence: latest.sequence,
+                activation_id: activation.activation_id,
+                workflow_version: activation.workflow.version(),
+                next,
+                waits,
+                now: self.now(),
+                consume_signal_id,
+                consume_child_record_id,
+                effects: ctx
+                    .commit_effects
+                    .into_values()
+                    .filter(|effect| !matches!(effect, CheckpointEffectMutation::Completed { .. }))
+                    .collect(),
+                child_starts: ctx.commit_child_starts.into_values().collect(),
+            })
+            .await?;
 
         Ok(())
     }
@@ -1985,6 +5865,39 @@ pub struct StartOptions {
     pub conflict_policy: Option<ConflictPolicy>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeOptions {
+    pub worker_id: String,
+    pub shard_count: u32,
+    pub dispatch_shard_ids: Vec<u32>,
+    pub shard_lease_ms: u64,
+    pub activation_lease_ms: u64,
+    pub max_concurrent_activations: usize,
+    pub activation_prefetch_limit: usize,
+    pub commit_batch_size: usize,
+    pub commit_max_delay_ms: u64,
+    pub min_poll_interval_ms: u64,
+    pub max_poll_interval_ms: u64,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            worker_id: format!("worker-{}", Uuid::new_v4()),
+            shard_count: 1,
+            dispatch_shard_ids: vec![0],
+            shard_lease_ms: 30_000,
+            activation_lease_ms: 30_000,
+            max_concurrent_activations: 1,
+            activation_prefetch_limit: 32,
+            commit_batch_size: 32,
+            commit_max_delay_ms: 0,
+            min_poll_interval_ms: 10,
+            max_poll_interval_ms: 1_000,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DrainOptions {
     pub max_activations: Option<usize>,
@@ -1996,13 +5909,19 @@ pub struct DrainResult {
 }
 
 pub struct DurableContext {
-    provider: JsonFileDurabilityProvider,
+    provider: Arc<dyn DurabilityProvider>,
     registry: Arc<Mutex<HashMap<String, Arc<dyn ErasedWorkflow>>>>,
     workflow_id: String,
     run_id: String,
+    partition_shard: u32,
     sequence: u64,
     activation_id: String,
+    commit_effects: HashMap<String, CheckpointEffectMutation>,
+    commit_child_starts: HashMap<String, CheckpointChildStart>,
+    commit_child_key_by_ref: HashMap<String, String>,
     clock: Clock,
+    worker_id: String,
+    shard_count: u32,
 }
 
 impl DurableContext {
@@ -2031,42 +5950,124 @@ impl DurableContext {
         F: FnOnce(ActivityContext) -> Fut + Send,
         Fut: Future<Output = Result<T, WorkflowError>> + Send,
     {
-        match self.provider.get_or_reserve_effect(
-            &self.workflow_id,
-            &self.run_id,
-            &self.activation_id,
-            key,
-        )? {
+        if _options.durability == ActivityDurability::Commit {
+            if let Some(effect) = self.commit_effects.get(key) {
+                match effect {
+                    CheckpointEffectMutation::Completed { result, .. } => {
+                        return Ok(serde_json::from_value(result.clone())?);
+                    }
+                    CheckpointEffectMutation::Failed { error, .. } => {
+                        return Err(WorkflowError::new(error.message.clone()));
+                    }
+                }
+            }
+            let context = ActivityContext {
+                provider: None,
+                workflow_id: self.workflow_id.clone(),
+                run_id: self.run_id.clone(),
+                activation_id: self.activation_id.clone(),
+                worker_id: self.worker_id.clone(),
+                effect_id: String::new(),
+                attempt_id: String::new(),
+                idempotency_key: format!(
+                    "{}/{}/{}/{}",
+                    self.workflow_id, self.run_id, self.activation_id, key
+                ),
+                last_heartbeat_details: None,
+            };
+            let result = match f(context).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.commit_effects.insert(
+                        key.to_string(),
+                        CheckpointEffectMutation::Failed {
+                            key: key.to_string(),
+                            error: SerializedError {
+                                name: None,
+                                message: error.message.clone(),
+                            },
+                        },
+                    );
+                    return Err(error);
+                }
+            };
+            self.commit_effects.insert(
+                key.to_string(),
+                CheckpointEffectMutation::Completed {
+                    key: key.to_string(),
+                    result: serde_json::to_value(&result)?,
+                },
+            );
+            return Ok(result);
+        }
+
+        match self
+            .provider
+            .get_or_reserve_effect(ReserveEffectInput {
+                workflow_id: self.workflow_id.clone(),
+                run_id: self.run_id.clone(),
+                activation_id: self.activation_id.clone(),
+                worker_id: self.worker_id.clone(),
+                key: key.to_string(),
+                now: self.now(),
+                options: _options.clone(),
+                max_attempts: _options.max_attempts,
+            })
+            .await?
+        {
             EffectReservation::Completed { result } => Ok(serde_json::from_value(result)?),
             EffectReservation::Failed { error } => Err(WorkflowError::new(error.message)),
             EffectReservation::Reserved {
                 effect_id,
                 idempotency_key,
+                attempt: _,
+                attempt_id,
                 heartbeat_details,
             } => {
                 let context = ActivityContext {
+                    provider: Some(self.provider.clone()),
+                    workflow_id: self.workflow_id.clone(),
+                    run_id: self.run_id.clone(),
+                    activation_id: self.activation_id.clone(),
+                    worker_id: self.worker_id.clone(),
+                    effect_id: effect_id.clone(),
+                    attempt_id: attempt_id.clone(),
                     idempotency_key,
                     last_heartbeat_details: heartbeat_details,
                 };
                 match f(context).await {
                     Ok(result) => {
-                        self.provider.complete_effect(
-                            &self.workflow_id,
-                            &self.run_id,
-                            &effect_id,
-                            serde_json::to_value(&result)?,
-                        )?;
+                        self.provider
+                            .complete_effect(CompleteEffectInput {
+                                workflow_id: self.workflow_id.clone(),
+                                run_id: self.run_id.clone(),
+                                activation_id: self.activation_id.clone(),
+                                worker_id: self.worker_id.clone(),
+                                effect_id,
+                                attempt_id,
+                                result: serde_json::to_value(&result)?,
+                                now: self.now(),
+                            })
+                            .await?;
                         Ok(result)
                     }
                     Err(error) => {
-                        self.provider.fail_effect(
-                            &self.workflow_id,
-                            &self.run_id,
-                            &effect_id,
-                            SerializedError {
-                                message: error.message.clone(),
-                            },
-                        )?;
+                        self.provider
+                            .fail_effect(FailEffectInput {
+                                workflow_id: self.workflow_id.clone(),
+                                run_id: self.run_id.clone(),
+                                activation_id: self.activation_id.clone(),
+                                worker_id: self.worker_id.clone(),
+                                effect_id,
+                                attempt_id,
+                                error: SerializedError {
+                                    name: None,
+                                    message: error.message.clone(),
+                                },
+                                now: self.now(),
+                                retryable: None,
+                            })
+                            .await?;
                         Err(error)
                     }
                 }
@@ -2098,10 +6099,80 @@ impl DurableContext {
         let start = adapter.initial_value(serde_json::to_value(input)?)?;
         let now = (self.clock)();
         let workflow_id = options.workflow_id.unwrap_or_else(|| {
-            format!("{}__{}__{}", self.workflow_id, self.sequence, safe_id(key))
+            default_child_workflow_id(
+                &self.workflow_id,
+                &self.run_id,
+                self.sequence,
+                key,
+                self.shard_count,
+                self.partition_shard,
+            )
         });
         let run_id = "run-1".to_string();
+        let partition_shard = workflow_partition_shard(&workflow_id, &run_id, self.shard_count);
         let waits = adapter.materialize_waits(&start.common, &start.phase, now)?;
+
+        if options.durability == ChildDurability::Commit {
+            if let Some(existing) = self.commit_child_starts.get(key).cloned() {
+                if options.conflict_policy == ConflictPolicy::Fail {
+                    return Err(WorkflowError::new(format!(
+                        "child workflow already exists for activation key: {}/{}/{}/{}",
+                        self.workflow_id, self.run_id, self.activation_id, key
+                    )));
+                }
+                if options.conflict_policy != ConflictPolicy::TerminateExisting {
+                    return Ok(ChildHandle {
+                        workflow_name: existing.workflow_name,
+                        workflow_version: existing.workflow_version,
+                        workflow_id: existing.workflow_id,
+                        run_id: existing.run_id,
+                        workflow: PhantomData,
+                    });
+                }
+                self.commit_child_starts.remove(key);
+                self.commit_child_key_by_ref
+                    .remove(&child_ref_key(&existing.workflow_id, &existing.run_id));
+            }
+
+            let ref_key = child_ref_key(&workflow_id, &run_id);
+            if let Some(existing_key) = self.commit_child_key_by_ref.get(&ref_key).cloned() {
+                if options.conflict_policy == ConflictPolicy::TerminateExisting {
+                    self.commit_child_starts.remove(&existing_key);
+                    self.commit_child_key_by_ref.remove(&ref_key);
+                } else {
+                    return Err(WorkflowError::new(format!(
+                        "child workflow instance already exists in this activation: {}/{}",
+                        workflow_id, run_id
+                    )));
+                }
+            }
+
+            self.commit_child_starts.insert(
+                key.to_string(),
+                CheckpointChildStart {
+                    key: key.to_string(),
+                    workflow_name: W::NAME.to_string(),
+                    workflow_version: W::VERSION,
+                    workflow_id: workflow_id.clone(),
+                    run_id: run_id.clone(),
+                    partition_shard,
+                    common: start.common,
+                    phase: start.phase,
+                    waits,
+                    parent_close_policy: options.parent_close_policy,
+                    conflict_policy: options.conflict_policy,
+                },
+            );
+            self.commit_child_key_by_ref
+                .insert(ref_key, key.to_string());
+            return Ok(ChildHandle {
+                workflow_name: W::NAME.to_string(),
+                workflow_version: W::VERSION,
+                workflow_id,
+                run_id,
+                workflow: PhantomData,
+            });
+        }
 
         let handle = self
             .provider
@@ -2110,6 +6181,7 @@ impl DurableContext {
                 workflow_version: W::VERSION,
                 workflow_id,
                 run_id,
+                partition_shard,
                 common: start.common,
                 phase: start.phase,
                 waits,
@@ -2117,8 +6189,13 @@ impl DurableContext {
                 parent_workflow_id: self.workflow_id.clone(),
                 parent_run_id: self.run_id.clone(),
                 activation_id: self.activation_id.clone(),
+                worker_id: self.worker_id.clone(),
+                lease_now: now,
                 key: key.to_string(),
-            })?;
+                parent_close_policy: options.parent_close_policy,
+                conflict_policy: options.conflict_policy,
+            })
+            .await?;
 
         Ok(ChildHandle {
             workflow_name: handle.workflow_name,
@@ -2136,14 +6213,52 @@ impl DurableContext {
     where
         W: Workflow,
     {
-        self.provider.read_output(handle)
+        let ref_ = InstanceRef::new(handle.workflow_id.clone(), handle.run_id.clone());
+        let instance = self
+            .provider
+            .load_instance(
+                &ref_,
+                LoadInstanceOptions {
+                    include_effects: false,
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                WorkflowError::new(format!(
+                    "unknown child workflow: {}/{}",
+                    handle.workflow_id, handle.run_id
+                ))
+            })?;
+        if instance.status != PersistedStatus::Completed {
+            return Err(WorkflowError::new(format!(
+                "child workflow is not complete: {}/{}",
+                handle.workflow_id, handle.run_id
+            )));
+        }
+        serde_json::from_value(instance.output.unwrap_or(JsonValue::Null))
+            .map_err(WorkflowError::from)
     }
 
-    pub async fn child_cancel<W>(&mut self, _handle: &ChildHandle<W>) -> Result<(), WorkflowError>
+    pub async fn child_cancel<W>(&mut self, handle: &ChildHandle<W>) -> Result<(), WorkflowError>
     where
         W: Workflow,
     {
-        Ok(())
+        let ref_key = child_ref_key(&handle.workflow_id, &handle.run_id);
+        if let Some(key) = self.commit_child_key_by_ref.remove(&ref_key) {
+            self.commit_child_starts.remove(&key);
+            return Ok(());
+        }
+        self.provider
+            .cancel_child(CancelChildInput {
+                parent_workflow_id: self.workflow_id.clone(),
+                parent_run_id: self.run_id.clone(),
+                activation_id: self.activation_id.clone(),
+                worker_id: self.worker_id.clone(),
+                workflow_id: handle.workflow_id.clone(),
+                run_id: handle.run_id.clone(),
+                now: self.now(),
+            })
+            .await
     }
 }
 
@@ -2155,7 +6270,7 @@ struct ReadyActivation {
     activation_id: String,
     wait_name: Option<String>,
     event: Option<ReadyEvent>,
-    sort: Vec<String>,
+    lease: ActivationClaimLease,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2195,6 +6310,7 @@ where
         }),
         PersistedStatus::Failed => Ok(InstanceSnapshot::Failed {
             error: instance.error.clone().unwrap_or(SerializedError {
+                name: None,
                 message: "failed".to_string(),
             }),
         }),
@@ -2238,8 +6354,17 @@ fn compare_signals(left: &&SignalRecord, right: &&SignalRecord) -> std::cmp::Ord
         ))
 }
 
-fn compare_activations(left: &ReadyActivation, right: &ReadyActivation) -> std::cmp::Ordering {
-    left.sort.cmp(&right.sort)
+fn compare_signal_records(left: &SignalRecord, right: &SignalRecord) -> std::cmp::Ordering {
+    (
+        left.received_at,
+        left.r#type.as_str(),
+        left.signal_id.as_str(),
+    )
+        .cmp(&(
+            right.received_at,
+            right.r#type.as_str(),
+            right.signal_id.as_str(),
+        ))
 }
 
 fn activation_id(instance: &PersistedInstance, kind: &str, event_id: &str) -> String {
@@ -2257,6 +6382,22 @@ fn instance_key(workflow_id: &str, run_id: &str) -> String {
     format!("{workflow_id}:{run_id}")
 }
 
+pub fn workflow_partition_shard(workflow_id: &str, run_id: &str, shard_count: u32) -> u32 {
+    assert!(shard_count > 0, "shard_count must be positive");
+    let mut hash = 0x811c9dc5u32;
+    for byte in workflow_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(run_id.as_bytes().iter().copied())
+    {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash % shard_count
+}
+
 fn child_handle_value(record: &ChildRecord) -> ChildHandleValue {
     ChildHandleValue {
         workflow_name: record.workflow_name.clone(),
@@ -2264,6 +6405,10 @@ fn child_handle_value(record: &ChildRecord) -> ChildHandleValue {
         workflow_id: record.workflow_id.clone(),
         run_id: record.run_id.clone(),
     }
+}
+
+fn child_ref_key(workflow_id: &str, run_id: &str) -> String {
+    format!("{workflow_id}:{run_id}")
 }
 
 fn require_instance_mut<'a>(
@@ -2296,6 +6441,30 @@ fn safe_id(value: &str) -> String {
         .collect()
 }
 
+fn default_child_workflow_id(
+    parent_workflow_id: &str,
+    parent_run_id: &str,
+    sequence: u64,
+    key: &str,
+    shard_count: u32,
+    parent_shard: u32,
+) -> String {
+    let base = format!("{parent_workflow_id}__{sequence}__{}", safe_id(key));
+    if workflow_partition_shard(&base, "run-1", shard_count) == parent_shard {
+        return base;
+    }
+    for attempt in 1..=10_000 {
+        let candidate = format!("{base}__shard_{attempt}");
+        if workflow_partition_shard(&candidate, "run-1", shard_count) == parent_shard {
+            return candidate;
+        }
+    }
+    panic!(
+        "could not find shard-affine child workflow id for {}/{}/{}",
+        parent_workflow_id, parent_run_id, key
+    );
+}
+
 #[macro_export]
 macro_rules! start {
     (common: $common:expr, phase: $phase:expr $(,)?) => {
@@ -2314,13 +6483,6 @@ macro_rules! start {
 
 #[macro_export]
 macro_rules! stay {
-    ($phase:expr $(,)?) => {
-        Ok($crate::Transition::Stay($phase))
-    };
-}
-
-#[macro_export]
-macro_rules! checkpoint {
     ($phase:expr $(,)?) => {
         Ok($crate::Transition::Stay($phase))
     };
@@ -2351,7 +6513,110 @@ macro_rules! cancel {
 macro_rules! fail {
     ($error:expr $(,)?) => {
         Ok($crate::Transition::Fail($crate::SerializedError {
+            name: None,
             message: $error.to_string(),
         }))
     };
+}
+
+pub mod testing {
+    pub mod conformance {
+        use super::super::*;
+        use std::future::Future;
+
+        pub async fn assert_basic_provider_conformance<P, F, Fut>(factory: F)
+        where
+            P: DurabilityProvider + 'static,
+            F: Fn() -> Fut,
+            Fut: Future<Output = Result<P, WorkflowError>>,
+        {
+            let provider = factory().await.expect("provider factory failed");
+            let now = Utc::now();
+            let ref_ = provider
+                .create_instance(CreateInstanceInput {
+                    workflow_name: "conformance".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "conformance-instance".to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "value": "original" }),
+                    phase: PhaseSnapshot {
+                        name: "run".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![DurableWait::Run {
+                        name: "__run".to_string(),
+                        ready_at: now,
+                    }],
+                    now,
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                })
+                .await
+                .expect("create instance failed");
+
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "worker-a".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("claim shard failed")
+                .expect("shard was not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let mut workflows = HashMap::new();
+            workflows.insert("conformance".to_string(), 1);
+            let claims = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows,
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("claim tasks failed");
+            assert_eq!(claims.claims.len(), 1);
+            let claim = &claims.claims[0];
+            let result = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Completed {
+                        output: serde_json::json!({ "ok": true }),
+                    },
+                    waits: Vec::new(),
+                    now,
+                    consume_signal_id: None,
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("commit failed");
+            assert!(result.ok, "commit conflict: {:?}", result);
+            assert_eq!(result.sequence, 1);
+            let loaded = provider
+                .load_instance(
+                    &ref_,
+                    LoadInstanceOptions {
+                        include_effects: false,
+                    },
+                )
+                .await
+                .expect("load failed")
+                .expect("instance missing after commit");
+            assert_eq!(loaded.status, PersistedStatus::Completed);
+            assert_eq!(loaded.sequence, 1);
+        }
+    }
 }
