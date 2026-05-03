@@ -1,8 +1,9 @@
 # Durable Phases
 
-Durable Phases is a TypeScript runtime for phase-based durable execution. It
-turns workflow phases, durable waits, signals, timers, child workflows, and
-activities into checkpointed state backed by a `DurabilityProvider`.
+Durable Phases is a TypeScript and Rust runtime for phase-based durable
+execution. It turns workflow phases, durable waits, signals, timers, child
+workflows, and activities into checkpointed state backed by a
+`DurabilityProvider`.
 
 The runtime ships with production-shaped SQLite and Postgres providers. The
 provider boundary is now shard-native: the runtime owns a dispatch shard, opens
@@ -144,6 +145,33 @@ updates; neither used SQL task-discovery joins or ready-table scans.
 Postgres uses the same append-store shard engine as SQLite. Use
 `benchmark:postgres:processes` to measure multiple Node processes against one
 shared Postgres schema with disjoint shard ranges.
+
+### Rust vs TypeScript parity
+
+Rust parity is checked by running matching TS and Rust JSON benchmarks on the
+same machine and comparing median `processingWorkflowsPerSecond`. A ratio above
+`1.0x` means Rust is faster than TypeScript for that provider/mode pair.
+
+```bash
+npm run benchmark:rust-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 3 --physical-partitions 2
+npm run benchmark:rust-parity -- --provider null --mode all --workflows 100 --workers 4 --shards 4 --repeat 3
+```
+
+Latest local parity gate, `20` workflows, `2` workers, `2` shards, repeat `3`:
+
+| Provider | mixed | bare | activity | signal | timer | child |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Null | 6.61x | 25.27x | 22.33x | 20.35x | 16.95x | 10.88x |
+| SQLite single-file | 3.26x | 4.44x | 4.27x | 5.34x | 4.57x | 3.05x |
+| SQLite shard-file | 2.95x | 3.45x | 3.15x | 2.81x | 2.57x | 3.72x |
+| Postgres | 1.40x | 2.06x | 1.77x | 2.07x | 2.14x | 1.48x |
+
+Focused null-provider rerun, `100` workflows, `4` workers, `4` shards, repeat
+`3`:
+
+| Provider | mixed | bare | activity | signal | timer | child |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Null | 2.45x | 7.97x | 8.95x | 6.97x | 7.67x | 2.73x |
 
 ## Provider conformance
 
