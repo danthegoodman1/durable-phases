@@ -145,44 +145,14 @@ Postgres uses the same append-store shard engine as SQLite. Use
 `benchmark:postgres:processes` to measure multiple Node processes against one
 shared Postgres schema with disjoint shard ranges.
 
-### Rust vs TypeScript parity
-
-Rust parity is checked by running matching TS and Rust JSON benchmarks on the
-same machine and comparing median `processingWorkflowsPerSecond`. A ratio above
-`1.0x` means Rust is faster than TypeScript for that provider/mode pair.
-The Rust crate no longer exposes a JSON-file provider; examples and restart
-tests use the null, SQLite, SQLite shard-file, or Postgres providers. Rust
-execution is routed through shard-owned Tokio actors. SQLite writes are owned
-by a dedicated blocking writer, and Postgres uses a round-robin async client
-pool.
-
-```bash
-npm run benchmark:rust-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 3 --physical-partitions 2
-npm run benchmark:rust-parity -- --provider null --mode all --workflows 100 --workers 4 --shards 4 --repeat 3
-```
-
-Latest local parity gate, `20` workflows, `2` workers, `2` shards, repeat `3`:
-
-| Provider | mixed | bare | activity | signal | timer | child |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null | 4.298x | 16.592x | 14.262x | 14.090x | 16.385x | 6.500x |
-| SQLite single-file | 12.670x | 13.787x | 13.203x | 15.346x | 16.453x | 12.324x |
-| SQLite shard-file | 10.391x | 13.041x | 11.847x | 12.470x | 10.666x | 9.122x |
-| Postgres | 3.594x | 4.203x | 4.076x | 4.282x | 4.221x | 3.733x |
-
-Focused null-provider rerun, `100` workflows, `4` workers, `4` shards, repeat
-`3`:
-
-| Provider | mixed | bare | activity | signal | timer | child |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null | 2.565x | 6.388x | 7.489x | 5.712x | 7.034x | 3.861x |
-
-### Go parity
+### Runtime parity
 
 The Go runtime lives in [`go/`](go/). It has its own `go:generate` workflow
 authoring path, reusable provider conformance tests, SQLite single-file,
 SQLite shard-file, and Postgres append-store providers. The Go module does not
-include a JSON/file durability provider.
+include a JSON/file durability provider. The Rust crate also no longer exposes
+a JSON-file provider; examples and restart tests use the null, SQLite, SQLite
+shard-file, or Postgres providers.
 
 ```bash
 cd go
@@ -191,37 +161,40 @@ go test ./...
 go run ./cmd/durable-demo immediate-and-signal
 go run ./cmd/durable-bench --provider sqlite --mode mixed --workflows 100 --json
 cd ..
-npm run benchmark:full-parity -- --provider sqlite --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --json
+npm run benchmark:full-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --physical-partitions 2 --json
 ```
 
 Latest local TS/Rust/Go parity smoke, `20` workflows, `2` workers, `2` shards,
-repeat `1`. Values are `processingWorkflowsPerSecond`; all rows reported
-`correct=true`.
+repeat `1`, with Postgres using local Docker and `physicalPartitions=2`.
+Throughput columns are `processingWorkflowsPerSecond`; multiplier columns are
+relative to TypeScript. All rows reported `correct=true`.
 
-| Provider | Mode | TypeScript | Rust | Go | Go / TS |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Null | mixed | 982.67 | 7,062.36 | 5,450.46 | 5.55x |
-| Null | bare | 1,861.48 | 45,091.66 | 21,786.49 | 11.70x |
-| Null | activity | 1,658.97 | 36,204.53 | 30,458.79 | 18.36x |
-| Null | signal | 1,113.80 | 31,356.12 | 22,174.99 | 19.91x |
-| Null | timer | 1,659.93 | 34,297.96 | 25,028.66 | 15.08x |
-| Null | child | 1,200.20 | 12,058.49 | 8,061.67 | 6.72x |
-| SQLite single-file | mixed | 209.38 | 775.46 | 285.84 | 1.37x |
-| SQLite single-file | bare | 661.01 | 1,723.12 | 1,294.08 | 1.96x |
-| SQLite single-file | activity | 601.42 | 6,553.80 | 1,464.57 | 2.44x |
-| SQLite single-file | signal | 668.65 | 3,053.94 | 783.89 | 1.17x |
-| SQLite single-file | timer | 694.60 | 2,908.24 | 1,504.24 | 2.17x |
-| SQLite single-file | child | 335.27 | 2,517.83 | 555.82 | 1.66x |
-| SQLite shard-file | mixed | 209.58 | 1,181.41 | 467.55 | 2.23x |
-| SQLite shard-file | bare | 688.15 | 4,882.96 | 1,550.33 | 2.25x |
-| SQLite shard-file | activity | 588.23 | 1,537.34 | 2,159.85 | 3.67x |
-| SQLite shard-file | signal | 690.36 | 4,307.95 | 1,231.39 | 1.78x |
-| SQLite shard-file | timer | 689.08 | 5,732.37 | 2,095.03 | 3.04x |
-| SQLite shard-file | child | 329.91 | 1,714.60 | 901.06 | 2.73x |
-
-Postgres Go conformance and restart tests are wired to run when
-`DURABLE_POSTGRES_URL` is set. They were not included in the local Go benchmark
-table above because this run did not have `DURABLE_POSTGRES_URL` configured.
+| Provider | Mode | TypeScript | Rust | Rust / TS | Go | Go / TS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Null | mixed | 982.67 | 7,062.36 | 7.19x | 5,450.46 | 5.55x |
+| Null | bare | 1,861.48 | 45,091.66 | 24.22x | 21,786.49 | 11.70x |
+| Null | activity | 1,658.97 | 36,204.53 | 21.82x | 30,458.79 | 18.36x |
+| Null | signal | 1,113.80 | 31,356.12 | 28.15x | 22,174.99 | 19.91x |
+| Null | timer | 1,659.93 | 34,297.96 | 20.66x | 25,028.66 | 15.08x |
+| Null | child | 1,200.20 | 12,058.49 | 10.05x | 8,061.67 | 6.72x |
+| SQLite single-file | mixed | 209.38 | 775.46 | 3.70x | 285.84 | 1.37x |
+| SQLite single-file | bare | 661.01 | 1,723.12 | 2.61x | 1,294.08 | 1.96x |
+| SQLite single-file | activity | 601.42 | 6,553.80 | 10.90x | 1,464.57 | 2.44x |
+| SQLite single-file | signal | 668.65 | 3,053.94 | 4.57x | 783.89 | 1.17x |
+| SQLite single-file | timer | 694.60 | 2,908.24 | 4.19x | 1,504.24 | 2.17x |
+| SQLite single-file | child | 335.27 | 2,517.83 | 7.51x | 555.82 | 1.66x |
+| SQLite shard-file | mixed | 209.58 | 1,181.41 | 5.64x | 467.55 | 2.23x |
+| SQLite shard-file | bare | 688.15 | 4,882.96 | 7.10x | 1,550.33 | 2.25x |
+| SQLite shard-file | activity | 588.23 | 1,537.34 | 2.61x | 2,159.85 | 3.67x |
+| SQLite shard-file | signal | 690.36 | 4,307.95 | 6.24x | 1,231.39 | 1.78x |
+| SQLite shard-file | timer | 689.08 | 5,732.37 | 8.32x | 2,095.03 | 3.04x |
+| SQLite shard-file | child | 329.91 | 1,714.60 | 5.20x | 901.06 | 2.73x |
+| Postgres | mixed | 176.41 | 720.99 | 4.09x | 141.99 | 0.80x |
+| Postgres | bare | 541.28 | 2,441.69 | 4.51x | 491.82 | 0.91x |
+| Postgres | activity | 531.10 | 2,263.58 | 4.26x | 588.19 | 1.11x |
+| Postgres | signal | 535.72 | 2,602.77 | 4.86x | 331.44 | 0.62x |
+| Postgres | timer | 534.73 | 2,292.68 | 4.29x | 536.52 | 1.00x |
+| Postgres | child | 272.86 | 1,133.09 | 4.15x | 265.76 | 0.97x |
 
 ## Provider conformance
 

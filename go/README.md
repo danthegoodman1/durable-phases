@@ -72,13 +72,14 @@ child conflict policies, and parent-close behavior.
 Latest local TS/Rust/Go smoke:
 
 ```sh
-npm run benchmark:full-parity -- --provider sqlite --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --json
+npm run benchmark:full-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --physical-partitions 2 --json
 ```
 
-For the Go SQLite provider, every mode reported `correct=true` and these
-processing workflow rates:
+For the Go providers, every mode reported `correct=true` and these processing
+workflow rates:
 
 | Provider | mixed | bare | activity | signal | timer | child |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | SQLite single-file | 285.84 | 1,294.08 | 1,464.57 | 783.89 | 1,504.24 | 555.82 |
 | SQLite shard-file | 467.55 | 1,550.33 | 2,159.85 | 1,231.39 | 2,095.03 | 901.06 |
+| Postgres | 141.99 | 491.82 | 588.19 | 331.44 | 536.52 | 265.76 |

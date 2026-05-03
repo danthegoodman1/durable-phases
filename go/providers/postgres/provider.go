@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS %s.dispatch_shards (
 `, quoteIdent(p.schema), quoteIdent(p.schema))); err != nil {
 		return err
 	}
-	if err := p.verifyMetadata(ctx, "postgres_storage_shape", "go_append_store_v1"); err != nil {
+	if err := p.verifyMetadata(ctx, "postgres_storage_shape", "go_append_store_v2"); err != nil {
 		return err
 	}
 	if err := p.verifyMetadata(ctx, "physical_partition_count", fmt.Sprint(p.physicalPartitions)); err != nil {
@@ -151,14 +151,14 @@ CREATE TABLE IF NOT EXISTS %s (
 CREATE TABLE IF NOT EXISTS %s (
   shard_id INTEGER NOT NULL,
   entry_id BIGINT NOT NULL,
-  operation_json JSONB NOT NULL,
+  operation_json TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (shard_id, entry_id)
 );
 CREATE TABLE IF NOT EXISTS %s (
   shard_id INTEGER PRIMARY KEY,
   last_entry_id BIGINT NOT NULL,
-  snapshot_json JSONB NOT NULL,
+  snapshot_json TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
 );
 `, p.table("shard_heads", partition), p.table("shard_journal", partition), p.table("shard_snapshots", partition))); err != nil {
@@ -190,7 +190,7 @@ func (p *Provider) reload(ctx context.Context) error {
 	var latestAt time.Time
 	var latestEntry int64
 	for partition := 0; partition < p.physicalPartitions; partition++ {
-		var raw []byte
+		var raw string
 		var at time.Time
 		var entry int64
 		err := p.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT snapshot_json, created_at, last_entry_id FROM %s ORDER BY created_at DESC LIMIT 1`, p.table("shard_snapshots", partition))).Scan(&raw, &at, &entry)
@@ -201,7 +201,7 @@ func (p *Provider) reload(ctx context.Context) error {
 			return err
 		}
 		if latestRaw == nil || at.After(latestAt) {
-			latestRaw = raw
+			latestRaw = []byte(raw)
 			latestAt = at
 			latestEntry = entry
 		}
@@ -273,7 +273,7 @@ WITH next_head AS (
   RETURNING last_entry_id
 )
 INSERT INTO %s (shard_id, entry_id, operation_json, created_at)
-SELECT $1, last_entry_id, $2::jsonb, NOW()
+SELECT $1, last_entry_id, $2, NOW()
 FROM next_head
 RETURNING entry_id
 `, p.table("shard_heads", partition), p.table("shard_journal", partition)), shardID, string(raw)).Scan(&entryID)
@@ -284,7 +284,7 @@ RETURNING entry_id
 	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 INSERT INTO %s (shard_id, last_entry_id, snapshot_json, created_at)
-VALUES ($1, $2, $3::jsonb, NOW())
+VALUES ($1, $2, $3, NOW())
 ON CONFLICT (shard_id) DO UPDATE SET
   last_entry_id = EXCLUDED.last_entry_id,
   snapshot_json = EXCLUDED.snapshot_json,
