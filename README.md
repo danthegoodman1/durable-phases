@@ -1,6 +1,6 @@
 # Durable Phases
 
-Durable Phases is a TypeScript and Rust runtime for phase-based durable
+Durable Phases is a TypeScript, Rust, and Go runtime for phase-based durable
 execution. It turns workflow phases, durable waits, signals, timers, child
 workflows, and activities into checkpointed state backed by a
 `DurabilityProvider`.
@@ -18,6 +18,7 @@ their own durable attempt fencing.
 npm run demo
 npm test
 npm run build
+cd go && go generate ./... && go test ./...
 ```
 
 The demos in [`src/demos/`](src/demos/) cover:
@@ -176,6 +177,52 @@ Focused null-provider rerun, `100` workflows, `4` workers, `4` shards, repeat
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Null | 2.565x | 6.388x | 7.489x | 5.712x | 7.034x | 3.861x |
 
+### Go parity
+
+The Go runtime lives in [`go/`](go/). It has its own `go:generate` workflow
+authoring path, reusable provider conformance tests, SQLite single-file,
+SQLite shard-file, and Postgres append-store providers. The Go module does not
+include a JSON/file durability provider.
+
+```bash
+cd go
+go generate ./...
+go test ./...
+go run ./cmd/durable-demo immediate-and-signal
+go run ./cmd/durable-bench --provider sqlite --mode mixed --workflows 100 --json
+cd ..
+npm run benchmark:full-parity -- --provider sqlite --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --json
+```
+
+Latest local TS/Rust/Go parity smoke, `20` workflows, `2` workers, `2` shards,
+repeat `1`. Values are `processingWorkflowsPerSecond`; all rows reported
+`correct=true`.
+
+| Provider | Mode | TypeScript | Rust | Go | Go / TS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Null | mixed | 982.67 | 7,062.36 | 5,450.46 | 5.55x |
+| Null | bare | 1,861.48 | 45,091.66 | 21,786.49 | 11.70x |
+| Null | activity | 1,658.97 | 36,204.53 | 30,458.79 | 18.36x |
+| Null | signal | 1,113.80 | 31,356.12 | 22,174.99 | 19.91x |
+| Null | timer | 1,659.93 | 34,297.96 | 25,028.66 | 15.08x |
+| Null | child | 1,200.20 | 12,058.49 | 8,061.67 | 6.72x |
+| SQLite single-file | mixed | 209.38 | 775.46 | 285.84 | 1.37x |
+| SQLite single-file | bare | 661.01 | 1,723.12 | 1,294.08 | 1.96x |
+| SQLite single-file | activity | 601.42 | 6,553.80 | 1,464.57 | 2.44x |
+| SQLite single-file | signal | 668.65 | 3,053.94 | 783.89 | 1.17x |
+| SQLite single-file | timer | 694.60 | 2,908.24 | 1,504.24 | 2.17x |
+| SQLite single-file | child | 335.27 | 2,517.83 | 555.82 | 1.66x |
+| SQLite shard-file | mixed | 209.58 | 1,181.41 | 467.55 | 2.23x |
+| SQLite shard-file | bare | 688.15 | 4,882.96 | 1,550.33 | 2.25x |
+| SQLite shard-file | activity | 588.23 | 1,537.34 | 2,159.85 | 3.67x |
+| SQLite shard-file | signal | 690.36 | 4,307.95 | 1,231.39 | 1.78x |
+| SQLite shard-file | timer | 689.08 | 5,732.37 | 2,095.03 | 3.04x |
+| SQLite shard-file | child | 329.91 | 1,714.60 | 901.06 | 2.73x |
+
+Postgres Go conformance and restart tests are wired to run when
+`DURABLE_POSTGRES_URL` is set. They were not included in the local Go benchmark
+table above because this run did not have `DURABLE_POSTGRES_URL` configured.
+
 ## Provider conformance
 
 Rust providers should run `durable::testing::conformance`, which now covers
@@ -200,6 +247,25 @@ describeDurabilityProviderConformance({
         return { provider, close: () => provider.close?.() }
       },
       cleanup: () => sharedStore.destroy(),
+    }
+  },
+})
+```
+
+Go providers should run
+[`testing/conformance.AssertProviderConformance`](go/testing/conformance/conformance.go).
+The in-tree Go suite applies it to the shared memory shard engine, SQLite
+single-file, SQLite shard-file, and Postgres when `DURABLE_POSTGRES_URL` is set:
+
+```go
+conformance.AssertProviderConformance(t, conformance.Factory{
+  Name: "MyProvider",
+  NewStore: func(t *testing.T) conformance.Store {
+    return conformance.Store{
+      New: func(t *testing.T) conformance.ProviderHandle {
+        provider := newMyProvider(t)
+        return conformance.ProviderHandle{Provider: provider, Close: provider.Close}
+      },
     }
   },
 })
