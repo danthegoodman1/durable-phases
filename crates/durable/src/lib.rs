@@ -3079,12 +3079,12 @@ struct SqliteWriterInner {
 enum SqliteWriterCommand {
     AppendJournal {
         operation_json: String,
-        response: std::sync::mpsc::Sender<Result<u64, WorkflowError>>,
+        response: oneshot::Sender<Result<u64, WorkflowError>>,
     },
     WriteSnapshot {
         entry_id: u64,
         snapshot_json: String,
-        response: std::sync::mpsc::Sender<Result<(), WorkflowError>>,
+        response: oneshot::Sender<Result<(), WorkflowError>>,
     },
     PragmaString {
         pragma: String,
@@ -3095,7 +3095,7 @@ enum SqliteWriterCommand {
         response: std::sync::mpsc::Sender<Result<i64, WorkflowError>>,
     },
     Shutdown {
-        response: std::sync::mpsc::Sender<Result<(), WorkflowError>>,
+        response: oneshot::Sender<Result<(), WorkflowError>>,
     },
 }
 
@@ -3186,20 +3186,16 @@ impl SqliteWriter {
     async fn request<T, F>(&self, build: F) -> Result<T, WorkflowError>
     where
         T: Send + 'static,
-        F: FnOnce(std::sync::mpsc::Sender<Result<T, WorkflowError>>) -> SqliteWriterCommand,
+        F: FnOnce(oneshot::Sender<Result<T, WorkflowError>>) -> SqliteWriterCommand,
     {
-        let (response, receiver) = std::sync::mpsc::channel();
+        let (response, receiver) = oneshot::channel();
         self.inner
             .sender
             .send(build(response))
             .map_err(|_| WorkflowError::new("sqlite writer is closed"))?;
-        tokio::task::spawn_blocking(move || {
-            receiver
-                .recv()
-                .map_err(|_| WorkflowError::new("sqlite writer closed before responding"))?
-        })
-        .await
-        .map_err(|error| WorkflowError::new(error.to_string()))?
+        receiver
+            .await
+            .map_err(|_| WorkflowError::new("sqlite writer closed before responding"))?
     }
 
     fn request_blocking<T, F>(&self, build: F) -> Result<T, WorkflowError>
@@ -3265,14 +3261,13 @@ fn sqlite_append_journal(
     operation_json: String,
 ) -> Result<u64, WorkflowError> {
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let tx = connection.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO shard_journal (operation_json, created_at) VALUES (?1, ?2)",
-        rusqlite::params![operation_json, now],
-    )?;
-    let entry_id = tx.last_insert_rowid() as u64;
-    tx.commit()?;
-    Ok(entry_id)
+    {
+        let mut statement = connection.prepare_cached(
+            "INSERT INTO shard_journal (operation_json, created_at) VALUES (?1, ?2)",
+        )?;
+        statement.execute(rusqlite::params![operation_json, now])?;
+    }
+    Ok(connection.last_insert_rowid() as u64)
 }
 
 fn sqlite_write_snapshot(
@@ -3281,17 +3276,15 @@ fn sqlite_write_snapshot(
     snapshot_json: String,
 ) -> Result<(), WorkflowError> {
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let tx = connection.unchecked_transaction()?;
-    tx.execute(
+    let mut statement = connection.prepare_cached(
         "INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
          VALUES (1, ?1, ?2, ?3)
          ON CONFLICT(snapshot_id) DO UPDATE SET
            last_entry_id = excluded.last_entry_id,
            snapshot_json = excluded.snapshot_json,
            created_at = excluded.created_at",
-        rusqlite::params![entry_id, snapshot_json, now],
     )?;
-    tx.commit()?;
+    statement.execute(rusqlite::params![entry_id, snapshot_json, now])?;
     Ok(())
 }
 

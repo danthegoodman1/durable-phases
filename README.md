@@ -176,7 +176,9 @@ npm run benchmark:full-parity -- --provider all --mode all --workflows 20 --work
 ```
 
 Latest local TS/Rust/Go parity smoke, `20` workflows, `2` workers, `2` shards,
-repeat `1`, with Postgres using local Docker and `physicalPartitions=2`.
+with Postgres using local Docker and `physicalPartitions=2`. The SQLite rows
+were refreshed with `repeat 3` after the Rust SQLite writer optimization;
+non-SQLite rows are from the prior `repeat 1` smoke.
 Throughput columns are `processingWorkflowsPerSecond`; multiplier columns are
 relative to TypeScript. All rows reported `correct=true`.
 
@@ -188,18 +190,18 @@ relative to TypeScript. All rows reported `correct=true`.
 | Null | signal | 1,113.80 | 31,356.12 | 28.15x | 22,174.99 | 19.91x |
 | Null | timer | 1,659.93 | 34,297.96 | 20.66x | 25,028.66 | 15.08x |
 | Null | child | 1,200.20 | 12,058.49 | 10.05x | 8,061.67 | 6.72x |
-| SQLite single-file | mixed | 209.38 | 775.46 | 3.70x | 285.84 | 1.37x |
-| SQLite single-file | bare | 661.01 | 1,723.12 | 2.61x | 1,294.08 | 1.96x |
-| SQLite single-file | activity | 601.42 | 6,553.80 | 10.90x | 1,464.57 | 2.44x |
-| SQLite single-file | signal | 668.65 | 3,053.94 | 4.57x | 783.89 | 1.17x |
-| SQLite single-file | timer | 694.60 | 2,908.24 | 4.19x | 1,504.24 | 2.17x |
-| SQLite single-file | child | 335.27 | 2,517.83 | 7.51x | 555.82 | 1.66x |
-| SQLite shard-file | mixed | 209.58 | 1,181.41 | 5.64x | 467.55 | 2.23x |
-| SQLite shard-file | bare | 688.15 | 4,882.96 | 7.10x | 1,550.33 | 2.25x |
-| SQLite shard-file | activity | 588.23 | 1,537.34 | 2.61x | 2,159.85 | 3.67x |
-| SQLite shard-file | signal | 690.36 | 4,307.95 | 6.24x | 1,231.39 | 1.78x |
-| SQLite shard-file | timer | 689.08 | 5,732.37 | 8.32x | 2,095.03 | 3.04x |
-| SQLite shard-file | child | 329.91 | 1,714.60 | 5.20x | 901.06 | 2.73x |
+| SQLite single-file | mixed | 209.13 | 1,972.09 | 9.43x | 349.13 | 1.67x |
+| SQLite single-file | bare | 720.45 | 7,306.05 | 10.14x | 1,728.55 | 2.40x |
+| SQLite single-file | activity | 662.36 | 6,982.53 | 10.54x | 1,598.48 | 2.41x |
+| SQLite single-file | signal | 669.84 | 7,802.72 | 11.65x | 883.02 | 1.32x |
+| SQLite single-file | timer | 665.41 | 7,291.62 | 10.96x | 1,558.81 | 2.34x |
+| SQLite single-file | child | 331.01 | 3,233.61 | 9.77x | 591.07 | 1.79x |
+| SQLite shard-file | mixed | 210.87 | 2,383.62 | 11.30x | 590.60 | 2.80x |
+| SQLite shard-file | bare | 661.47 | 8,261.76 | 12.49x | 2,605.52 | 3.94x |
+| SQLite shard-file | activity | 634.13 | 7,946.62 | 12.53x | 2,261.20 | 3.57x |
+| SQLite shard-file | signal | 662.98 | 8,484.31 | 12.80x | 1,309.73 | 1.98x |
+| SQLite shard-file | timer | 679.10 | 8,083.53 | 11.90x | 2,199.02 | 3.24x |
+| SQLite shard-file | child | 338.89 | 3,367.41 | 9.94x | 928.84 | 2.74x |
 | Postgres | mixed | 195.01 | 734.09 | 3.76x | 724.59 | 3.72x |
 | Postgres | bare | 606.29 | 2,292.31 | 3.78x | 1,250.35 | 2.06x |
 | Postgres | activity | 567.70 | 2,375.57 | 4.18x | 1,915.16 | 3.37x |
