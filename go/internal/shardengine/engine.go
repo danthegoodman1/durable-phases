@@ -334,6 +334,26 @@ func (p *Provider) LoadInstance(_ context.Context, ref durable.InstanceRef, opti
 	return &out, nil
 }
 
+func (p *Provider) ShardForRef(ref durable.InstanceRef) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	instance, ok := p.instances[refKey(ref.WorkflowID, ref.RunID)]
+	if !ok {
+		return 0, false
+	}
+	return instance.PartitionShard, true
+}
+
+func (p *Provider) ShardForActivation(activationID string) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tasks := p.tasksForActivationLocked(activationID)
+	if len(tasks) == 0 {
+		return 0, false
+	}
+	return tasks[0].PartitionShard, true
+}
+
 func (p *Provider) AppendSignal(_ context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

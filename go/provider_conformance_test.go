@@ -2,7 +2,6 @@ package durable_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 	postgresprovider "github.com/danthegoodman1/durable-phases/go/providers/postgres"
 	sqliteprovider "github.com/danthegoodman1/durable-phases/go/providers/sqlite"
 	"github.com/danthegoodman1/durable-phases/go/testing/conformance"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestMemoryProviderConformance(t *testing.T) {
@@ -98,11 +97,11 @@ func TestPostgresProviderConformanceWhenConfigured(t *testing.T) {
 		t.Skip("DURABLE_POSTGRES_URL is not set")
 	}
 	schema := fmt.Sprintf("durable_go_conformance_%d", time.Now().UnixNano())
-	db, err := sql.Open("pgx", url)
+	pool, err := pgxpool.New(context.Background(), url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer pool.Close()
 	conformance.AssertProviderConformance(t, conformance.Factory{
 		Name: "Postgres",
 		NewStore: func(t *testing.T) conformance.Store {
@@ -129,7 +128,7 @@ func TestPostgresProviderConformanceWhenConfigured(t *testing.T) {
 					if provider != nil {
 						_ = provider.Close(ctx)
 					}
-					_, err := db.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+					_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 					return err
 				},
 			}

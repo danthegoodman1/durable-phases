@@ -18,16 +18,26 @@ their own durable attempt fencing.
 npm run demo
 npm test
 npm run build
-cd go && go generate ./... && go test ./...
+cd go
+go generate ./...
+go test ./...
+go run ./examples/index
 ```
 
-The demos in [`src/demos/`](src/demos/) cover:
+The TypeScript demos in [`src/demos/`](src/demos/), Rust examples in
+[`crates/durable/examples/`](crates/durable/examples/), and Go examples in
+[`go/examples/`](go/examples/) cover the same workflow set:
 
 - immediate `run` phases plus signal delivery
 - timer waits that survive runtime reconstruction plus `stay()`
 - bounded unbound-loop processing with `stay()`
 - a tiny local child workflow
 - checkpoint-boundary workflow migration
+
+The Go examples are intentionally authored as real `go:generate` examples:
+each named example package contains the developer-written workflow types,
+`//durable:*` annotations, handwritten phase logic, and checked-in generated
+`durable_gen.go`.
 
 Short inline TypeScript activities and local child starts default to checkpoint
 durability, so they are persisted atomically with the workflow checkpoint.
@@ -75,9 +85,10 @@ The TypeScript `PostgresDurabilityProvider.create(...)` accepts a connection
 string or shared `pg.Pool`, schema name, pool size, statement/lock timeouts,
 `physicalPartitions`, and optional observability sinks. The Rust
 `PostgresDurabilityProvider` now opens a small `tokio-postgres` client pool per
-provider, persists schema metadata, and uses the same append/replay shard
-projection as SQLite. Postgres is no longer used as the task scheduler in this
-path.
+provider. The Go Postgres provider uses a native `pgx/v5` pool, not
+`database/sql`. Both native providers persist schema metadata and use the same
+append/replay shard projection as SQLite. Postgres is no longer used as the
+task scheduler in this path.
 
 `physicalPartitions` is fixed when a schema is created and is persisted in
 provider metadata. Shard journals, shard heads, and snapshots are manually
@@ -158,7 +169,7 @@ shard-file, or Postgres providers.
 cd go
 go generate ./...
 go test ./...
-go run ./cmd/durable-demo immediate-and-signal
+go run ./examples/index
 go run ./cmd/durable-bench --provider sqlite --mode mixed --workflows 100 --json
 cd ..
 npm run benchmark:full-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 1 --physical-partitions 2 --json
@@ -189,12 +200,12 @@ relative to TypeScript. All rows reported `correct=true`.
 | SQLite shard-file | signal | 690.36 | 4,307.95 | 6.24x | 1,231.39 | 1.78x |
 | SQLite shard-file | timer | 689.08 | 5,732.37 | 8.32x | 2,095.03 | 3.04x |
 | SQLite shard-file | child | 329.91 | 1,714.60 | 5.20x | 901.06 | 2.73x |
-| Postgres | mixed | 176.41 | 720.99 | 4.09x | 141.99 | 0.80x |
-| Postgres | bare | 541.28 | 2,441.69 | 4.51x | 491.82 | 0.91x |
-| Postgres | activity | 531.10 | 2,263.58 | 4.26x | 588.19 | 1.11x |
-| Postgres | signal | 535.72 | 2,602.77 | 4.86x | 331.44 | 0.62x |
-| Postgres | timer | 534.73 | 2,292.68 | 4.29x | 536.52 | 1.00x |
-| Postgres | child | 272.86 | 1,133.09 | 4.15x | 265.76 | 0.97x |
+| Postgres | mixed | 195.01 | 734.09 | 3.76x | 724.59 | 3.72x |
+| Postgres | bare | 606.29 | 2,292.31 | 3.78x | 1,250.35 | 2.06x |
+| Postgres | activity | 567.70 | 2,375.57 | 4.18x | 1,915.16 | 3.37x |
+| Postgres | signal | 581.93 | 2,666.37 | 4.58x | 1,241.35 | 2.13x |
+| Postgres | timer | 583.10 | 2,336.85 | 4.01x | 1,793.80 | 3.08x |
+| Postgres | child | 291.19 | 1,428.35 | 4.91x | 1,256.08 | 4.31x |
 
 ## Provider conformance
 

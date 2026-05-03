@@ -7,7 +7,7 @@ This module is the Go SDK/runtime for durable-phases. It is intentionally shard-
 - `durable`: workflow/runtime API, transitions, waits, activities, child workflow handles, provider interfaces, and observability hooks.
 - `durable/internal/shardengine`: shared shard engine used by tests and durable append-store providers.
 - `durable/providers/sqlite`: single-file SQLite provider and shard-file SQLite provider.
-- `durable/providers/postgres`: Postgres append-store provider.
+- `durable/providers/postgres`: Postgres append-store provider backed by native `pgx/v5`.
 - `durable/cmd/durable-gen`: `go:generate` annotation generator.
 
 There is no Go JSON durability provider. SQLite and Postgres are the durable providers.
@@ -41,12 +41,32 @@ go generate ./...
 
 See `examples/generated` for a generated workflow-contract package covering phases, signals, timers, children, queries, and migrations.
 
+## Examples
+
+The runnable Go examples mirror the TypeScript demos and Rust examples:
+
+```sh
+go run ./examples/index
+go run ./examples/immediate-and-signal
+go run ./examples/timer-stay-restart
+go run ./examples/stay-loop
+go run ./examples/child-workflow
+go run ./examples/migration
+```
+
+They cover immediate run phases plus signals, timer restart plus `stay`, bounded
+`stay` loops, local child workflows across restart, and checkpoint-boundary
+migration. Each named example keeps the ordinary Go workflow declarations,
+`//go:generate` directive, `//durable:*` annotations, handwritten phase logic,
+and generated `durable_gen.go` in the same package so the authoring path is
+visible end to end.
+
 ## Verify
 
 ```sh
 go generate ./...
 go test ./...
-go run ./cmd/durable-demo immediate-and-signal
+go run ./examples/index
 go run ./cmd/durable-bench --provider sqlite --mode mixed --workflows 100 --json
 ```
 
@@ -82,4 +102,4 @@ workflow rates:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | SQLite single-file | 285.84 | 1,294.08 | 1,464.57 | 783.89 | 1,504.24 | 555.82 |
 | SQLite shard-file | 467.55 | 1,550.33 | 2,159.85 | 1,231.39 | 2,095.03 | 901.06 |
-| Postgres | 141.99 | 491.82 | 588.19 | 331.44 | 536.52 | 265.76 |
+| Postgres | 724.59 | 1,250.35 | 1,915.16 | 1,241.35 | 1,793.80 | 1,256.08 |
