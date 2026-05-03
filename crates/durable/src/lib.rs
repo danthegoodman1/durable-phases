@@ -9,7 +9,8 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -981,37 +982,19 @@ impl Default for Store {
 }
 
 #[derive(Clone)]
-pub struct JsonFileDurabilityProvider {
-    file_path: Option<PathBuf>,
+struct ShardEngineProvider {
     state: Arc<Mutex<Store>>,
 }
 
-impl JsonFileDurabilityProvider {
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, WorkflowError> {
-        let file_path = path.as_ref().to_path_buf();
-        let state = if file_path.exists() {
-            let raw = fs::read_to_string(&file_path)?;
-            serde_json::from_str::<Store>(&raw)?
-        } else {
-            Store::default()
-        };
-
-        Ok(Self {
-            file_path: Some(file_path),
-            state: Arc::new(Mutex::new(state)),
-        })
-    }
-
+impl ShardEngineProvider {
     fn in_memory() -> Self {
         Self {
-            file_path: None,
             state: Arc::new(Mutex::new(Store::default())),
         }
     }
 
     fn from_store(state: Store) -> Self {
         Self {
-            file_path: None,
             state: Arc::new(Mutex::new(state)),
         }
     }
@@ -1792,28 +1775,76 @@ impl JsonFileDurabilityProvider {
         })
     }
 
-    pub fn read_output<W>(&self, handle: &ChildHandle<W>) -> Result<W::Output, WorkflowError>
-    where
-        W: Workflow,
-    {
-        let state = self.lock()?;
-        let key = instance_key(&handle.workflow_id, &handle.run_id);
-        let instance = state.instances.get(&key).ok_or_else(|| {
-            WorkflowError::new(format!(
-                "unknown child workflow: {}/{}",
-                handle.workflow_id, handle.run_id
-            ))
-        })?;
+    fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            results.push(self.commit_checkpoint(input)?);
+        }
+        Ok(CommitActivationsResult { results })
+    }
 
-        if instance.status != PersistedStatus::Completed {
-            return Err(WorkflowError::new(format!(
-                "child workflow is not complete: {}/{}",
-                handle.workflow_id, handle.run_id
-            )));
+    fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        if inputs.is_empty() {
+            return Ok(());
         }
 
-        serde_json::from_value(instance.output.clone().unwrap_or(JsonValue::Null))
-            .map_err(WorkflowError::from)
+        let mut state = self.lock()?;
+        for input in inputs {
+            let key = instance_key(&input.workflow_id, &input.run_id);
+            if !state.instances.contains_key(&key) {
+                return Err(WorkflowError::new(format!(
+                    "unknown workflow instance: {}/{}",
+                    input.workflow_id, input.run_id
+                )));
+            }
+
+            let mutation_keys = input
+                .effects
+                .iter()
+                .map(|effect| effect.key().to_string())
+                .collect::<std::collections::HashSet<_>>();
+            let mut records = Vec::with_capacity(input.effects.len());
+            for effect in input.effects {
+                let effect_id = format!("effect-{}", state.next_effect_id);
+                state.next_effect_id += 1;
+                let idempotency_key = format!(
+                    "{}/{}/{}/{}",
+                    input.workflow_id,
+                    input.run_id,
+                    input.activation_id,
+                    effect.key()
+                );
+                records.push(effect.to_record(
+                    effect_id,
+                    input.activation_id.clone(),
+                    idempotency_key,
+                    input.now,
+                ));
+            }
+
+            if !records.is_empty() {
+                let instance = state.instances.get_mut(&key).ok_or_else(|| {
+                    WorkflowError::new("instance disappeared while recording activation failure")
+                })?;
+                instance.effects.retain(|effect| {
+                    effect.activation_id != input.activation_id
+                        || !mutation_keys.contains(&effect.key)
+                });
+                instance.effects.extend(records);
+            }
+
+            if input.release_activation {
+                release_tasks_for_activation(&mut state, &input.activation_id, None);
+            }
+        }
+
+        self.save_locked(&state)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Store>, WorkflowError> {
@@ -1822,16 +1853,7 @@ impl JsonFileDurabilityProvider {
             .map_err(|_| WorkflowError::new("durability provider lock poisoned"))
     }
 
-    fn save_locked(&self, state: &Store) -> Result<(), WorkflowError> {
-        let Some(file_path) = &self.file_path else {
-            return Ok(());
-        };
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp_path = file_path.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
-        fs::rename(tmp_path, file_path)?;
+    fn save_locked(&self, _state: &Store) -> Result<(), WorkflowError> {
         Ok(())
     }
 
@@ -1918,17 +1940,43 @@ impl JsonFileDurabilityProvider {
         }
         self.save_locked(&state)
     }
+
+    fn assert_activation_claim_sync(
+        &self,
+        activation_id: &str,
+        owner_id: Option<&str>,
+        lease_epoch: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        let state = self.lock()?;
+        let Some(task) = state
+            .tasks
+            .values()
+            .find(|task| task.activation_id == activation_id)
+        else {
+            return Ok(());
+        };
+        if task.claim_owner_id.as_deref() != owner_id
+            || task.claim_epoch != lease_epoch
+            || task.lease_until.is_none_or(|lease_until| lease_until < now)
+        {
+            return Err(WorkflowError::new(format!(
+                "lost activation lease: {activation_id}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct NullDurabilityProvider {
-    inner: JsonFileDurabilityProvider,
+    inner: ShardEngineProvider,
 }
 
 impl NullDurabilityProvider {
     pub fn new() -> Self {
         Self {
-            inner: JsonFileDurabilityProvider::in_memory(),
+            inner: ShardEngineProvider::in_memory(),
         }
     }
 }
@@ -1968,17 +2016,57 @@ enum JournalOperation {
     AppendSignal(AppendSignalInput),
     CancelChild(CancelChildInput),
     ReserveEffect(ReserveEffectInput),
+    PutEffectRecord {
+        workflow_id: String,
+        run_id: String,
+        effect: EffectRecord,
+    },
     HeartbeatEffect(HeartbeatEffectInput),
     CompleteEffect(CompleteEffectInput),
     FailEffect(FailEffectInput),
     CommitCheckpoint(CommitCheckpointInput),
+    CommitActivations(Vec<CommitCheckpointInput>),
+    RecordActivationFailures(Vec<RecordActivationFailureInput>),
 }
 
 #[derive(Clone)]
 pub struct SqliteDurabilityProvider {
-    inner: JsonFileDurabilityProvider,
-    connection: Arc<Mutex<rusqlite::Connection>>,
+    inner: ShardEngineProvider,
+    writer: SqliteWriter,
     snapshot_interval: u64,
+}
+
+#[derive(Clone)]
+struct SqliteWriter {
+    inner: Arc<SqliteWriterInner>,
+}
+
+struct SqliteWriterInner {
+    sender: std::sync::mpsc::Sender<SqliteWriterCommand>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+enum SqliteWriterCommand {
+    AppendJournal {
+        operation_json: String,
+        response: std::sync::mpsc::Sender<Result<u64, WorkflowError>>,
+    },
+    WriteSnapshot {
+        entry_id: u64,
+        snapshot_json: String,
+        response: std::sync::mpsc::Sender<Result<(), WorkflowError>>,
+    },
+    PragmaString {
+        pragma: String,
+        response: std::sync::mpsc::Sender<Result<String, WorkflowError>>,
+    },
+    PragmaI64 {
+        pragma: String,
+        response: std::sync::mpsc::Sender<Result<i64, WorkflowError>>,
+    },
+    Shutdown {
+        response: std::sync::mpsc::Sender<Result<(), WorkflowError>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1992,6 +2080,189 @@ impl Default for SqliteDurabilityOptions {
             snapshot_interval: DEFAULT_SQLITE_SNAPSHOT_INTERVAL,
         }
     }
+}
+
+impl SqliteWriter {
+    fn start(connection: rusqlite::Connection) -> Result<Self, WorkflowError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("durable-sqlite-writer".to_string())
+            .spawn(move || sqlite_writer_loop(connection, receiver))
+            .map_err(|error| WorkflowError::new(error.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(SqliteWriterInner {
+                sender,
+                handle: Mutex::new(Some(handle)),
+            }),
+        })
+    }
+
+    async fn append_journal(&self, operation_json: String) -> Result<u64, WorkflowError> {
+        self.request(|response| SqliteWriterCommand::AppendJournal {
+            operation_json,
+            response,
+        })
+        .await
+    }
+
+    async fn write_snapshot(
+        &self,
+        entry_id: u64,
+        snapshot_json: String,
+    ) -> Result<(), WorkflowError> {
+        self.request(|response| SqliteWriterCommand::WriteSnapshot {
+            entry_id,
+            snapshot_json,
+            response,
+        })
+        .await
+    }
+
+    fn pragma_string(&self, pragma: &str) -> Result<String, WorkflowError> {
+        self.request_blocking(|response| SqliteWriterCommand::PragmaString {
+            pragma: pragma.to_string(),
+            response,
+        })
+    }
+
+    fn pragma_i64(&self, pragma: &str) -> Result<i64, WorkflowError> {
+        self.request_blocking(|response| SqliteWriterCommand::PragmaI64 {
+            pragma: pragma.to_string(),
+            response,
+        })
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        self.request(|response| SqliteWriterCommand::Shutdown { response })
+            .await?;
+        let handle = self
+            .inner
+            .handle
+            .lock()
+            .map_err(|_| WorkflowError::new("sqlite writer handle lock poisoned"))?
+            .take();
+        if let Some(handle) = handle {
+            tokio::task::spawn_blocking(move || {
+                handle
+                    .join()
+                    .map_err(|_| WorkflowError::new("sqlite writer thread panicked"))
+            })
+            .await
+            .map_err(|error| WorkflowError::new(error.to_string()))??;
+        }
+        Ok(())
+    }
+
+    async fn request<T, F>(&self, build: F) -> Result<T, WorkflowError>
+    where
+        T: Send + 'static,
+        F: FnOnce(std::sync::mpsc::Sender<Result<T, WorkflowError>>) -> SqliteWriterCommand,
+    {
+        let (response, receiver) = std::sync::mpsc::channel();
+        self.inner
+            .sender
+            .send(build(response))
+            .map_err(|_| WorkflowError::new("sqlite writer is closed"))?;
+        tokio::task::spawn_blocking(move || {
+            receiver
+                .recv()
+                .map_err(|_| WorkflowError::new("sqlite writer closed before responding"))?
+        })
+        .await
+        .map_err(|error| WorkflowError::new(error.to_string()))?
+    }
+
+    fn request_blocking<T, F>(&self, build: F) -> Result<T, WorkflowError>
+    where
+        F: FnOnce(std::sync::mpsc::Sender<Result<T, WorkflowError>>) -> SqliteWriterCommand,
+    {
+        let (response, receiver) = std::sync::mpsc::channel();
+        self.inner
+            .sender
+            .send(build(response))
+            .map_err(|_| WorkflowError::new("sqlite writer is closed"))?;
+        receiver
+            .recv()
+            .map_err(|_| WorkflowError::new("sqlite writer closed before responding"))?
+    }
+}
+
+fn sqlite_writer_loop(
+    connection: rusqlite::Connection,
+    receiver: std::sync::mpsc::Receiver<SqliteWriterCommand>,
+) {
+    for command in receiver {
+        match command {
+            SqliteWriterCommand::AppendJournal {
+                operation_json,
+                response,
+            } => {
+                let result = sqlite_append_journal(&connection, operation_json);
+                let _ = response.send(result);
+            }
+            SqliteWriterCommand::WriteSnapshot {
+                entry_id,
+                snapshot_json,
+                response,
+            } => {
+                let result = sqlite_write_snapshot(&connection, entry_id, snapshot_json);
+                let _ = response.send(result);
+            }
+            SqliteWriterCommand::PragmaString { pragma, response } => {
+                let result = connection
+                    .query_row(&format!("PRAGMA {pragma}"), [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(WorkflowError::from);
+                let _ = response.send(result);
+            }
+            SqliteWriterCommand::PragmaI64 { pragma, response } => {
+                let result = connection
+                    .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+                    .map_err(WorkflowError::from);
+                let _ = response.send(result);
+            }
+            SqliteWriterCommand::Shutdown { response } => {
+                let _ = response.send(Ok(()));
+                break;
+            }
+        }
+    }
+}
+
+fn sqlite_append_journal(
+    connection: &rusqlite::Connection,
+    operation_json: String,
+) -> Result<u64, WorkflowError> {
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let tx = connection.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO shard_journal (operation_json, created_at) VALUES (?1, ?2)",
+        rusqlite::params![operation_json, now],
+    )?;
+    let entry_id = tx.last_insert_rowid() as u64;
+    tx.commit()?;
+    Ok(entry_id)
+}
+
+fn sqlite_write_snapshot(
+    connection: &rusqlite::Connection,
+    entry_id: u64,
+    snapshot_json: String,
+) -> Result<(), WorkflowError> {
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let tx = connection.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(snapshot_id) DO UPDATE SET
+           last_entry_id = excluded.last_entry_id,
+           snapshot_json = excluded.snapshot_json,
+           created_at = excluded.created_at",
+        rusqlite::params![entry_id, snapshot_json, now],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 impl SqliteDurabilityProvider {
@@ -2011,63 +2282,32 @@ impl SqliteDurabilityProvider {
         configure_sqlite(&connection)?;
         ensure_sqlite_schema(&connection)?;
         let state = load_sqlite_store(&connection)?;
+        let writer = SqliteWriter::start(connection)?;
         Ok(Self {
-            inner: JsonFileDurabilityProvider {
-                file_path: None,
-                state: Arc::new(Mutex::new(state)),
-            },
-            connection: Arc::new(Mutex::new(connection)),
+            inner: ShardEngineProvider::from_store(state),
+            writer,
             snapshot_interval: options.snapshot_interval.max(1),
         })
     }
 
     pub fn pragma_string(&self, pragma: &str) -> Result<String, WorkflowError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
-        let value = connection.query_row(&format!("PRAGMA {pragma}"), [], |row| {
-            row.get::<_, String>(0)
-        })?;
-        Ok(value)
+        self.writer.pragma_string(pragma)
     }
 
     pub fn pragma_i64(&self, pragma: &str) -> Result<i64, WorkflowError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
-        let value =
-            connection.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))?;
-        Ok(value)
+        self.writer.pragma_i64(pragma)
     }
 
-    fn append_journal_operation(&self, operation: JournalOperation) -> Result<(), WorkflowError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| WorkflowError::new("sqlite connection lock poisoned"))?;
+    async fn append_journal_operation(
+        &self,
+        operation: JournalOperation,
+    ) -> Result<(), WorkflowError> {
         let operation_json = serde_json::to_string(&operation)?;
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let tx = connection.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO shard_journal (operation_json, created_at) VALUES (?1, ?2)",
-            rusqlite::params![operation_json, now],
-        )?;
-        let entry_id = tx.last_insert_rowid() as u64;
+        let entry_id = self.writer.append_journal(operation_json).await?;
         if entry_id % self.snapshot_interval == 0 {
             let snapshot = serde_json::to_string(&self.inner.snapshot_store()?)?;
-            tx.execute(
-                "INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
-                 VALUES (1, ?1, ?2, ?3)
-                 ON CONFLICT(snapshot_id) DO UPDATE SET
-                   last_entry_id = excluded.last_entry_id,
-                   snapshot_json = excluded.snapshot_json,
-                   created_at = excluded.created_at",
-                rusqlite::params![entry_id, snapshot, now],
-            )?;
+            self.writer.write_snapshot(entry_id, snapshot).await?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2095,7 +2335,8 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     ) -> Result<Option<ShardLease>, WorkflowError> {
         let output = self.inner.claim_shard_sync(input.clone())?;
         if output.is_some() {
-            self.append_journal_operation(JournalOperation::ClaimShard(input))?;
+            self.append_journal_operation(JournalOperation::ClaimShard(input))
+                .await?;
         }
         Ok(output)
     }
@@ -2103,10 +2344,7 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
         Arc::new(SqliteShardSession {
             provider: self.clone(),
-            inner: <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(
-                &self.inner,
-                input,
-            ),
+            inner: <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input),
         })
     }
 
@@ -2115,7 +2353,8 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
         let output = self.inner.create_instance(input.clone())?;
-        self.append_journal_operation(JournalOperation::CreateInstance(input))?;
+        self.append_journal_operation(JournalOperation::CreateInstance(input))
+            .await?;
         Ok(output)
     }
 
@@ -2124,7 +2363,8 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
         let output = self.inner.create_child_instance(input.clone())?;
-        self.append_journal_operation(JournalOperation::CreateChildInstance(input))?;
+        self.append_journal_operation(JournalOperation::CreateChildInstance(input))
+            .await?;
         Ok(output)
     }
 
@@ -2133,73 +2373,71 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
-            &self.inner,
-            ref_,
-            options,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
-        self.append_journal_operation(JournalOperation::AppendSignal(input))?;
+        let output =
+            <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input.clone())
+                .await?;
+        self.append_journal_operation(JournalOperation::AppendSignal(input))
+            .await?;
         Ok(output)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input.clone())
+            .await?;
         self.append_journal_operation(JournalOperation::CancelChild(input))
+            .await
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+        let output = <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(
             &self.inner,
             input.clone(),
         )
         .await?;
-        if matches!(output, EffectReservation::Reserved { .. }) {
-            self.append_journal_operation(JournalOperation::ReserveEffect(input))?;
+        if let EffectReservation::Reserved { effect_id, .. } = &output {
+            let effect = reserved_effect_record_from_provider(
+                &self.inner,
+                &input.workflow_id,
+                &input.run_id,
+                effect_id,
+            )?;
+            self.append_journal_operation(JournalOperation::PutEffectRecord {
+                workflow_id: input.workflow_id,
+                run_id: input.run_id,
+                effect,
+            })
+            .await?;
         }
         Ok(output)
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone())
+            .await?;
         self.append_journal_operation(JournalOperation::HeartbeatEffect(input))
+            .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input.clone())
+            .await?;
         self.append_journal_operation(JournalOperation::CompleteEffect(input))
+            .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
-        self.append_journal_operation(JournalOperation::FailEffect(input))?;
+        let output =
+            <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input.clone())
+                .await?;
+        self.append_journal_operation(JournalOperation::FailEffect(input))
+            .await?;
         Ok(output)
     }
 
@@ -2207,15 +2445,48 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(
+        let output = <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(
             &self.inner,
             input.clone(),
         )
         .await?;
         if output.ok {
-            self.append_journal_operation(JournalOperation::CommitCheckpoint(input))?;
+            self.append_journal_operation(JournalOperation::CommitCheckpoint(input))
+                .await?;
         }
         Ok(output)
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let output = <ShardEngineProvider as DurabilityProvider>::commit_activations(
+            &self.inner,
+            inputs.clone(),
+        )
+        .await?;
+        if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
+            self.append_journal_operation(JournalOperation::CommitActivations(inputs))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
+            &self.inner,
+            inputs.clone(),
+        )
+        .await?;
+        self.append_journal_operation(JournalOperation::RecordActivationFailures(inputs))
+            .await
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
@@ -2228,6 +2499,10 @@ impl DurabilityProvider for SqliteDurabilityProvider {
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
         self.inner.list_children()
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        self.writer.shutdown().await
     }
 }
 
@@ -2261,7 +2536,8 @@ impl ShardDurabilitySession for SqliteShardSession {
         };
         let output = self.inner.claim_tasks(input.clone()).await?;
         self.provider
-            .append_journal_operation(JournalOperation::ClaimShardTasks { session, input })?;
+            .append_journal_operation(JournalOperation::ClaimShardTasks { session, input })
+            .await?;
         Ok(output)
     }
 
@@ -2276,7 +2552,8 @@ impl ShardDurabilitySession for SqliteShardSession {
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         let output = self.inner.append_signal(input.clone()).await?;
         self.provider
-            .append_journal_operation(JournalOperation::AppendSignal(input))?;
+            .append_journal_operation(JournalOperation::AppendSignal(input))
+            .await?;
         Ok(output)
     }
 
@@ -2284,6 +2561,7 @@ impl ShardDurabilitySession for SqliteShardSession {
         self.inner.cancel_child(input.clone()).await?;
         self.provider
             .append_journal_operation(JournalOperation::CancelChild(input))
+            .await
     }
 
     async fn get_or_reserve_effect(
@@ -2291,9 +2569,32 @@ impl ShardDurabilitySession for SqliteShardSession {
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
         let output = self.inner.get_or_reserve_effect(input.clone()).await?;
-        if matches!(output, EffectReservation::Reserved { .. }) {
+        if let EffectReservation::Reserved { effect_id, .. } = &output {
+            let effect = self
+                .inner
+                .read_instance(
+                    &InstanceRef::new(input.workflow_id.clone(), input.run_id.clone()),
+                    LoadInstanceOptions {
+                        include_effects: true,
+                    },
+                )
+                .await?
+                .and_then(|instance| {
+                    instance
+                        .effects
+                        .into_iter()
+                        .find(|effect| effect.effect_id == *effect_id)
+                })
+                .ok_or_else(|| {
+                    WorkflowError::new(format!("reserved effect missing: {effect_id}"))
+                })?;
             self.provider
-                .append_journal_operation(JournalOperation::ReserveEffect(input))?;
+                .append_journal_operation(JournalOperation::PutEffectRecord {
+                    workflow_id: input.workflow_id,
+                    run_id: input.run_id,
+                    effect,
+                })
+                .await?;
         }
         Ok(output)
     }
@@ -2302,18 +2603,21 @@ impl ShardDurabilitySession for SqliteShardSession {
         self.inner.heartbeat_effect(input.clone()).await?;
         self.provider
             .append_journal_operation(JournalOperation::HeartbeatEffect(input))
+            .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
         self.inner.complete_effect(input.clone()).await?;
         self.provider
             .append_journal_operation(JournalOperation::CompleteEffect(input))
+            .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
         let output = self.inner.fail_effect(input.clone()).await?;
         self.provider
-            .append_journal_operation(JournalOperation::FailEffect(input))?;
+            .append_journal_operation(JournalOperation::FailEffect(input))
+            .await?;
         Ok(output)
     }
 
@@ -2324,9 +2628,38 @@ impl ShardDurabilitySession for SqliteShardSession {
         let output = self.inner.commit_checkpoint(input.clone()).await?;
         if output.ok {
             self.provider
-                .append_journal_operation(JournalOperation::CommitCheckpoint(input))?;
+                .append_journal_operation(JournalOperation::CommitCheckpoint(input))
+                .await?;
         }
         Ok(output)
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let output = self.inner.commit_activations(inputs.clone()).await?;
+        if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
+            self.provider
+                .append_journal_operation(JournalOperation::CommitActivations(inputs))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .record_activation_failures(inputs.clone())
+            .await?;
+        self.provider
+            .append_journal_operation(JournalOperation::RecordActivationFailures(inputs))
+            .await
     }
 
     async fn release_activation(
@@ -2342,6 +2675,7 @@ impl ShardDurabilitySession for SqliteShardSession {
                 activation_id: activation_id.to_string(),
                 worker_id: worker_id.to_string(),
             })
+            .await
     }
 
     async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError> {
@@ -2353,7 +2687,8 @@ impl ShardDurabilitySession for SqliteShardSession {
                     owner_id: owner_id.to_string(),
                     now,
                     lease_ms,
-                })?;
+                })
+                .await?;
         }
         Ok(())
     }
@@ -2365,7 +2700,8 @@ impl ShardDurabilitySession for SqliteShardSession {
                 .append_journal_operation(JournalOperation::ReleaseShard {
                     shard_id: self.shard_id(),
                     owner_id: owner_id.to_string(),
-                })?;
+                })
+                .await?;
         }
         Ok(())
     }
@@ -2424,7 +2760,7 @@ fn load_sqlite_store(connection: &rusqlite::Connection) -> Result<Store, Workflo
         Err(rusqlite::Error::QueryReturnedNoRows) => (0, Store::default()),
         Err(error) => return Err(error.into()),
     };
-    let provider = JsonFileDurabilityProvider::from_store(store);
+    let provider = ShardEngineProvider::from_store(store);
     let mut statement = connection.prepare(
         "SELECT operation_json FROM shard_journal WHERE entry_id > ?1 ORDER BY entry_id ASC",
     )?;
@@ -2450,7 +2786,7 @@ fn sqlite_table_columns(
 }
 
 fn apply_journal_operation(
-    provider: &JsonFileDurabilityProvider,
+    provider: &ShardEngineProvider,
     operation: JournalOperation,
 ) -> Result<(), WorkflowError> {
     match operation {
@@ -2473,7 +2809,7 @@ fn apply_journal_operation(
             provider.release_activation_sync(&activation_id, &worker_id)?;
         }
         JournalOperation::ClaimShardTasks { session, input } => {
-            let session = JsonFileShardSession {
+            let session = ShardEngineSession {
                 provider: provider.clone(),
                 shard_id: session.shard_id,
                 owner_id: session.owner_id,
@@ -2510,6 +2846,13 @@ fn apply_journal_operation(
                 input.options,
                 input.max_attempts,
             )?;
+        }
+        JournalOperation::PutEffectRecord {
+            workflow_id,
+            run_id,
+            effect,
+        } => {
+            put_effect_record(provider, &workflow_id, &run_id, effect)?;
         }
         JournalOperation::HeartbeatEffect(input) => {
             provider.heartbeat_effect(
@@ -2554,15 +2897,73 @@ fn apply_journal_operation(
                 )));
             }
         }
+        JournalOperation::CommitActivations(inputs) => {
+            let results = provider.commit_activations(inputs)?;
+            if let Some(conflict) = results.results.iter().find(|result| !result.ok) {
+                return Err(WorkflowError::new(format!(
+                    "journal replay hit activation commit conflict: {:?}",
+                    conflict
+                )));
+            }
+        }
+        JournalOperation::RecordActivationFailures(inputs) => {
+            provider.record_activation_failures(inputs)?;
+        }
     }
     Ok(())
 }
 
+fn put_effect_record(
+    provider: &ShardEngineProvider,
+    workflow_id: &str,
+    run_id: &str,
+    effect: EffectRecord,
+) -> Result<(), WorkflowError> {
+    let mut state = provider.lock()?;
+    if let Some(number) = effect
+        .effect_id
+        .strip_prefix("effect-")
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+    {
+        state.next_effect_id = state.next_effect_id.max(number + 1);
+    }
+    let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
+    if let Some(existing) = instance
+        .effects
+        .iter_mut()
+        .find(|existing| existing.effect_id == effect.effect_id)
+    {
+        *existing = effect;
+    } else {
+        instance.effects.push(effect);
+    }
+    provider.save_locked(&state)
+}
+
+fn reserved_effect_record_from_provider(
+    provider: &ShardEngineProvider,
+    workflow_id: &str,
+    run_id: &str,
+    effect_id: &str,
+) -> Result<EffectRecord, WorkflowError> {
+    provider
+        .load_instance(&InstanceRef::new(
+            workflow_id.to_string(),
+            run_id.to_string(),
+        ))?
+        .and_then(|instance| {
+            instance
+                .effects
+                .into_iter()
+                .find(|effect| effect.effect_id == effect_id)
+        })
+        .ok_or_else(|| WorkflowError::new(format!("reserved effect missing: {effect_id}")))
+}
+
 #[derive(Clone)]
 pub struct SqliteShardFileDurabilityProvider {
-    directory: PathBuf,
     shard_count: u32,
-    providers: Arc<Mutex<HashMap<u32, SqliteDurabilityProvider>>>,
+    providers: Arc<Vec<SqliteDurabilityProvider>>,
 }
 
 impl SqliteShardFileDurabilityProvider {
@@ -2572,10 +2973,15 @@ impl SqliteShardFileDurabilityProvider {
         }
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
+        let mut providers = Vec::with_capacity(shard_count as usize);
+        for shard_id in 0..shard_count {
+            providers.push(SqliteDurabilityProvider::new(
+                directory.join(format!("shard-{shard_id}.sqlite")),
+            )?);
+        }
         Ok(Self {
-            directory,
             shard_count,
-            providers: Arc::new(Mutex::new(HashMap::new())),
+            providers: Arc::new(providers),
         })
     }
 
@@ -2586,17 +2992,7 @@ impl SqliteShardFileDurabilityProvider {
                 self.shard_count
             )));
         }
-        let mut providers = self
-            .providers
-            .lock()
-            .map_err(|_| WorkflowError::new("sqlite shard provider lock poisoned"))?;
-        if let Some(provider) = providers.get(&shard_id) {
-            return Ok(provider.clone());
-        }
-        let provider =
-            SqliteDurabilityProvider::new(self.directory.join(format!("shard-{shard_id}.sqlite")))?;
-        providers.insert(shard_id, provider.clone());
-        Ok(provider)
+        Ok(self.providers[shard_id as usize].clone())
     }
 
     fn provider_for_ref(
@@ -2734,6 +3130,29 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
             .await
     }
 
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            results.push(self.commit_checkpoint(input).await?);
+        }
+        Ok(CommitActivationsResult { results })
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        for input in inputs {
+            self.provider_for_ref(&input.workflow_id, &input.run_id)?
+                .record_activation_failures(vec![input])
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
         let mut output = Vec::new();
         for shard_id in 0..self.shard_count {
@@ -2867,11 +3286,49 @@ pub struct PostgresDurabilityProviderOptions {
 
 #[derive(Clone)]
 pub struct PostgresDurabilityProvider {
-    inner: JsonFileDurabilityProvider,
-    client: Arc<AsyncMutex<tokio_postgres::Client>>,
+    inner: ShardEngineProvider,
+    pool: Arc<PostgresClientPool>,
     schema: String,
     physical_partitions: u32,
     snapshot_interval: u64,
+}
+
+struct PostgresClientPool {
+    clients: Vec<Arc<AsyncMutex<tokio_postgres::Client>>>,
+    next: AtomicUsize,
+}
+
+impl PostgresClientPool {
+    async fn create(connection_string: &str, size: usize) -> Result<Self, WorkflowError> {
+        let mut clients = Vec::with_capacity(size);
+        for index in 0..size {
+            let (client, connection) =
+                tokio_postgres::connect(connection_string, tokio_postgres::NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("durable Postgres connection {index} error: {error}");
+                }
+            });
+            client
+                .batch_execute(
+                    "
+                    SET statement_timeout = 30000;
+                    SET lock_timeout = 5000;
+                    ",
+                )
+                .await?;
+            clients.push(Arc::new(AsyncMutex::new(client)));
+        }
+        Ok(Self {
+            clients,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn next(&self) -> Arc<AsyncMutex<tokio_postgres::Client>> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[index].clone()
+    }
 }
 
 impl PostgresDurabilityProvider {
@@ -2880,16 +3337,12 @@ impl PostgresDurabilityProvider {
             return Err(WorkflowError::new("physical_partitions must be positive"));
         }
         let schema = normalize_postgres_schema(options.schema)?;
-        let (client, connection) =
-            tokio_postgres::connect(&options.connection_string, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("durable Postgres connection error: {error}");
-            }
-        });
+        let pool_size = (options.physical_partitions as usize).max(4);
+        let pool =
+            Arc::new(PostgresClientPool::create(&options.connection_string, pool_size).await?);
         let provider = Self {
-            inner: JsonFileDurabilityProvider::in_memory(),
-            client: Arc::new(AsyncMutex::new(client)),
+            inner: ShardEngineProvider::in_memory(),
+            pool,
             schema,
             physical_partitions: options.physical_partitions,
             snapshot_interval: options
@@ -2899,7 +3352,7 @@ impl PostgresDurabilityProvider {
         provider.initialize_postgres_schema().await?;
         let state = provider.load_postgres_store().await?;
         Ok(Self {
-            inner: JsonFileDurabilityProvider::from_store(state),
+            inner: ShardEngineProvider::from_store(state),
             ..provider
         })
     }
@@ -2909,7 +3362,8 @@ impl PostgresDurabilityProvider {
     }
 
     async fn initialize_postgres_schema(&self) -> Result<(), WorkflowError> {
-        let client = self.client.lock().await;
+        let client_handle = self.pool.next();
+        let client = client_handle.lock().await;
         client
             .batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {};",
@@ -3016,7 +3470,8 @@ impl PostgresDurabilityProvider {
         let operation_json = serde_json::to_string(&operation)?;
         let shard_id = self.postgres_shard_for_operation(&operation)?;
         let shard_id_i32 = shard_id as i32;
-        let client = self.client.lock().await;
+        let client_handle = self.pool.next();
+        let client = client_handle.lock().await;
         let row = client
             .query_one(
                 &format!(
@@ -3062,7 +3517,8 @@ impl PostgresDurabilityProvider {
     }
 
     async fn load_postgres_store(&self) -> Result<Store, WorkflowError> {
-        let client = self.client.lock().await;
+        let client_handle = self.pool.next();
+        let client = client_handle.lock().await;
         let mut latest_snapshot: Option<(DateTime<Utc>, String)> = None;
         for partition in 0..self.physical_partitions {
             let snapshot = client
@@ -3090,7 +3546,7 @@ impl PostgresDurabilityProvider {
         } else {
             (None, Store::default())
         };
-        let provider = JsonFileDurabilityProvider::from_store(store);
+        let provider = ShardEngineProvider::from_store(store);
         let mut rows = Vec::new();
         for partition in 0..self.physical_partitions {
             let table = self.postgres_table("shard_journal", partition);
@@ -3153,6 +3609,11 @@ impl PostgresDurabilityProvider {
             JournalOperation::ReserveEffect(input) => {
                 self.shard_for_ref(&input.workflow_id, &input.run_id)
             }
+            JournalOperation::PutEffectRecord {
+                workflow_id,
+                run_id,
+                ..
+            } => self.shard_for_ref(workflow_id, run_id),
             JournalOperation::HeartbeatEffect(input) => {
                 self.shard_for_ref(&input.workflow_id, &input.run_id)
             }
@@ -3165,6 +3626,16 @@ impl PostgresDurabilityProvider {
             JournalOperation::CommitCheckpoint(input) => {
                 self.shard_for_ref(&input.workflow_id, &input.run_id)
             }
+            JournalOperation::CommitActivations(inputs) => inputs
+                .first()
+                .map(|input| self.shard_for_ref(&input.workflow_id, &input.run_id))
+                .transpose()?
+                .ok_or_else(|| WorkflowError::new("empty activation commit batch")),
+            JournalOperation::RecordActivationFailures(inputs) => inputs
+                .first()
+                .map(|input| self.shard_for_ref(&input.workflow_id, &input.run_id))
+                .transpose()?
+                .ok_or_else(|| WorkflowError::new("empty activation failure batch")),
         }
     }
 
@@ -3247,10 +3718,7 @@ impl DurabilityProvider for PostgresDurabilityProvider {
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
         Arc::new(PostgresShardSession {
             provider: self.clone(),
-            inner: <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(
-                &self.inner,
-                input,
-            ),
+            inner: <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input),
         })
     }
 
@@ -3289,31 +3757,21 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
-            &self.inner,
-            ref_,
-            options,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input.clone())
+                .await?;
         self.append_postgres_operation(JournalOperation::AppendSignal(input))
             .await?;
         Ok(output)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input.clone())
+            .await?;
         self.append_postgres_operation(JournalOperation::CancelChild(input))
             .await
     }
@@ -3322,44 +3780,46 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
+        let output = <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(
             &self.inner,
             input.clone(),
         )
         .await?;
-        if matches!(output, EffectReservation::Reserved { .. }) {
-            self.append_postgres_operation(JournalOperation::ReserveEffect(input))
-                .await?;
+        if let EffectReservation::Reserved { effect_id, .. } = &output {
+            let effect = reserved_effect_record_from_provider(
+                &self.inner,
+                &input.workflow_id,
+                &input.run_id,
+                effect_id,
+            )?;
+            self.append_postgres_operation(JournalOperation::PutEffectRecord {
+                workflow_id: input.workflow_id,
+                run_id: input.run_id,
+                effect,
+            })
+            .await?;
         }
         Ok(output)
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone())
+            .await?;
         self.append_postgres_operation(JournalOperation::HeartbeatEffect(input))
             .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input.clone())
+            .await?;
         self.append_postgres_operation(JournalOperation::CompleteEffect(input))
             .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input.clone())
+                .await?;
         self.append_postgres_operation(JournalOperation::FailEffect(input))
             .await?;
         Ok(output)
@@ -3391,7 +3851,7 @@ impl DurabilityProvider for PostgresDurabilityProvider {
                 });
             }
         }
-        let output = <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(
+        let output = <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(
             &self.inner,
             input.clone(),
         )
@@ -3403,16 +3863,48 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         Ok(output)
     }
 
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let output = <ShardEngineProvider as DurabilityProvider>::commit_activations(
+            &self.inner,
+            inputs.clone(),
+        )
+        .await?;
+        if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
+            self.append_postgres_operation(JournalOperation::CommitActivations(inputs))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
+            &self.inner,
+            inputs.clone(),
+        )
+        .await?;
+        self.append_postgres_operation(JournalOperation::RecordActivationFailures(inputs))
+            .await
+    }
+
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_instances(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_instances(&self.inner).await
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_signals(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_signals(&self.inner).await
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_children(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_children(&self.inner).await
     }
 }
 
@@ -3480,9 +3972,31 @@ impl ShardDurabilitySession for PostgresShardSession {
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
         let output = self.inner.get_or_reserve_effect(input.clone()).await?;
-        if matches!(output, EffectReservation::Reserved { .. }) {
+        if let EffectReservation::Reserved { effect_id, .. } = &output {
+            let effect = self
+                .inner
+                .read_instance(
+                    &InstanceRef::new(input.workflow_id.clone(), input.run_id.clone()),
+                    LoadInstanceOptions {
+                        include_effects: true,
+                    },
+                )
+                .await?
+                .and_then(|instance| {
+                    instance
+                        .effects
+                        .into_iter()
+                        .find(|effect| effect.effect_id == *effect_id)
+                })
+                .ok_or_else(|| {
+                    WorkflowError::new(format!("reserved effect missing: {effect_id}"))
+                })?;
             self.provider
-                .append_postgres_operation(JournalOperation::ReserveEffect(input))
+                .append_postgres_operation(JournalOperation::PutEffectRecord {
+                    workflow_id: input.workflow_id,
+                    run_id: input.run_id,
+                    effect,
+                })
                 .await?;
         }
         Ok(output)
@@ -3521,6 +4035,34 @@ impl ShardDurabilitySession for PostgresShardSession {
                 .await?;
         }
         Ok(output)
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let output = self.inner.commit_activations(inputs.clone()).await?;
+        if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
+            self.provider
+                .append_postgres_operation(JournalOperation::CommitActivations(inputs))
+                .await?;
+        }
+        Ok(output)
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .record_activation_failures(inputs.clone())
+            .await?;
+        self.provider
+            .append_postgres_operation(JournalOperation::RecordActivationFailures(inputs))
+            .await
     }
 
     async fn release_activation(
@@ -3595,15 +4137,15 @@ fn postgres_partition_suffix(partition: u32) -> String {
 }
 
 #[derive(Clone)]
-struct JsonFileShardSession {
-    provider: JsonFileDurabilityProvider,
+struct ShardEngineSession {
+    provider: ShardEngineProvider,
     shard_id: u32,
     owner_id: Option<String>,
     lease_epoch: Option<u64>,
 }
 
 #[async_trait]
-impl ShardDurabilitySession for JsonFileShardSession {
+impl ShardDurabilitySession for ShardEngineSession {
     fn shard_id(&self) -> u32 {
         self.shard_id
     }
@@ -3628,55 +4170,79 @@ impl ShardDurabilitySession for JsonFileShardSession {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
-            &self.provider,
-            ref_,
-            options,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.provider, ref_, options)
+            .await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(&self.provider, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::append_signal(&self.provider, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(&self.provider, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.provider, input).await
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
-            &self.provider,
-            input,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(&self.provider, input)
+            .await
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(&self.provider, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.provider, input).await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(&self.provider, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.provider, input).await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(&self.provider, input).await
+        <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.provider, input).await
     }
 
     async fn commit_checkpoint(
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(&self.provider, input)
+        if let Err(error) = self.provider.assert_activation_claim_sync(
+            &input.activation_id,
+            self.owner_id(),
+            self.lease_epoch(),
+            input.now,
+        ) {
+            return Ok(CommitCheckpointResult {
+                ok: false,
+                sequence: input.expected_sequence,
+                reason: Some("lost_activation_lease".to_string()),
+                retryable: Some(true),
+                error: Some(SerializedError {
+                    name: Some("LostActivationLease".to_string()),
+                    message: error.message,
+                }),
+            });
+        }
+        <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(&self.provider, input).await
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        <ShardEngineProvider as DurabilityProvider>::commit_activations(&self.provider, inputs)
             .await
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
+            &self.provider,
+            inputs,
+        )
+        .await
     }
 
     async fn release_activation(
@@ -3706,7 +4272,7 @@ impl ShardDurabilitySession for JsonFileShardSession {
 }
 
 #[async_trait]
-impl DurabilityProvider for JsonFileDurabilityProvider {
+impl DurabilityProvider for ShardEngineProvider {
     async fn claim_shard(
         &self,
         input: ClaimShardInput,
@@ -3715,7 +4281,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
-        Arc::new(JsonFileShardSession {
+        Arc::new(ShardEngineSession {
             provider: self.clone(),
             shard_id: input.shard_id,
             owner_id: input.owner_id,
@@ -3727,14 +4293,14 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        JsonFileDurabilityProvider::create_instance(self, input)
+        ShardEngineProvider::create_instance(self, input)
     }
 
     async fn create_child_instance(
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        JsonFileDurabilityProvider::create_child_instance(self, input)
+        ShardEngineProvider::create_child_instance(self, input)
     }
 
     async fn load_instance(
@@ -3742,7 +4308,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        let mut instance = JsonFileDurabilityProvider::load_instance(self, ref_)?;
+        let mut instance = ShardEngineProvider::load_instance(self, ref_)?;
         if !options.include_effects {
             if let Some(instance) = &mut instance {
                 instance.effects.clear();
@@ -3752,7 +4318,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        JsonFileDurabilityProvider::append_signal(
+        ShardEngineProvider::append_signal(
             self,
             input.workflow_id,
             input.run_id,
@@ -3763,14 +4329,14 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        JsonFileDurabilityProvider::cancel_child(self, input)
+        ShardEngineProvider::cancel_child(self, input)
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        JsonFileDurabilityProvider::get_or_reserve_effect(
+        ShardEngineProvider::get_or_reserve_effect(
             self,
             &input.workflow_id,
             &input.run_id,
@@ -3784,7 +4350,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        JsonFileDurabilityProvider::heartbeat_effect(
+        ShardEngineProvider::heartbeat_effect(
             self,
             &input.workflow_id,
             &input.run_id,
@@ -3797,7 +4363,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        JsonFileDurabilityProvider::complete_effect(
+        ShardEngineProvider::complete_effect(
             self,
             &input.workflow_id,
             &input.run_id,
@@ -3810,7 +4376,7 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        JsonFileDurabilityProvider::fail_effect(
+        ShardEngineProvider::fail_effect(
             self,
             &input.workflow_id,
             &input.run_id,
@@ -3827,19 +4393,33 @@ impl DurabilityProvider for JsonFileDurabilityProvider {
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        JsonFileDurabilityProvider::commit_checkpoint(self, input)
+        ShardEngineProvider::commit_checkpoint(self, input)
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        ShardEngineProvider::commit_activations(self, inputs)
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        ShardEngineProvider::record_activation_failures(self, inputs)
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        JsonFileDurabilityProvider::list_instances(self)
+        ShardEngineProvider::list_instances(self)
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        JsonFileDurabilityProvider::list_signals(self)
+        ShardEngineProvider::list_signals(self)
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        JsonFileDurabilityProvider::list_children(self)
+        ShardEngineProvider::list_children(self)
     }
 }
 
@@ -3849,30 +4429,25 @@ impl DurabilityProvider for NullDurabilityProvider {
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::claim_shard(&self.inner, input).await
+        <ShardEngineProvider as DurabilityProvider>::claim_shard(&self.inner, input).await
     }
 
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::open_shard(&self.inner, input)
+        <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input)
     }
 
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::create_instance(&self.inner, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::create_instance(&self.inner, input).await
     }
 
     async fn create_child_instance(
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::create_child_instance(
-            &self.inner,
-            input,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::create_child_instance(&self.inner, input).await
     }
 
     async fn load_instance(
@@ -3880,65 +4455,68 @@ impl DurabilityProvider for NullDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::load_instance(
-            &self.inner,
-            ref_,
-            options,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::append_signal(&self.inner, input).await
+        <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::cancel_child(&self.inner, input).await
+        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input).await
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::get_or_reserve_effect(
-            &self.inner,
-            input,
-        )
-        .await
+        <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(&self.inner, input).await
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input).await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::complete_effect(&self.inner, input)
-            .await
+        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input).await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::fail_effect(&self.inner, input).await
+        <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input).await
     }
 
     async fn commit_checkpoint(
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::commit_checkpoint(&self.inner, input)
+        <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(&self.inner, input).await
+    }
+
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        <ShardEngineProvider as DurabilityProvider>::commit_activations(&self.inner, inputs).await
+    }
+
+    async fn record_activation_failures(
+        &self,
+        inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(&self.inner, inputs)
             .await
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_instances(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_instances(&self.inner).await
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_signals(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_signals(&self.inner).await
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        <JsonFileDurabilityProvider as DurabilityProvider>::list_children(&self.inner).await
+        <ShardEngineProvider as DurabilityProvider>::list_children(&self.inner).await
     }
 }
 
@@ -4645,8 +5223,8 @@ fn expire_activity_timeouts(
 }
 
 fn claim_tasks_for_provider(
-    provider: &JsonFileDurabilityProvider,
-    session: &JsonFileShardSession,
+    provider: &ShardEngineProvider,
+    session: &ShardEngineSession,
     input: ClaimShardTasksInput,
 ) -> Result<ClaimShardTasksResult, WorkflowError> {
     if input.limit == 0 {
@@ -4936,6 +5514,22 @@ pub struct CommitCheckpointResult {
     pub error: Option<SerializedError>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CommitActivationsResult {
+    pub results: Vec<CommitCheckpointResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordActivationFailureInput {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub activation_id: String,
+    pub worker_id: String,
+    pub now: DateTime<Utc>,
+    pub effects: Vec<CheckpointEffectMutation>,
+    pub release_activation: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CheckpointEffectMutation {
     Completed { key: String, result: JsonValue },
@@ -5221,6 +5815,24 @@ pub trait ShardDurabilitySession: Send + Sync {
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError>;
 
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            results.push(self.commit_checkpoint(input).await?);
+        }
+        Ok(CommitActivationsResult { results })
+    }
+
+    async fn record_activation_failures(
+        &self,
+        _inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        Ok(())
+    }
+
     async fn release_activation(
         &self,
         activation_id: &str,
@@ -5274,9 +5886,31 @@ pub trait DurabilityProvider: Send + Sync {
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError>;
 
+    async fn commit_activations(
+        &self,
+        inputs: Vec<CommitCheckpointInput>,
+    ) -> Result<CommitActivationsResult, WorkflowError> {
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            results.push(self.commit_checkpoint(input).await?);
+        }
+        Ok(CommitActivationsResult { results })
+    }
+
+    async fn record_activation_failures(
+        &self,
+        _inputs: Vec<RecordActivationFailureInput>,
+    ) -> Result<(), WorkflowError> {
+        Ok(())
+    }
+
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError>;
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError>;
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError>;
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -5458,16 +6092,49 @@ impl DurableRuntime {
     }
 
     pub async fn drain(&self, options: DrainOptions) -> Result<DrainResult, WorkflowError> {
-        let max_activations = options.max_activations.unwrap_or(100);
+        self.run_worker(RunWorkerOptions {
+            max_activations: options.max_activations,
+            stop_when_idle: true,
+            ..RunWorkerOptions::default()
+        })
+        .await
+    }
+
+    pub async fn run_worker(
+        &self,
+        options: RunWorkerOptions,
+    ) -> Result<DrainResult, WorkflowError> {
+        let max_activations = options.max_activations.unwrap_or(usize::MAX);
         let mut activations = 0;
+        let mut idle_sleep_ms = options
+            .idle_sleep_ms
+            .unwrap_or(self.options.min_poll_interval_ms)
+            .max(1);
+        let max_idle_sleep_ms = self.options.max_poll_interval_ms.max(idle_sleep_ms);
 
         while activations < max_activations {
+            if options
+                .cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                break;
+            }
             let remaining = max_activations - activations;
             let batch_limit = self.options.activation_prefetch_limit.max(1).min(remaining);
             let batch = self.next_activation_batch(batch_limit).await?;
             if batch.is_empty() {
-                break;
+                if options.stop_when_idle {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(idle_sleep_ms)).await;
+                idle_sleep_ms = (idle_sleep_ms.saturating_mul(2)).min(max_idle_sleep_ms);
+                continue;
             }
+            idle_sleep_ms = options
+                .idle_sleep_ms
+                .unwrap_or(self.options.min_poll_interval_ms)
+                .max(1);
             for activation in batch {
                 if let Err(error) = self.run_activation(activation.clone()).await {
                     let _ = self.release_claimed_activation(&activation).await;
@@ -5678,22 +6345,26 @@ impl DurableRuntime {
             } else {
                 Vec::new()
             };
-            self.provider
-                .commit_checkpoint(CommitCheckpointInput {
-                    workflow_id: latest.workflow_id,
-                    run_id: latest.run_id,
-                    expected_sequence: latest.sequence,
-                    activation_id: activation.activation_id,
-                    workflow_version: activation.workflow.version(),
-                    next,
-                    waits,
-                    now: self.now(),
-                    consume_signal_id: None,
-                    consume_child_record_id: None,
-                    effects: Vec::new(),
-                    child_starts: Vec::new(),
-                })
+            let commit = self
+                .commit_claimed_activation(
+                    &activation,
+                    CommitCheckpointInput {
+                        workflow_id: latest.workflow_id,
+                        run_id: latest.run_id,
+                        expected_sequence: latest.sequence,
+                        activation_id: activation.activation_id.clone(),
+                        workflow_version: activation.workflow.version(),
+                        next,
+                        waits,
+                        now: self.now(),
+                        consume_signal_id: None,
+                        consume_child_record_id: None,
+                        effects: Vec::new(),
+                        child_starts: Vec::new(),
+                    },
+                )
                 .await?;
+            self.handle_commit_result(commit)?;
             return Ok(());
         }
 
@@ -5771,28 +6442,65 @@ impl DurableRuntime {
             Vec::new()
         };
 
-        self.provider
-            .commit_checkpoint(CommitCheckpointInput {
-                workflow_id: latest.workflow_id,
-                run_id: latest.run_id,
-                expected_sequence: latest.sequence,
-                activation_id: activation.activation_id,
-                workflow_version: activation.workflow.version(),
-                next,
-                waits,
-                now: self.now(),
-                consume_signal_id,
-                consume_child_record_id,
-                effects: ctx
-                    .commit_effects
-                    .into_values()
-                    .filter(|effect| !matches!(effect, CheckpointEffectMutation::Completed { .. }))
-                    .collect(),
-                child_starts: ctx.commit_child_starts.into_values().collect(),
-            })
+        let commit = self
+            .commit_claimed_activation(
+                &activation,
+                CommitCheckpointInput {
+                    workflow_id: latest.workflow_id,
+                    run_id: latest.run_id,
+                    expected_sequence: latest.sequence,
+                    activation_id: activation.activation_id.clone(),
+                    workflow_version: activation.workflow.version(),
+                    next,
+                    waits,
+                    now: self.now(),
+                    consume_signal_id,
+                    consume_child_record_id,
+                    effects: ctx
+                        .commit_effects
+                        .into_values()
+                        .filter(|effect| {
+                            !matches!(effect, CheckpointEffectMutation::Completed { .. })
+                        })
+                        .collect(),
+                    child_starts: ctx.commit_child_starts.into_values().collect(),
+                },
+            )
             .await?;
+        self.handle_commit_result(commit)?;
 
         Ok(())
+    }
+
+    async fn commit_claimed_activation(
+        &self,
+        activation: &ReadyActivation,
+        input: CommitCheckpointInput,
+    ) -> Result<CommitCheckpointResult, WorkflowError> {
+        match activation.lease {
+            ActivationClaimLease::Shard { shard_id, epoch } => {
+                let session = self.provider.open_shard(OpenShardInput {
+                    shard_id,
+                    owner_id: Some(self.options.worker_id.clone()),
+                    lease_epoch: Some(epoch),
+                });
+                session.commit_checkpoint(input).await
+            }
+            ActivationClaimLease::Activation => self.provider.commit_checkpoint(input).await,
+        }
+    }
+
+    fn handle_commit_result(&self, result: CommitCheckpointResult) -> Result<(), WorkflowError> {
+        if result.ok || result.retryable.unwrap_or(false) {
+            return Ok(());
+        }
+        Err(WorkflowError::new(
+            result
+                .error
+                .map(|error| error.message)
+                .or(result.reason)
+                .unwrap_or_else(|| "activation commit failed".to_string()),
+        ))
     }
 
     fn apply_transition(
@@ -5901,6 +6609,52 @@ impl Default for RuntimeOptions {
 #[derive(Clone, Debug, Default)]
 pub struct DrainOptions {
     pub max_activations: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl WorkerCancellation {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for WorkerCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RunWorkerOptions {
+    pub max_activations: Option<usize>,
+    pub stop_when_idle: bool,
+    pub idle_sleep_ms: Option<u64>,
+    pub cancellation: Option<WorkerCancellation>,
+}
+
+impl Default for RunWorkerOptions {
+    fn default() -> Self {
+        Self {
+            max_activations: None,
+            stop_when_idle: false,
+            idle_sleep_ms: None,
+            cancellation: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6532,29 +7286,14 @@ pub mod testing {
         {
             let provider = factory().await.expect("provider factory failed");
             let now = Utc::now();
-            let ref_ = provider
-                .create_instance(CreateInstanceInput {
-                    workflow_name: "conformance".to_string(),
-                    workflow_version: 1,
-                    workflow_id: "conformance-instance".to_string(),
-                    run_id: "run-1".to_string(),
-                    partition_shard: 0,
-                    common: serde_json::json!({ "value": "original" }),
-                    phase: PhaseSnapshot {
-                        name: "run".to_string(),
-                        data: serde_json::json!({}),
-                    },
-                    waits: vec![DurableWait::Run {
-                        name: "__run".to_string(),
-                        ready_at: now,
-                    }],
-                    now,
-                    parent: None,
-                    conflict_policy: Some(ConflictPolicy::Fail),
-                })
-                .await
-                .expect("create instance failed");
-
+            let ref_ = create_conformance_instance(
+                &provider,
+                "conformance-instance",
+                "conformance",
+                vec![run_wait(now)],
+                now,
+            )
+            .await;
             let lease = provider
                 .claim_shard(ClaimShardInput {
                     shard_id: 0,
@@ -6617,6 +7356,396 @@ pub mod testing {
                 .expect("instance missing after commit");
             assert_eq!(loaded.status, PersistedStatus::Completed);
             assert_eq!(loaded.sequence, 1);
+            session.release().await.expect("release basic shard failed");
+
+            assert_ordered_batch_claims_and_lean_reads(&provider, now).await;
+            assert_lost_activation_lease_preserves_signal(&provider, now).await;
+            assert_eager_effect_retry_reclaims_activation(&provider, now).await;
+        }
+
+        async fn assert_ordered_batch_claims_and_lean_reads<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            let later = create_conformance_instance(
+                provider,
+                "ordered-later",
+                "ordered",
+                vec![run_wait(now + chrono::Duration::milliseconds(2))],
+                now,
+            )
+            .await;
+            let earlier = create_conformance_instance(
+                provider,
+                "ordered-earlier",
+                "ordered",
+                vec![run_wait(now + chrono::Duration::milliseconds(1))],
+                now,
+            )
+            .await;
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "ordered-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("ordered shard claim failed")
+                .expect("ordered shard was not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let claims = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("ordered".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::milliseconds(10),
+                    lease_ms: 60_000,
+                    limit: 2,
+                })
+                .await
+                .expect("ordered claim failed");
+            assert_eq!(claims.claims.len(), 2);
+            assert_eq!(claims.claims[0].instance.workflow_id, earlier.workflow_id);
+            assert_eq!(claims.claims[1].instance.workflow_id, later.workflow_id);
+
+            let lean = provider
+                .load_instance(
+                    &earlier,
+                    LoadInstanceOptions {
+                        include_effects: false,
+                    },
+                )
+                .await
+                .expect("lean load failed")
+                .expect("ordered instance missing");
+            assert!(lean.effects.is_empty());
+            session
+                .release()
+                .await
+                .expect("release ordered shard failed");
+        }
+
+        async fn assert_lost_activation_lease_preserves_signal<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            let ref_ = create_conformance_instance(
+                provider,
+                "lost-lease-signal",
+                "lost_lease",
+                vec![DurableWait::Signal {
+                    name: "finish".to_string(),
+                    r#type: "finish".to_string(),
+                    scope: WaitScope::Phase,
+                }],
+                now,
+            )
+            .await;
+            let signal = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "ok": true }),
+                    received_at: now,
+                })
+                .await
+                .expect("append signal failed");
+
+            let lease_a = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "lease-worker-a".to_string(),
+                    now,
+                    lease_ms: 10,
+                })
+                .await
+                .expect("worker a shard claim failed")
+                .expect("worker a shard not claimed");
+            let session_a = provider.open_shard(OpenShardInput {
+                shard_id: 0,
+                owner_id: Some("lease-worker-a".to_string()),
+                lease_epoch: Some(lease_a.lease_epoch),
+            });
+            let claim_a = session_a
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("lost_lease".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 10,
+                    limit: 1,
+                })
+                .await
+                .expect("worker a claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("worker a did not claim signal");
+
+            let reclaim_at = now + chrono::Duration::milliseconds(20);
+            let lease_b = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "lease-worker-b".to_string(),
+                    now: reclaim_at,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("worker b shard claim failed")
+                .expect("worker b shard not claimed");
+            let session_b = provider.open_shard(OpenShardInput {
+                shard_id: 0,
+                owner_id: Some("lease-worker-b".to_string()),
+                lease_epoch: Some(lease_b.lease_epoch),
+            });
+            let claim_b = session_b
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("lost_lease".to_string(), 1)]),
+                    shard_count: 1,
+                    now: reclaim_at,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("worker b claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("worker b did not reclaim signal");
+
+            let stale = session_a
+                .commit_checkpoint(complete_input(
+                    &ref_,
+                    claim_a.activation.sequence(),
+                    claim_a.activation.activation_id(),
+                    1,
+                    reclaim_at,
+                    Some(signal.signal_id.clone()),
+                ))
+                .await
+                .expect("stale commit errored");
+            assert!(!stale.ok);
+            assert_eq!(stale.reason.as_deref(), Some("lost_activation_lease"));
+            let unconsumed = provider
+                .list_signals()
+                .await
+                .expect("list signals failed")
+                .into_iter()
+                .find(|record| record.signal_id == signal.signal_id)
+                .expect("signal missing");
+            assert_eq!(unconsumed.consumed_by_sequence, None);
+
+            let committed = session_b
+                .commit_checkpoint(complete_input(
+                    &ref_,
+                    claim_b.activation.sequence(),
+                    claim_b.activation.activation_id(),
+                    1,
+                    reclaim_at,
+                    Some(signal.signal_id.clone()),
+                ))
+                .await
+                .expect("fresh commit errored");
+            assert!(committed.ok, "fresh commit conflict: {:?}", committed);
+            let consumed = provider
+                .list_signals()
+                .await
+                .expect("list signals failed")
+                .into_iter()
+                .find(|record| record.signal_id == signal.signal_id)
+                .expect("signal missing");
+            assert_eq!(consumed.consumed_by_sequence, Some(1));
+            session_b
+                .release()
+                .await
+                .expect("release lost-lease shard failed");
+        }
+
+        async fn assert_eager_effect_retry_reclaims_activation<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            create_conformance_instance(
+                provider,
+                "effect-retry",
+                "effect_retry",
+                vec![run_wait(now)],
+                now,
+            )
+            .await;
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "effect-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("effect shard claim failed")
+                .expect("effect shard not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: 0,
+                owner_id: Some("effect-worker".to_string()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let claim = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("effect_retry".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("effect claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("effect activation missing");
+            let EffectReservation::Reserved {
+                effect_id,
+                attempt_id,
+                attempt,
+                ..
+            } = session
+                .get_or_reserve_effect(ReserveEffectInput {
+                    workflow_id: "effect-retry".to_string(),
+                    run_id: "run-1".to_string(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    worker_id: "effect-worker".to_string(),
+                    key: "activity".to_string(),
+                    now,
+                    options: ActivityOptions {
+                        durability: ActivityDurability::Eager,
+                        max_attempts: Some(2),
+                        initial_interval_ms: Some(25),
+                        ..ActivityOptions::default()
+                    },
+                    max_attempts: None,
+                })
+                .await
+                .expect("reserve effect failed")
+            else {
+                panic!("expected effect reservation");
+            };
+            assert_eq!(attempt, 1);
+            let failed = session
+                .fail_effect(FailEffectInput {
+                    workflow_id: "effect-retry".to_string(),
+                    run_id: "run-1".to_string(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    worker_id: "effect-worker".to_string(),
+                    effect_id,
+                    attempt_id,
+                    error: SerializedError {
+                        name: Some("Transient".to_string()),
+                        message: "try again".to_string(),
+                    },
+                    now,
+                    retryable: Some(true),
+                })
+                .await
+                .expect("fail effect failed");
+            let FailEffectResult::RetryScheduled {
+                next_attempt_at,
+                next_attempt,
+            } = failed
+            else {
+                panic!("expected retry schedule");
+            };
+            assert_eq!(next_attempt, 2);
+
+            let early = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("effect_retry".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::milliseconds(10),
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("early effect reclaim failed");
+            assert!(early.claims.is_empty());
+
+            let retry = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("effect_retry".to_string(), 1)]),
+                    shard_count: 1,
+                    now: next_attempt_at,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("retry effect reclaim failed");
+            assert_eq!(retry.claims.len(), 1);
+        }
+
+        async fn create_conformance_instance<P>(
+            provider: &P,
+            workflow_id: &str,
+            workflow_name: &str,
+            waits: Vec<DurableWait>,
+            now: DateTime<Utc>,
+        ) -> InstanceRef
+        where
+            P: DurabilityProvider,
+        {
+            provider
+                .create_instance(CreateInstanceInput {
+                    workflow_name: workflow_name.to_string(),
+                    workflow_version: 1,
+                    workflow_id: workflow_id.to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "value": "original" }),
+                    phase: PhaseSnapshot {
+                        name: "run".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits,
+                    now,
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                })
+                .await
+                .expect("create instance failed")
+        }
+
+        fn run_wait(ready_at: DateTime<Utc>) -> DurableWait {
+            DurableWait::Run {
+                name: "__run".to_string(),
+                ready_at,
+            }
+        }
+
+        fn complete_input(
+            ref_: &InstanceRef,
+            expected_sequence: u64,
+            activation_id: &str,
+            workflow_version: u32,
+            now: DateTime<Utc>,
+            consume_signal_id: Option<String>,
+        ) -> CommitCheckpointInput {
+            CommitCheckpointInput {
+                workflow_id: ref_.workflow_id.clone(),
+                run_id: ref_.run_id.clone(),
+                expected_sequence,
+                activation_id: activation_id.to_string(),
+                workflow_version,
+                next: InstanceStatusValue::Completed {
+                    output: serde_json::json!({ "ok": true }),
+                },
+                waits: Vec::new(),
+                now,
+                consume_signal_id,
+                consume_child_record_id: None,
+                effects: Vec::new(),
+                child_starts: Vec::new(),
+            }
         }
     }
 }

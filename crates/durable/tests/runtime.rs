@@ -6,11 +6,11 @@ use durable::{
     CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput, ClaimShardTasksInput,
     ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider, DurableRuntime,
     DurableWait, EffectReservation, FailEffectInput, FailEffectResult, HeartbeatEffectInput,
-    InstanceRef, InstanceStatusValue, JsonFileDurabilityProvider, LoadInstanceOptions,
-    OpenShardInput, ParentClosePolicy, PersistedInstance, PersistedStatus, PhaseSnapshot,
-    PostgresDurabilityProvider, PostgresDurabilityProviderOptions, ReserveEffectInput,
-    RuntimeOptions, SerializedError, SignalRecord, SqliteDurabilityOptions,
-    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkflowError,
+    InstanceRef, InstanceStatusValue, LoadInstanceOptions, OpenShardInput, ParentClosePolicy,
+    PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
+    PostgresDurabilityProviderOptions, ReserveEffectInput, RunWorkerOptions, RuntimeOptions,
+    SerializedError, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
+    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -93,8 +93,8 @@ impl ManualClock {
     }
 }
 
-fn provider(path: &std::path::Path) -> JsonFileDurabilityProvider {
-    JsonFileDurabilityProvider::new(path).unwrap()
+fn provider(path: &std::path::Path) -> SqliteDurabilityProvider {
+    SqliteDurabilityProvider::new(path).unwrap()
 }
 
 fn make_runtime(path: &std::path::Path, clock: &ManualClock) -> DurableRuntime {
@@ -130,7 +130,7 @@ async fn runtime_children(runtime: &DurableRuntime) -> Vec<ChildRecord> {
 async fn persists_initial_snapshot_and_reloads() {
     let _guard = TEST_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<TestChildWorkflow>().unwrap();
@@ -161,7 +161,7 @@ async fn persists_initial_snapshot_and_reloads() {
         }]
     );
 
-    let reloaded = provider(&path).load_instance(&ref_).unwrap().unwrap();
+    let reloaded = provider(&path).load_instance(&ref_).await.unwrap().unwrap();
     assert_eq!(reloaded.sequence, 0);
     assert_eq!(reloaded.phase.unwrap().name, "boot");
 }
@@ -171,7 +171,7 @@ async fn survives_restart_with_pending_timer_and_stay_checkpoint() {
     let _guard = TEST_LOCK.lock().unwrap();
     parent_child::reset_reminders();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<TestChildWorkflow>().unwrap();
@@ -227,7 +227,7 @@ async fn survives_restart_with_pending_timer_and_stay_checkpoint() {
 async fn persists_signals_and_consumes_atomically_with_go_checkpoint() {
     let _guard = TEST_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<TestChildWorkflow>().unwrap();
@@ -278,7 +278,7 @@ async fn uses_checkpoint_for_bounded_loop_pattern() {
     let _guard = TEST_LOCK.lock().unwrap();
     parent_child::reset_processed();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<TestChildWorkflow>().unwrap();
@@ -331,7 +331,7 @@ async fn uses_checkpoint_for_bounded_loop_pattern() {
 async fn wakes_parent_from_completed_child_after_reconstruction() {
     let _guard = TEST_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<TestChildWorkflow>().unwrap();
@@ -420,7 +420,7 @@ async fn memoizes_completed_activities_across_failed_activation_retry() {
     let _guard = TEST_LOCK.lock().unwrap();
     unstable::reset(true);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
 
@@ -465,7 +465,7 @@ async fn memoizes_completed_activities_across_failed_activation_retry() {
 async fn migrates_running_instance_and_recomputes_waits() {
     let _guard = TEST_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime_v1 = make_runtime(&path, &clock);
 
@@ -721,7 +721,7 @@ async fn commit_local_child_start_materializes_only_at_checkpoint() {
     let _guard = TEST_LOCK.lock().unwrap();
     COMMIT_LOCAL_CHILD_SHOULD_THROW.store(true, Ordering::SeqCst);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.json");
+    let path = dir.path().join("store.sqlite");
     let clock = ManualClock::new();
     let runtime = make_runtime(&path, &clock);
     runtime.register::<CommitLocalChildWorkflow>().unwrap();
@@ -760,6 +760,85 @@ async fn commit_local_child_start_materializes_only_at_checkpoint() {
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].key, "child");
     assert_eq!(children[0].status, durable::ChildStatus::Started);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_worker_stop_when_idle_uses_same_activation_path_as_drain() {
+    let clock = ManualClock::new();
+    let runtime = DurableRuntime::with_clock(durable::NullDurabilityProvider::new(), {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+    runtime.register::<TestChildWorkflow>().unwrap();
+
+    let ref_ = runtime
+        .start::<TestWorkflow>(
+            TestInput {
+                label: "Ada".to_string(),
+                items: vec!["a".to_string()],
+            },
+            StartOptions {
+                workflow_id: Some("run-worker-parent".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = runtime
+        .run_worker(RunWorkerOptions {
+            max_activations: Some(1),
+            stop_when_idle: true,
+            ..RunWorkerOptions::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.activations, 1);
+    assert_eq!(
+        load_runtime_instance(&runtime, &ref_)
+            .await
+            .phase
+            .unwrap()
+            .name,
+        "waiting"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_worker_honors_cancellation_before_claiming_work() {
+    let clock = ManualClock::new();
+    let runtime = DurableRuntime::with_clock(durable::NullDurabilityProvider::new(), {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+    runtime.register::<TestChildWorkflow>().unwrap();
+
+    let ref_ = runtime
+        .start::<TestWorkflow>(
+            TestInput {
+                label: "Ada".to_string(),
+                items: vec!["a".to_string()],
+            },
+            StartOptions {
+                workflow_id: Some("cancelled-worker-parent".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cancellation = WorkerCancellation::new();
+    cancellation.cancel();
+
+    let result = runtime
+        .run_worker(RunWorkerOptions {
+            max_activations: Some(10),
+            cancellation: Some(cancellation),
+            ..RunWorkerOptions::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.activations, 0);
+    assert_eq!(load_runtime_instance(&runtime, &ref_).await.sequence, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

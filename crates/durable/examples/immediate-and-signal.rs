@@ -8,7 +8,7 @@
 use chrono::TimeZone;
 use durable::{
     complete, go, start, workflow, DrainOptions, DurablePhase, DurableRuntime, InstanceRef,
-    InstanceSnapshot, JsonFileDurabilityProvider, PersistedInstance, PersistedStatus, StartOptions,
+    InstanceSnapshot, PersistedInstance, PersistedStatus, SqliteDurabilityProvider, StartOptions,
     WorkflowError,
 };
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,7 @@ workflow! {
 pub async fn run_immediate_and_signal_demo() -> Result<(), WorkflowError> {
     let path = reset_demo_store("immediate-and-signal")?;
     let clock = ManualClock::new();
-    let provider = JsonFileDurabilityProvider::new(path)?;
+    let provider = SqliteDurabilityProvider::new(path)?;
     let runtime = DurableRuntime::with_clock(provider.clone(), clock.closure());
 
     let ref_ = runtime
@@ -162,7 +162,7 @@ pub async fn run_immediate_and_signal_demo() -> Result<(), WorkflowError> {
         )
         .await?;
     runtime.drain(DrainOptions::default()).await?;
-    print_committed("immediate + signal: completed", &provider, &ref_)
+    print_committed("immediate + signal: completed", &provider, &ref_).await
 }
 
 #[allow(dead_code)]
@@ -172,7 +172,7 @@ async fn main() -> Result<(), WorkflowError> {
 }
 
 fn demo_store_path(name: &str) -> PathBuf {
-    PathBuf::from(".durable-demo").join(format!("rust-{name}.json"))
+    PathBuf::from(".durable-demo").join(format!("rust-{name}.sqlite"))
 }
 
 #[derive(Clone)]
@@ -201,22 +201,28 @@ impl ManualClock {
 
 fn reset_demo_store(name: &str) -> Result<PathBuf, std::io::Error> {
     let path = demo_store_path(name);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    for candidate in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(path)
 }
 
-fn print_committed(
+async fn print_committed(
     label: &str,
-    provider: &JsonFileDurabilityProvider,
+    provider: &SqliteDurabilityProvider,
     ref_: &InstanceRef,
 ) -> Result<(), WorkflowError> {
     println!(
         "{label} {}",
-        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_)?))?
+        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_).await?))?
     );
     Ok(())
 }

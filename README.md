@@ -70,15 +70,13 @@ npm run postgres:down
 The Compose file defaults to the pinned official image
 `${POSTGRES_IMAGE:-postgres:18.3}` on local port `${POSTGRES_PORT:-55432}`.
 
-`PostgresDurabilityProvider.create(...)` accepts a connection string or shared
-`pg.Pool`, schema name, pool size, statement/lock timeouts,
-`physicalPartitions`, and optional observability sinks. The provider uses the
-same shared append/replay shard engine as SQLite: each logical shard has a
-current in-memory projection, durable journal rows, and periodic snapshots.
-Warm shard-owner mutations apply in memory and persist with one fenced
-compare-and-swap append against the shard head; if another writer advanced the
-head, the provider catches up from the journal and retries. Postgres is no
-longer used as the task scheduler in this path.
+The TypeScript `PostgresDurabilityProvider.create(...)` accepts a connection
+string or shared `pg.Pool`, schema name, pool size, statement/lock timeouts,
+`physicalPartitions`, and optional observability sinks. The Rust
+`PostgresDurabilityProvider` now opens a small `tokio-postgres` client pool per
+provider, persists schema metadata, and uses the same append/replay shard
+projection as SQLite. Postgres is no longer used as the task scheduler in this
+path.
 
 `physicalPartitions` is fixed when a schema is created and is persisted in
 provider metadata. Shard journals, shard heads, and snapshots are manually
@@ -151,6 +149,10 @@ shared Postgres schema with disjoint shard ranges.
 Rust parity is checked by running matching TS and Rust JSON benchmarks on the
 same machine and comparing median `processingWorkflowsPerSecond`. A ratio above
 `1.0x` means Rust is faster than TypeScript for that provider/mode pair.
+The Rust crate no longer exposes the old JSON-file provider; examples and
+restart tests use the null, SQLite, SQLite shard-file, or Postgres providers.
+SQLite writes are owned by a dedicated blocking writer, and Postgres uses a
+round-robin async client pool.
 
 ```bash
 npm run benchmark:rust-parity -- --provider all --mode all --workflows 20 --workers 2 --shards 2 --repeat 3 --physical-partitions 2
@@ -161,19 +163,24 @@ Latest local parity gate, `20` workflows, `2` workers, `2` shards, repeat `3`:
 
 | Provider | mixed | bare | activity | signal | timer | child |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null | 6.61x | 25.27x | 22.33x | 20.35x | 16.95x | 10.88x |
-| SQLite single-file | 3.26x | 4.44x | 4.27x | 5.34x | 4.57x | 3.05x |
-| SQLite shard-file | 2.95x | 3.45x | 3.15x | 2.81x | 2.57x | 3.72x |
-| Postgres | 1.40x | 2.06x | 1.77x | 2.07x | 2.14x | 1.48x |
+| Null | 7.61x | 32.30x | 33.01x | 32.17x | 33.03x | 13.04x |
+| SQLite single-file | 2.80x | 3.35x | 2.90x | 2.54x | 2.53x | 1.68x |
+| SQLite shard-file | 1.35x | 1.86x | 1.68x | 5.10x | 4.89x | 2.48x |
+| Postgres | 1.24x | 1.78x | 1.95x | 1.99x | 2.01x | 1.41x |
 
 Focused null-provider rerun, `100` workflows, `4` workers, `4` shards, repeat
 `3`:
 
 | Provider | mixed | bare | activity | signal | timer | child |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Null | 2.45x | 7.97x | 8.95x | 6.97x | 7.67x | 2.73x |
+| Null | 2.76x | 9.00x | 10.85x | 10.30x | 10.96x | 3.35x |
 
 ## Provider conformance
+
+Rust providers should run `durable::testing::conformance`, which now covers
+lifecycle, ordered batch claims, lean reads, activation lease fencing with
+signal preservation, and eager effect retry/reclaim behavior for null, SQLite,
+SQLite shard-file, and Postgres when `DURABLE_POSTGRES_URL` is set.
 
 New TypeScript durability providers should run the shared Vitest conformance
 harness. The helper lives outside the main runtime barrel so production imports

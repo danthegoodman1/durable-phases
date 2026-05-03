@@ -7,7 +7,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use durable::{
     complete, go, start, workflow, ChildEvent, ChildHandle, ChildOptions, DrainOptions,
-    DurableRuntime, InstanceRef, JsonFileDurabilityProvider, PersistedInstance, PersistedStatus,
+    DurableRuntime, InstanceRef, PersistedInstance, PersistedStatus, SqliteDurabilityProvider,
     StartOptions, WorkflowError,
 };
 use serde::{Deserialize, Serialize};
@@ -132,7 +132,7 @@ workflow! {
 pub async fn run_child_workflow_demo() -> Result<(), WorkflowError> {
     let path = reset_demo_store("child-workflow")?;
     let clock = ManualClock::new();
-    let provider = JsonFileDurabilityProvider::new(&path)?;
+    let provider = SqliteDurabilityProvider::new(&path)?;
     let runtime = DurableRuntime::with_clock(provider.clone(), clock.closure());
     runtime.register::<GreetingChildWorkflow>()?;
 
@@ -152,9 +152,9 @@ pub async fn run_child_workflow_demo() -> Result<(), WorkflowError> {
             max_activations: Some(1),
         })
         .await?;
-    print_committed("child workflow: parent waiting", &provider, &ref_)?;
+    print_committed("child workflow: parent waiting", &provider, &ref_).await?;
 
-    let restarted_provider = JsonFileDurabilityProvider::new(&path)?;
+    let restarted_provider = SqliteDurabilityProvider::new(&path)?;
     let restarted = DurableRuntime::with_clock(restarted_provider.clone(), clock.closure());
     restarted.register::<GreetingParentWorkflow>()?;
     restarted.register::<GreetingChildWorkflow>()?;
@@ -164,6 +164,7 @@ pub async fn run_child_workflow_demo() -> Result<(), WorkflowError> {
         &restarted_provider,
         &ref_,
     )
+    .await
 }
 
 #[allow(dead_code)]
@@ -197,27 +198,33 @@ impl ManualClock {
 }
 
 fn demo_store_path(name: &str) -> PathBuf {
-    PathBuf::from(".durable-demo").join(format!("rust-{name}.json"))
+    PathBuf::from(".durable-demo").join(format!("rust-{name}.sqlite"))
 }
 
 fn reset_demo_store(name: &str) -> Result<PathBuf, std::io::Error> {
     let path = demo_store_path(name);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    for candidate in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(path)
 }
 
-fn print_committed(
+async fn print_committed(
     label: &str,
-    provider: &JsonFileDurabilityProvider,
+    provider: &SqliteDurabilityProvider,
     ref_: &InstanceRef,
 ) -> Result<(), WorkflowError> {
     println!(
         "{label} {}",
-        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_)?))?
+        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_).await?))?
     );
     Ok(())
 }

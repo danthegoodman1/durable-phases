@@ -6,8 +6,8 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use durable::{
-    complete, start, stay, workflow, DrainOptions, DurableRuntime, InstanceSnapshot, StartOptions,
-    WorkflowError,
+    complete, start, stay, workflow, DrainOptions, DurableRuntime, InstanceSnapshot,
+    SqliteDurabilityProvider, StartOptions, WorkflowError,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -111,7 +111,7 @@ workflow! {
 pub async fn run_timer_stay_restart_demo() -> Result<(), WorkflowError> {
     let path = reset_demo_store("timer-stay-restart")?;
     let clock = ManualClock::new();
-    let provider = durable::JsonFileDurabilityProvider::new(&path)?;
+    let provider = SqliteDurabilityProvider::new(&path)?;
     let runtime = DurableRuntime::with_clock(provider, clock.closure());
 
     let ref_ = runtime
@@ -135,7 +135,7 @@ pub async fn run_timer_stay_restart_demo() -> Result<(), WorkflowError> {
     );
 
     clock.advance(1_000);
-    let restarted_provider = durable::JsonFileDurabilityProvider::new(&path)?;
+    let restarted_provider = SqliteDurabilityProvider::new(&path)?;
     let restarted = DurableRuntime::with_clock(restarted_provider, clock.closure());
     restarted.register::<ReminderWorkflow>()?;
     restarted.drain(DrainOptions::default()).await?;
@@ -186,15 +186,21 @@ impl ManualClock {
 }
 
 fn demo_store_path(name: &str) -> PathBuf {
-    PathBuf::from(".durable-demo").join(format!("rust-{name}.json"))
+    PathBuf::from(".durable-demo").join(format!("rust-{name}.sqlite"))
 }
 
 fn reset_demo_store(name: &str) -> Result<PathBuf, std::io::Error> {
     let path = demo_store_path(name);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    for candidate in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(path)
 }

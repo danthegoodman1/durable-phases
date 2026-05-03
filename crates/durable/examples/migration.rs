@@ -7,9 +7,9 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use durable::{
-    complete, start, workflow, DrainOptions, DurableRuntime, InstanceRef,
-    JsonFileDurabilityProvider, MigrationArgs, MigrationResult, PersistedInstance, PersistedStatus,
-    StartOptions, WorkflowError,
+    complete, start, workflow, DrainOptions, DurableRuntime, InstanceRef, MigrationArgs,
+    MigrationResult, PersistedInstance, PersistedStatus, SqliteDurabilityProvider, StartOptions,
+    WorkflowError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -139,7 +139,7 @@ workflow! {
 pub async fn run_migration_demo() -> Result<(), WorkflowError> {
     let path = reset_demo_store("migration")?;
     let clock = ManualClock::new();
-    let provider_v1 = JsonFileDurabilityProvider::new(&path)?;
+    let provider_v1 = SqliteDurabilityProvider::new(&path)?;
     let runtime_v1 = DurableRuntime::with_clock(provider_v1.clone(), clock.closure());
 
     let ref_ = runtime_v1
@@ -153,9 +153,9 @@ pub async fn run_migration_demo() -> Result<(), WorkflowError> {
             },
         )
         .await?;
-    print_committed("migration: v1 persisted", &provider_v1, &ref_)?;
+    print_committed("migration: v1 persisted", &provider_v1, &ref_).await?;
 
-    let upgraded_provider = JsonFileDurabilityProvider::new(&path)?;
+    let upgraded_provider = SqliteDurabilityProvider::new(&path)?;
     let upgraded_runtime = DurableRuntime::with_clock(upgraded_provider.clone(), clock.closure());
     upgraded_runtime.register::<MigratingOrderV2>()?;
     upgraded_runtime
@@ -167,7 +167,8 @@ pub async fn run_migration_demo() -> Result<(), WorkflowError> {
         "migration: after v2 migration checkpoint",
         &upgraded_provider,
         &ref_,
-    )?;
+    )
+    .await?;
 
     upgraded_runtime
         .signal(
@@ -179,7 +180,7 @@ pub async fn run_migration_demo() -> Result<(), WorkflowError> {
         )
         .await?;
     upgraded_runtime.drain(DrainOptions::default()).await?;
-    print_committed("migration: completed on v2", &upgraded_provider, &ref_)
+    print_committed("migration: completed on v2", &upgraded_provider, &ref_).await
 }
 
 #[allow(dead_code)]
@@ -213,27 +214,33 @@ impl ManualClock {
 }
 
 fn demo_store_path(name: &str) -> PathBuf {
-    PathBuf::from(".durable-demo").join(format!("rust-{name}.json"))
+    PathBuf::from(".durable-demo").join(format!("rust-{name}.sqlite"))
 }
 
 fn reset_demo_store(name: &str) -> Result<PathBuf, std::io::Error> {
     let path = demo_store_path(name);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    for candidate in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(path)
 }
 
-fn print_committed(
+async fn print_committed(
     label: &str,
-    provider: &JsonFileDurabilityProvider,
+    provider: &SqliteDurabilityProvider,
     ref_: &InstanceRef,
 ) -> Result<(), WorkflowError> {
     println!(
         "{label} {}",
-        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_)?))?
+        serde_json::to_string_pretty(&summarize(provider.load_instance(ref_).await?))?
     );
     Ok(())
 }
