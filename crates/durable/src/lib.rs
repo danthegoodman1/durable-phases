@@ -4,7 +4,7 @@ pub use durable_macros::workflow;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::any::type_name;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -12,7 +12,9 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -956,6 +958,8 @@ struct Store {
     signals: Vec<SignalRecord>,
     children: Vec<ChildRecord>,
     tasks: HashMap<String, MemoryTask>,
+    #[serde(default)]
+    task_order: BTreeSet<(String, String)>,
     claimed_sequence_epochs: HashMap<String, u64>,
     completed_activation_claims: Vec<CompletedActivationClaim>,
     shard_leases: HashMap<u32, ShardLease>,
@@ -971,6 +975,7 @@ impl Default for Store {
             signals: Vec::new(),
             children: Vec::new(),
             tasks: HashMap::new(),
+            task_order: BTreeSet::new(),
             claimed_sequence_epochs: HashMap::new(),
             completed_activation_claims: Vec::new(),
             shard_leases: HashMap::new(),
@@ -982,32 +987,26 @@ impl Default for Store {
 }
 
 #[derive(Clone)]
-struct ShardEngineProvider {
-    state: Arc<Mutex<Store>>,
+struct ShardEngine {
+    state: Store,
 }
 
-impl ShardEngineProvider {
-    fn in_memory() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(Store::default())),
-        }
-    }
-
+impl ShardEngine {
     fn from_store(state: Store) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(state)),
-        }
+        let mut state = state;
+        rebuild_task_order(&mut state);
+        Self { state }
     }
 
-    fn snapshot_store(&self) -> Result<Store, WorkflowError> {
-        Ok(self.lock()?.clone())
+    fn snapshot_store(&self) -> Store {
+        self.state.clone()
     }
 
     pub fn create_instance(
-        &self,
+        &mut self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         let key = instance_key(&input.workflow_id, &input.run_id);
         let conflict_policy = input.conflict_policy.unwrap_or(ConflictPolicy::Fail);
 
@@ -1049,17 +1048,17 @@ impl ShardEngineProvider {
             parent: input.parent,
         };
         state.instances.insert(key, instance.clone());
-        replace_tasks_for_instance(&mut state, &instance);
+        replace_tasks_for_instance(state, &instance);
 
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(InstanceRef::new(input.workflow_id, input.run_id))
     }
 
     pub fn create_child_instance(
-        &self,
+        &mut self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
 
         if let Some(existing) = state.children.iter().find(|record| {
             record.parent_workflow_id == input.parent_workflow_id
@@ -1105,7 +1104,7 @@ impl ShardEngineProvider {
             }),
         };
         state.instances.insert(instance_key, child_instance.clone());
-        replace_tasks_for_instance(&mut state, &child_instance);
+        replace_tasks_for_instance(state, &child_instance);
 
         state.children.push(ChildRecord {
             child_record_id: child_record_id.clone(),
@@ -1131,48 +1130,33 @@ impl ShardEngineProvider {
             .map(child_handle_value)
             .ok_or_else(|| WorkflowError::new("failed to create child record"))?;
 
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(handle)
     }
 
-    pub fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
-        cancel_child_in_state(&mut state, input);
-        self.save_locked(&state)
+    pub fn cancel_child(&mut self, input: CancelChildInput) -> Result<(), WorkflowError> {
+        let state = &mut self.state;
+        cancel_child_in_state(state, input);
+        save_engine(state)
     }
 
     pub fn load_instance(
         &self,
         ref_: &InstanceRef,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        let state = self.lock()?;
+        let state = &self.state;
         Ok(state.instances.get(&instance_key_ref(ref_)).cloned())
     }
 
-    pub fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        let state = self.lock()?;
-        Ok(state.instances.values().cloned().collect())
-    }
-
-    pub fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        let state = self.lock()?;
-        Ok(state.signals.clone())
-    }
-
-    pub fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        let state = self.lock()?;
-        Ok(state.children.clone())
-    }
-
     pub fn append_signal(
-        &self,
+        &mut self,
         workflow_id: String,
         run_id: String,
         r#type: String,
         payload: JsonValue,
         received_at: DateTime<Utc>,
     ) -> Result<SignalRecord, WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         let key = instance_key(&workflow_id, &run_id);
         let Some(instance) = state.instances.get(&key) else {
             return Err(WorkflowError::new(format!(
@@ -1200,14 +1184,14 @@ impl ShardEngineProvider {
         state.next_signal_id += 1;
         state.signals.push(signal.clone());
         if let Some(instance) = state.instances.get(&key).cloned() {
-            refresh_signal_tasks_for_instance(&mut state, &instance);
+            refresh_signal_tasks_for_instance(state, &instance);
         }
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(signal)
     }
 
     pub fn get_or_reserve_effect(
-        &self,
+        &mut self,
         workflow_id: &str,
         run_id: &str,
         activation_id: &str,
@@ -1217,8 +1201,8 @@ impl ShardEngineProvider {
         options: ActivityOptions,
         max_attempts: Option<u32>,
     ) -> Result<EffectReservation, WorkflowError> {
-        let mut state = self.lock()?;
-        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
+        let state = &mut self.state;
+        expire_activity_timeouts(state, now, None, Some(worker_id), None);
         let key_for_instance = instance_key(workflow_id, run_id);
 
         let existing = state
@@ -1329,7 +1313,7 @@ impl ShardEngineProvider {
             instance.effects.push(effect);
         }
 
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(EffectReservation::Reserved {
             effect_id,
             idempotency_key,
@@ -1340,7 +1324,7 @@ impl ShardEngineProvider {
     }
 
     pub fn complete_effect(
-        &self,
+        &mut self,
         workflow_id: &str,
         run_id: &str,
         effect_id: &str,
@@ -1349,9 +1333,9 @@ impl ShardEngineProvider {
         now: DateTime<Utc>,
         result: JsonValue,
     ) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
-        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
-        let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
+        let state = &mut self.state;
+        expire_activity_timeouts(state, now, None, Some(worker_id), None);
+        let instance = require_instance_mut(state, workflow_id, run_id)?;
         let effect = instance
             .effects
             .iter_mut()
@@ -1367,11 +1351,11 @@ impl ShardEngineProvider {
         effect.start_to_close_deadline = None;
         effect.heartbeat_deadline = None;
         effect.next_attempt_at = None;
-        self.save_locked(&state)
+        save_engine(state)
     }
 
     pub fn heartbeat_effect(
-        &self,
+        &mut self,
         workflow_id: &str,
         run_id: &str,
         effect_id: &str,
@@ -1380,9 +1364,9 @@ impl ShardEngineProvider {
         now: DateTime<Utc>,
         details: Option<JsonValue>,
     ) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
-        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
-        let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
+        let state = &mut self.state;
+        expire_activity_timeouts(state, now, None, Some(worker_id), None);
+        let instance = require_instance_mut(state, workflow_id, run_id)?;
         let effect = instance
             .effects
             .iter_mut()
@@ -1392,11 +1376,11 @@ impl ShardEngineProvider {
         effect.heartbeat_at = Some(now);
         effect.heartbeat_details = details;
         effect.heartbeat_deadline = deadline_from(now, effect.heartbeat_timeout_ms);
-        self.save_locked(&state)
+        save_engine(state)
     }
 
     pub fn fail_effect(
-        &self,
+        &mut self,
         workflow_id: &str,
         run_id: &str,
         effect_id: &str,
@@ -1406,11 +1390,11 @@ impl ShardEngineProvider {
         now: DateTime<Utc>,
         retryable: Option<bool>,
     ) -> Result<FailEffectResult, WorkflowError> {
-        let mut state = self.lock()?;
-        expire_activity_timeouts(&mut state, now, None, Some(worker_id), None);
+        let state = &mut self.state;
+        expire_activity_timeouts(state, now, None, Some(worker_id), None);
         let release_activation_id;
         let blocked_until;
-        let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
+        let instance = require_instance_mut(state, workflow_id, run_id)?;
         let effect = instance
             .effects
             .iter_mut()
@@ -1449,16 +1433,16 @@ impl ShardEngineProvider {
                 blocked_until = None;
             }
         }
-        release_tasks_for_activation(&mut state, &release_activation_id, blocked_until);
-        self.save_locked(&state)?;
+        release_tasks_for_activation(state, &release_activation_id, blocked_until);
+        save_engine(state)?;
         Ok(decision)
     }
 
     pub fn commit_checkpoint(
-        &self,
+        &mut self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         let key = instance_key(&input.workflow_id, &input.run_id);
         let current_sequence = {
             let Some(instance) = state.instances.get(&key) else {
@@ -1653,7 +1637,7 @@ impl ShardEngineProvider {
             state.next_child_id += 1;
             let child_key = instance_key(&start.workflow_id, &start.run_id);
             if start.conflict_policy == ConflictPolicy::TerminateExisting {
-                delete_instance_records(&mut state, &start.workflow_id, &start.run_id);
+                delete_instance_records(state, &start.workflow_id, &start.run_id);
             }
             let child_instance = PersistedInstance {
                 workflow_name: start.workflow_name.clone(),
@@ -1679,7 +1663,7 @@ impl ShardEngineProvider {
                 }),
             };
             state.instances.insert(child_key, child_instance.clone());
-            replace_tasks_for_instance(&mut state, &child_instance);
+            replace_tasks_for_instance(state, &child_instance);
             state.children.push(ChildRecord {
                 child_record_id,
                 parent_workflow_id: input.workflow_id.clone(),
@@ -1734,7 +1718,7 @@ impl ShardEngineProvider {
                 }
                 let parent_key = instance_key(&parent.workflow_id, &parent.run_id);
                 if let Some(parent_instance) = state.instances.get(&parent_key).cloned() {
-                    refresh_child_tasks_for_instance(&mut state, &parent_instance);
+                    refresh_child_tasks_for_instance(state, &parent_instance);
                 }
             }
         }
@@ -1744,7 +1728,7 @@ impl ShardEngineProvider {
             PersistedStatus::Canceled | PersistedStatus::Failed
         ) {
             apply_parent_close_policy(
-                &mut state,
+                state,
                 &input.workflow_id,
                 &input.run_id,
                 input.now,
@@ -1752,7 +1736,7 @@ impl ShardEngineProvider {
             );
         }
 
-        replace_tasks_for_instance(&mut state, &updated_instance);
+        replace_tasks_for_instance(state, &updated_instance);
         state
             .completed_activation_claims
             .push(CompletedActivationClaim {
@@ -1765,7 +1749,7 @@ impl ShardEngineProvider {
                 completed_by_sequence: next_sequence,
             });
 
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(CommitCheckpointResult {
             ok: true,
             sequence: next_sequence,
@@ -1776,7 +1760,7 @@ impl ShardEngineProvider {
     }
 
     fn commit_activations(
-        &self,
+        &mut self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
         let mut results = Vec::with_capacity(inputs.len());
@@ -1787,14 +1771,14 @@ impl ShardEngineProvider {
     }
 
     fn record_activation_failures(
-        &self,
+        &mut self,
         inputs: Vec<RecordActivationFailureInput>,
     ) -> Result<(), WorkflowError> {
         if inputs.is_empty() {
             return Ok(());
         }
 
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         for input in inputs {
             let key = instance_key(&input.workflow_id, &input.run_id);
             if !state.instances.contains_key(&key) {
@@ -1840,28 +1824,18 @@ impl ShardEngineProvider {
             }
 
             if input.release_activation {
-                release_tasks_for_activation(&mut state, &input.activation_id, None);
+                release_tasks_for_activation(state, &input.activation_id, None);
             }
         }
 
-        self.save_locked(&state)
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Store>, WorkflowError> {
-        self.state
-            .lock()
-            .map_err(|_| WorkflowError::new("durability provider lock poisoned"))
-    }
-
-    fn save_locked(&self, _state: &Store) -> Result<(), WorkflowError> {
-        Ok(())
+        save_engine(state)
     }
 
     fn claim_shard_sync(
-        &self,
+        &mut self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         if let Some(existing) = state.shard_leases.get(&input.shard_id) {
             if existing.owner_id != input.owner_id && existing.lease_until > input.now {
                 return Ok(None);
@@ -1885,18 +1859,18 @@ impl ShardEngineProvider {
             lease_epoch: epoch,
         };
         state.shard_leases.insert(input.shard_id, lease.clone());
-        self.save_locked(&state)?;
+        save_engine(state)?;
         Ok(Some(lease))
     }
 
     fn heartbeat_shard_sync(
-        &self,
+        &mut self,
         shard_id: u32,
         owner_id: &str,
         now: DateTime<Utc>,
         lease_ms: u64,
     ) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         let lease = state
             .shard_leases
             .get_mut(&shard_id)
@@ -1905,25 +1879,25 @@ impl ShardEngineProvider {
             return Err(WorkflowError::new(format!("lost shard lease: {shard_id}")));
         }
         lease.lease_until = now + chrono::Duration::milliseconds(lease_ms as i64);
-        self.save_locked(&state)
+        save_engine(state)
     }
 
-    fn release_shard_sync(&self, shard_id: u32, owner_id: &str) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
+    fn release_shard_sync(&mut self, shard_id: u32, owner_id: &str) -> Result<(), WorkflowError> {
+        let state = &mut self.state;
         if let Some(lease) = state.shard_leases.get_mut(&shard_id) {
             if lease.owner_id == owner_id {
                 lease.lease_until = DateTime::<Utc>::from(std::time::UNIX_EPOCH);
             }
         }
-        self.save_locked(&state)
+        save_engine(state)
     }
 
     fn release_activation_sync(
-        &self,
+        &mut self,
         activation_id: &str,
         worker_id: &str,
     ) -> Result<(), WorkflowError> {
-        let mut state = self.lock()?;
+        let state = &mut self.state;
         let mut released_sequences = Vec::new();
         for task in state.tasks.values_mut() {
             if task.activation_id == activation_id
@@ -1938,7 +1912,7 @@ impl ShardEngineProvider {
         for sequence in released_sequences {
             state.claimed_sequence_epochs.remove(&sequence);
         }
-        self.save_locked(&state)
+        save_engine(state)
     }
 
     fn assert_activation_claim_sync(
@@ -1948,7 +1922,7 @@ impl ShardEngineProvider {
         lease_epoch: Option<u64>,
         now: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
-        let state = self.lock()?;
+        let state = &self.state;
         let Some(task) = state
             .tasks
             .values()
@@ -1966,17 +1940,1073 @@ impl ShardEngineProvider {
         }
         Ok(())
     }
+
+    fn claim_tasks_for_session(
+        &mut self,
+        session: &OpenShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<ClaimShardTasksResult, WorkflowError> {
+        if input.limit == 0 {
+            return Err(WorkflowError::new("limit must be positive"));
+        }
+        let Some(owner_id) = &session.owner_id else {
+            return Err(WorkflowError::new(format!(
+                "shard {} is not opened with an owner",
+                session.shard_id
+            )));
+        };
+        let state = &mut self.state;
+        let lease = state
+            .shard_leases
+            .get(&session.shard_id)
+            .ok_or_else(|| WorkflowError::new(format!("lost shard lease: {}", session.shard_id)))?;
+        if lease.owner_id != *owner_id || lease.lease_until < input.now {
+            return Err(WorkflowError::new(format!(
+                "lost shard lease: {}",
+                session.shard_id
+            )));
+        }
+        if let Some(epoch) = session.lease_epoch {
+            if epoch != lease.lease_epoch {
+                return Err(WorkflowError::new(format!(
+                    "lost shard lease: {}",
+                    session.shard_id
+                )));
+            }
+        }
+        let lease_epoch = lease.lease_epoch;
+
+        expire_activity_timeouts(
+            state,
+            input.now,
+            None,
+            Some(owner_id),
+            Some(session.shard_id),
+        );
+        refresh_migration_tasks(state, session.shard_id, input.now, &input.workflows);
+
+        let candidates = state
+            .task_order
+            .iter()
+            .filter_map(|(_, task_id)| state.tasks.get(task_id))
+            .filter(|task| task.partition_shard == session.shard_id)
+            .filter(|task| task.ready_at <= input.now)
+            .filter(|task| {
+                task.blocked_until
+                    .map_or(true, |blocked| blocked <= input.now)
+            })
+            .filter(|task| {
+                input
+                    .workflows
+                    .get(&task.workflow_name)
+                    .is_some_and(|version| task.workflow_version <= *version)
+            })
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+
+        let mut claims = Vec::new();
+        let mut claimed_sequences = std::collections::HashSet::new();
+        for candidate_id in candidates {
+            if claims.len() >= input.limit {
+                break;
+            }
+            let Some(candidate) = state.tasks.get(&candidate_id).cloned() else {
+                continue;
+            };
+            let sequence_key = sequence_key_for_task(&candidate);
+            if claimed_sequences.contains(&sequence_key) {
+                continue;
+            }
+            if let Some(existing_epoch) = state.claimed_sequence_epochs.get(&sequence_key).copied()
+            {
+                if existing_epoch == lease_epoch {
+                    continue;
+                }
+                state.claimed_sequence_epochs.remove(&sequence_key);
+            }
+            let has_unexpired_claim = state.tasks.values().any(|task| {
+                task.workflow_id == candidate.workflow_id
+                    && task.run_id == candidate.run_id
+                    && task.sequence == candidate.sequence
+                    && task
+                        .lease_until
+                        .is_some_and(|lease_until| lease_until > input.now)
+                    && task.claim_owner_id.is_some()
+            });
+            if has_unexpired_claim {
+                continue;
+            }
+
+            let Some(instance) = state
+                .instances
+                .get(&instance_key(&candidate.workflow_id, &candidate.run_id))
+                .cloned()
+            else {
+                delete_task(state, &candidate.task_id);
+                continue;
+            };
+            if instance.status != PersistedStatus::Running
+                || instance.sequence != candidate.sequence
+            {
+                delete_task(state, &candidate.task_id);
+                continue;
+            }
+
+            if let Some(task) = state.tasks.get_mut(&candidate.task_id) {
+                task.claim_owner_id = Some(owner_id.clone());
+                task.claim_epoch = Some(lease_epoch);
+                task.lease_until =
+                    Some(input.now + chrono::Duration::milliseconds(input.lease_ms as i64));
+            }
+            state
+                .claimed_sequence_epochs
+                .insert(sequence_key.clone(), lease_epoch);
+            claimed_sequences.insert(sequence_key);
+
+            let lease_until = input.now + chrono::Duration::milliseconds(input.lease_ms as i64);
+            let activation = match candidate.kind {
+                MemoryTaskKind::Migration => ClaimedActivation::Migration {
+                    activation_id: candidate.activation_id.clone(),
+                    workflow_name: candidate.workflow_name.clone(),
+                    workflow_id: candidate.workflow_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    sequence: candidate.sequence,
+                    activation_time: input.now,
+                    lease_until,
+                },
+                MemoryTaskKind::Run => ClaimedActivation::Run {
+                    activation_id: candidate.activation_id.clone(),
+                    workflow_name: candidate.workflow_name.clone(),
+                    workflow_id: candidate.workflow_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    sequence: candidate.sequence,
+                    activation_time: input.now,
+                    lease_until,
+                },
+                MemoryTaskKind::Event => ClaimedActivation::Event {
+                    activation_id: candidate.activation_id.clone(),
+                    workflow_name: candidate.workflow_name.clone(),
+                    workflow_id: candidate.workflow_id.clone(),
+                    run_id: candidate.run_id.clone(),
+                    sequence: candidate.sequence,
+                    activation_time: input.now,
+                    wait_name: candidate.wait_name.clone().unwrap_or_default(),
+                    event: candidate
+                        .event
+                        .clone()
+                        .ok_or_else(|| WorkflowError::new("event task missing event"))?,
+                    lease_until,
+                },
+            };
+            let effects = instance
+                .effects
+                .iter()
+                .filter(|effect| effect.activation_id == candidate.activation_id)
+                .cloned()
+                .collect();
+            claims.push(ClaimedActivationWithInstance {
+                activation,
+                instance,
+                effects,
+                lease: ActivationClaimLease::Shard {
+                    shard_id: session.shard_id,
+                    epoch: lease_epoch,
+                },
+            });
+        }
+
+        let next_wake_at = state
+            .tasks
+            .values()
+            .filter(|task| task.partition_shard == session.shard_id)
+            .filter(|task| {
+                input
+                    .workflows
+                    .get(&task.workflow_name)
+                    .is_some_and(|version| task.workflow_version <= *version)
+            })
+            .filter_map(|task| {
+                if let Some(blocked) = task.blocked_until {
+                    if blocked > input.now {
+                        return Some(blocked);
+                    }
+                }
+                (task.ready_at > input.now).then_some(task.ready_at)
+            })
+            .min();
+
+        save_engine(state)?;
+        Ok(ClaimShardTasksResult {
+            claims,
+            next_wake_at,
+        })
+    }
+
+    fn put_effect_record(
+        &mut self,
+        workflow_id: &str,
+        run_id: &str,
+        effect: EffectRecord,
+    ) -> Result<(), WorkflowError> {
+        let state = &mut self.state;
+        if let Some(number) = effect
+            .effect_id
+            .strip_prefix("effect-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+        {
+            state.next_effect_id = state.next_effect_id.max(number + 1);
+        }
+        let instance = require_instance_mut(state, workflow_id, run_id)?;
+        if let Some(existing) = instance
+            .effects
+            .iter_mut()
+            .find(|existing| existing.effect_id == effect.effect_id)
+        {
+            *existing = effect;
+        } else {
+            instance.effects.push(effect);
+        }
+        save_engine(state)
+    }
+}
+
+fn save_engine(_state: &Store) -> Result<(), WorkflowError> {
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ShardActorHandle {
+    sender: mpsc::Sender<ShardCommand>,
+}
+
+enum ShardCommand {
+    Execute {
+        operation: EngineOperation,
+        response: oneshot::Sender<Result<EngineOutput, WorkflowError>>,
+    },
+    Snapshot {
+        response: oneshot::Sender<Store>,
+    },
+    Shutdown {
+        response: oneshot::Sender<()>,
+    },
+}
+
+enum EngineOperation {
+    ClaimShard(ClaimShardInput),
+    ClaimTasks {
+        session: OpenShardInput,
+        input: ClaimShardTasksInput,
+    },
+    ClaimShardAndTasks {
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    },
+    CreateInstance(CreateInstanceInput),
+    CreateChildInstance(CreateChildInstanceInput),
+    LoadInstance {
+        ref_: InstanceRef,
+        options: LoadInstanceOptions,
+    },
+    AppendSignal(AppendSignalInput),
+    CancelChild(CancelChildInput),
+    ReserveEffect(ReserveEffectInput),
+    HeartbeatEffect(HeartbeatEffectInput),
+    CompleteEffect(CompleteEffectInput),
+    FailEffect(FailEffectInput),
+    CommitCheckpoint {
+        session: Option<OpenShardInput>,
+        input: CommitCheckpointInput,
+    },
+    CommitActivations {
+        session: Option<OpenShardInput>,
+        inputs: Vec<CommitCheckpointInput>,
+    },
+    RecordActivationFailures(Vec<RecordActivationFailureInput>),
+    ReleaseActivation {
+        activation_id: String,
+        worker_id: String,
+    },
+    HeartbeatShard {
+        shard_id: u32,
+        owner_id: String,
+        now: DateTime<Utc>,
+        lease_ms: u64,
+    },
+    ReleaseShard {
+        shard_id: u32,
+        owner_id: String,
+    },
+}
+
+enum EngineOutput {
+    OptionalShardLease(Option<ShardLease>),
+    ClaimTasks(ClaimShardTasksResult),
+    ClaimShardAndTasks(Option<(ShardLease, ClaimShardTasksResult)>),
+    InstanceCreated {
+        ref_: InstanceRef,
+        instance: PersistedInstance,
+    },
+    ChildCreated {
+        handle: ChildHandleValue,
+        instance: PersistedInstance,
+    },
+    OptionalInstance(Option<PersistedInstance>),
+    Signal(SignalRecord),
+    EffectReservation(EffectReservation),
+    FailEffect(FailEffectResult),
+    CommitCheckpoint {
+        result: CommitCheckpointResult,
+        instances: Vec<PersistedInstance>,
+        invalidate_cache: bool,
+    },
+    CommitActivations {
+        result: CommitActivationsResult,
+        instances: Vec<PersistedInstance>,
+        invalidate_cache: bool,
+    },
+    Unit,
+}
+
+impl EngineOperation {
+    fn apply(self, engine: &mut ShardEngine) -> Result<EngineOutput, WorkflowError> {
+        match self {
+            EngineOperation::ClaimShard(input) => engine
+                .claim_shard_sync(input)
+                .map(EngineOutput::OptionalShardLease),
+            EngineOperation::ClaimTasks { session, input } => engine
+                .claim_tasks_for_session(&session, input)
+                .map(EngineOutput::ClaimTasks),
+            EngineOperation::ClaimShardAndTasks { claim, input } => {
+                let Some(lease) = engine.claim_shard_sync(claim)? else {
+                    return Ok(EngineOutput::ClaimShardAndTasks(None));
+                };
+                let tasks = engine.claim_tasks_for_session(
+                    &OpenShardInput {
+                        shard_id: lease.shard_id,
+                        owner_id: Some(lease.owner_id.clone()),
+                        lease_epoch: Some(lease.lease_epoch),
+                    },
+                    input,
+                )?;
+                Ok(EngineOutput::ClaimShardAndTasks(Some((lease, tasks))))
+            }
+            EngineOperation::CreateInstance(input) => {
+                let ref_ = engine.create_instance(input)?;
+                let instance = engine
+                    .load_instance(&ref_)?
+                    .ok_or_else(|| WorkflowError::new("created instance missing from shard"))?;
+                Ok(EngineOutput::InstanceCreated { ref_, instance })
+            }
+            EngineOperation::CreateChildInstance(input) => {
+                let handle = engine.create_child_instance(input)?;
+                let ref_ = InstanceRef::new(handle.workflow_id.clone(), handle.run_id.clone());
+                let instance = engine.load_instance(&ref_)?.ok_or_else(|| {
+                    WorkflowError::new("created child instance missing from shard")
+                })?;
+                Ok(EngineOutput::ChildCreated { handle, instance })
+            }
+            EngineOperation::LoadInstance { ref_, options } => {
+                let mut instance = engine.load_instance(&ref_)?;
+                if !options.include_effects {
+                    if let Some(instance) = &mut instance {
+                        instance.effects.clear();
+                    }
+                }
+                Ok(EngineOutput::OptionalInstance(instance))
+            }
+            EngineOperation::AppendSignal(input) => engine
+                .append_signal(
+                    input.workflow_id,
+                    input.run_id,
+                    input.r#type,
+                    input.payload,
+                    input.received_at,
+                )
+                .map(EngineOutput::Signal),
+            EngineOperation::CancelChild(input) => {
+                engine.cancel_child(input)?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::ReserveEffect(input) => engine
+                .get_or_reserve_effect(
+                    &input.workflow_id,
+                    &input.run_id,
+                    &input.activation_id,
+                    &input.key,
+                    &input.worker_id,
+                    input.now,
+                    input.options,
+                    input.max_attempts,
+                )
+                .map(EngineOutput::EffectReservation),
+            EngineOperation::HeartbeatEffect(input) => {
+                engine.heartbeat_effect(
+                    &input.workflow_id,
+                    &input.run_id,
+                    &input.effect_id,
+                    &input.attempt_id,
+                    &input.worker_id,
+                    input.now,
+                    input.details,
+                )?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::CompleteEffect(input) => {
+                engine.complete_effect(
+                    &input.workflow_id,
+                    &input.run_id,
+                    &input.effect_id,
+                    &input.attempt_id,
+                    &input.worker_id,
+                    input.now,
+                    input.result,
+                )?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::FailEffect(input) => engine
+                .fail_effect(
+                    &input.workflow_id,
+                    &input.run_id,
+                    &input.effect_id,
+                    &input.attempt_id,
+                    &input.worker_id,
+                    input.error,
+                    input.now,
+                    input.retryable,
+                )
+                .map(EngineOutput::FailEffect),
+            EngineOperation::CommitCheckpoint { session, input } => {
+                if let Some(session) = session {
+                    if let Err(error) = engine.assert_activation_claim_sync(
+                        &input.activation_id,
+                        session.owner_id.as_deref(),
+                        session.lease_epoch,
+                        input.now,
+                    ) {
+                        return Ok(EngineOutput::CommitCheckpoint {
+                            result: CommitCheckpointResult {
+                                ok: false,
+                                sequence: input.expected_sequence,
+                                reason: Some("lost_activation_lease".to_string()),
+                                retryable: Some(true),
+                                error: Some(SerializedError {
+                                    name: Some("LostActivationLease".to_string()),
+                                    message: error.message,
+                                }),
+                            },
+                            instances: Vec::new(),
+                            invalidate_cache: false,
+                        });
+                    }
+                }
+                let refs = commit_result_refs(&input);
+                let invalidate_cache = commit_invalidates_cache(&input);
+                let result = engine.commit_checkpoint(input)?;
+                let instances = if result.ok {
+                    load_instances_for_cache(engine, refs)?
+                } else {
+                    Vec::new()
+                };
+                Ok(EngineOutput::CommitCheckpoint {
+                    result,
+                    instances,
+                    invalidate_cache,
+                })
+            }
+            EngineOperation::CommitActivations { session, inputs } => {
+                if let Some(session) = session {
+                    let mut results = Vec::with_capacity(inputs.len());
+                    let mut instances = Vec::new();
+                    let mut invalidate_cache = false;
+                    for input in inputs {
+                        let output = EngineOperation::CommitCheckpoint {
+                            session: Some(session.clone()),
+                            input,
+                        }
+                        .apply(engine)?;
+                        let EngineOutput::CommitCheckpoint {
+                            result,
+                            instances: committed_instances,
+                            invalidate_cache: commit_invalidated_cache,
+                        } = output
+                        else {
+                            unreachable!("commit checkpoint operation returned wrong output");
+                        };
+                        results.push(result);
+                        instances.extend(committed_instances);
+                        invalidate_cache |= commit_invalidated_cache;
+                    }
+                    Ok(EngineOutput::CommitActivations {
+                        result: CommitActivationsResult { results },
+                        instances,
+                        invalidate_cache,
+                    })
+                } else {
+                    let mut results = Vec::with_capacity(inputs.len());
+                    let mut instances = Vec::new();
+                    let mut invalidate_cache = false;
+                    for input in inputs {
+                        let output = EngineOperation::CommitCheckpoint {
+                            session: None,
+                            input,
+                        }
+                        .apply(engine)?;
+                        let EngineOutput::CommitCheckpoint {
+                            result,
+                            instances: committed_instances,
+                            invalidate_cache: commit_invalidated_cache,
+                        } = output
+                        else {
+                            unreachable!("commit checkpoint operation returned wrong output");
+                        };
+                        results.push(result);
+                        instances.extend(committed_instances);
+                        invalidate_cache |= commit_invalidated_cache;
+                    }
+                    Ok(EngineOutput::CommitActivations {
+                        result: CommitActivationsResult { results },
+                        instances,
+                        invalidate_cache,
+                    })
+                }
+            }
+            EngineOperation::RecordActivationFailures(inputs) => {
+                engine.record_activation_failures(inputs)?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::ReleaseActivation {
+                activation_id,
+                worker_id,
+            } => {
+                engine.release_activation_sync(&activation_id, &worker_id)?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::HeartbeatShard {
+                shard_id,
+                owner_id,
+                now,
+                lease_ms,
+            } => {
+                engine.heartbeat_shard_sync(shard_id, &owner_id, now, lease_ms)?;
+                Ok(EngineOutput::Unit)
+            }
+            EngineOperation::ReleaseShard { shard_id, owner_id } => {
+                engine.release_shard_sync(shard_id, &owner_id)?;
+                Ok(EngineOutput::Unit)
+            }
+        }
+    }
+}
+
+fn commit_result_refs(input: &CommitCheckpointInput) -> Vec<InstanceRef> {
+    let mut refs = Vec::with_capacity(input.child_starts.len() + 1);
+    refs.push(InstanceRef::new(
+        input.workflow_id.clone(),
+        input.run_id.clone(),
+    ));
+    refs.extend(
+        input
+            .child_starts
+            .iter()
+            .map(|child| InstanceRef::new(child.workflow_id.clone(), child.run_id.clone())),
+    );
+    refs
+}
+
+fn commit_invalidates_cache(input: &CommitCheckpointInput) -> bool {
+    matches!(
+        &input.next,
+        InstanceStatusValue::Canceled { .. } | InstanceStatusValue::Failed { .. }
+    )
+}
+
+fn load_instances_for_cache(
+    engine: &ShardEngine,
+    refs: Vec<InstanceRef>,
+) -> Result<Vec<PersistedInstance>, WorkflowError> {
+    let mut instances = Vec::with_capacity(refs.len());
+    for ref_ in refs {
+        if let Some(instance) = engine.load_instance(&ref_)? {
+            instances.push(instance);
+        }
+    }
+    Ok(instances)
+}
+
+async fn run_shard_actor(mut engine: ShardEngine, mut receiver: mpsc::Receiver<ShardCommand>) {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            ShardCommand::Execute {
+                operation,
+                response,
+            } => {
+                let _ = response.send(operation.apply(&mut engine));
+            }
+            ShardCommand::Snapshot { response } => {
+                let _ = response.send(engine.snapshot_store());
+            }
+            ShardCommand::Shutdown { response } => {
+                let _ = response.send(());
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShardRouter {
+    inner: Arc<ShardRouterInner>,
+}
+
+struct ShardRouterInner {
+    actors: Mutex<HashMap<u32, ShardActorHandle>>,
+    initial_shards: Mutex<HashMap<u32, Store>>,
+    directory: Mutex<HashMap<String, u32>>,
+    instance_cache: Mutex<HashMap<String, PersistedInstance>>,
+}
+
+impl ShardRouter {
+    fn in_memory() -> Self {
+        Self::from_store(Store::default())
+    }
+
+    fn from_store(store: Store) -> Self {
+        let directory = store
+            .instances
+            .values()
+            .map(|instance| {
+                (
+                    instance_key(&instance.workflow_id, &instance.run_id),
+                    instance.partition_shard,
+                )
+            })
+            .collect();
+        let instance_cache = store.instances.clone();
+        Self {
+            inner: Arc::new(ShardRouterInner {
+                actors: Mutex::new(HashMap::new()),
+                initial_shards: Mutex::new(split_store_by_shard(store)),
+                directory: Mutex::new(directory),
+                instance_cache: Mutex::new(instance_cache),
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        shard_id: u32,
+        operation: EngineOperation,
+    ) -> Result<EngineOutput, WorkflowError> {
+        let handle = self.ensure_actor(shard_id)?;
+        execute_on_actor(shard_id, &handle, operation).await
+    }
+
+    fn ensure_actor(&self, shard_id: u32) -> Result<ShardActorHandle, WorkflowError> {
+        if let Some(handle) = self
+            .inner
+            .actors
+            .lock()
+            .map_err(|_| WorkflowError::new("shard actor registry lock poisoned"))?
+            .get(&shard_id)
+            .cloned()
+        {
+            return Ok(handle);
+        }
+
+        let store = self
+            .inner
+            .initial_shards
+            .lock()
+            .map_err(|_| WorkflowError::new("shard initial state lock poisoned"))?
+            .remove(&shard_id)
+            .unwrap_or_else(Store::default);
+        let (sender, receiver) = mpsc::channel(256);
+        tokio::spawn(run_shard_actor(ShardEngine::from_store(store), receiver));
+        let handle = ShardActorHandle { sender };
+        self.inner
+            .actors
+            .lock()
+            .map_err(|_| WorkflowError::new("shard actor registry lock poisoned"))?
+            .insert(shard_id, handle.clone());
+        Ok(handle)
+    }
+}
+
+async fn execute_on_actor(
+    shard_id: u32,
+    handle: &ShardActorHandle,
+    operation: EngineOperation,
+) -> Result<EngineOutput, WorkflowError> {
+    let (response, receiver) = oneshot::channel();
+    let command = ShardCommand::Execute {
+        operation,
+        response,
+    };
+    match handle.sender.try_send(command) {
+        Ok(()) => {}
+        Err(TrySendError::Full(command)) => handle
+            .sender
+            .send(command)
+            .await
+            .map_err(|_| WorkflowError::new(format!("shard actor {shard_id} is closed")))?,
+        Err(TrySendError::Closed(_)) => {
+            return Err(WorkflowError::new(format!(
+                "shard actor {shard_id} is closed"
+            )));
+        }
+    }
+    receiver
+        .await
+        .map_err(|_| WorkflowError::new(format!("shard actor {shard_id} dropped response")))?
+}
+
+impl ShardRouter {
+    fn directory_get(&self, ref_: &InstanceRef) -> Result<Option<u32>, WorkflowError> {
+        Ok(self
+            .inner
+            .directory
+            .lock()
+            .map_err(|_| WorkflowError::new("instance directory lock poisoned"))?
+            .get(&instance_key_ref(ref_))
+            .copied())
+    }
+
+    fn directory_insert(&self, ref_: &InstanceRef, shard_id: u32) -> Result<(), WorkflowError> {
+        self.inner
+            .directory
+            .lock()
+            .map_err(|_| WorkflowError::new("instance directory lock poisoned"))?
+            .insert(instance_key_ref(ref_), shard_id);
+        Ok(())
+    }
+
+    fn cache_get(
+        &self,
+        ref_: &InstanceRef,
+        options: &LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        let mut instance = self
+            .inner
+            .instance_cache
+            .lock()
+            .map_err(|_| WorkflowError::new("instance cache lock poisoned"))?
+            .get(&instance_key_ref(ref_))
+            .cloned();
+        if !options.include_effects {
+            if let Some(instance) = &mut instance {
+                instance.effects.clear();
+            }
+        }
+        Ok(instance)
+    }
+
+    fn cache_insert(&self, instance: PersistedInstance) -> Result<(), WorkflowError> {
+        self.directory_insert(
+            &InstanceRef::new(instance.workflow_id.clone(), instance.run_id.clone()),
+            instance.partition_shard,
+        )?;
+        self.inner
+            .instance_cache
+            .lock()
+            .map_err(|_| WorkflowError::new("instance cache lock poisoned"))?
+            .insert(
+                instance_key(&instance.workflow_id, &instance.run_id),
+                instance,
+            );
+        Ok(())
+    }
+
+    fn cache_insert_many(&self, instances: Vec<PersistedInstance>) -> Result<(), WorkflowError> {
+        let mut directory = self
+            .inner
+            .directory
+            .lock()
+            .map_err(|_| WorkflowError::new("instance directory lock poisoned"))?;
+        let mut cache = self
+            .inner
+            .instance_cache
+            .lock()
+            .map_err(|_| WorkflowError::new("instance cache lock poisoned"))?;
+        for instance in instances {
+            let key = instance_key(&instance.workflow_id, &instance.run_id);
+            directory.insert(key.clone(), instance.partition_shard);
+            cache.insert(key, instance);
+        }
+        Ok(())
+    }
+
+    fn cache_remove(&self, ref_: &InstanceRef) -> Result<(), WorkflowError> {
+        self.inner
+            .instance_cache
+            .lock()
+            .map_err(|_| WorkflowError::new("instance cache lock poisoned"))?
+            .remove(&instance_key_ref(ref_));
+        Ok(())
+    }
+
+    fn cache_clear(&self) -> Result<(), WorkflowError> {
+        self.inner
+            .instance_cache
+            .lock()
+            .map_err(|_| WorkflowError::new("instance cache lock poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    fn known_shard_ids(&self) -> Result<Vec<u32>, WorkflowError> {
+        let mut ids = self
+            .inner
+            .actors
+            .lock()
+            .map_err(|_| WorkflowError::new("shard actor registry lock poisoned"))?
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        ids.extend(
+            self.inner
+                .initial_shards
+                .lock()
+                .map_err(|_| WorkflowError::new("shard initial state lock poisoned"))?
+                .keys()
+                .copied(),
+        );
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    async fn shard_for_ref(&self, ref_: &InstanceRef) -> Result<u32, WorkflowError> {
+        if let Some(shard_id) = self.directory_get(ref_)? {
+            return Ok(shard_id);
+        }
+        for shard_id in self.known_shard_ids()? {
+            let output = self
+                .execute(
+                    shard_id,
+                    EngineOperation::LoadInstance {
+                        ref_: ref_.clone(),
+                        options: LoadInstanceOptions {
+                            include_effects: true,
+                        },
+                    },
+                )
+                .await?;
+            let EngineOutput::OptionalInstance(instance) = output else {
+                unreachable!("load instance operation returned wrong output");
+            };
+            if let Some(instance) = instance {
+                self.directory_insert(ref_, instance.partition_shard)?;
+                return Ok(instance.partition_shard);
+            }
+        }
+        Err(WorkflowError::new(format!(
+            "unknown workflow instance for shard routing: {}/{}",
+            ref_.workflow_id, ref_.run_id
+        )))
+    }
+
+    async fn load_instance_internal(
+        &self,
+        ref_: &InstanceRef,
+        options: LoadInstanceOptions,
+    ) -> Result<Option<PersistedInstance>, WorkflowError> {
+        let include_effects = options.include_effects;
+        if let Some(instance) = self.cache_get(ref_, &options)? {
+            return Ok(Some(instance));
+        }
+        let shard_id = match self.directory_get(ref_)? {
+            Some(shard_id) => shard_id,
+            None => {
+                for shard_id in self.known_shard_ids()? {
+                    let output = self
+                        .execute(
+                            shard_id,
+                            EngineOperation::LoadInstance {
+                                ref_: ref_.clone(),
+                                options: options.clone(),
+                            },
+                        )
+                        .await?;
+                    let EngineOutput::OptionalInstance(instance) = output else {
+                        unreachable!("load instance operation returned wrong output");
+                    };
+                    if let Some(instance) = instance {
+                        self.directory_insert(ref_, instance.partition_shard)?;
+                        if include_effects {
+                            self.cache_insert(instance.clone())?;
+                        }
+                        let mut instance = instance;
+                        if !include_effects {
+                            instance.effects.clear();
+                        }
+                        return Ok(Some(instance));
+                    }
+                }
+                return Ok(None);
+            }
+        };
+        let output = self
+            .execute(
+                shard_id,
+                EngineOperation::LoadInstance {
+                    ref_: ref_.clone(),
+                    options,
+                },
+            )
+            .await?;
+        let EngineOutput::OptionalInstance(instance) = output else {
+            unreachable!("load instance operation returned wrong output");
+        };
+        if include_effects {
+            if let Some(instance) = &instance {
+                self.cache_insert(instance.clone())?;
+            }
+        }
+        Ok(instance)
+    }
+
+    async fn snapshot_store(&self) -> Result<Store, WorkflowError> {
+        let mut stores = Vec::new();
+        for shard_id in self.known_shard_ids()? {
+            let handle = self.ensure_actor(shard_id)?;
+            let (response, receiver) = oneshot::channel();
+            handle
+                .sender
+                .send(ShardCommand::Snapshot { response })
+                .await
+                .map_err(|_| WorkflowError::new(format!("shard actor {shard_id} is closed")))?;
+            stores.push(
+                receiver
+                    .await
+                    .map_err(|_| WorkflowError::new("shard actor dropped snapshot response"))?,
+            );
+        }
+        Ok(merge_shard_stores(stores))
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        let handles = {
+            let mut actors = self
+                .inner
+                .actors
+                .lock()
+                .map_err(|_| WorkflowError::new("shard actor registry lock poisoned"))?;
+            actors.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let (response, receiver) = oneshot::channel();
+            let _ = handle
+                .sender
+                .send(ShardCommand::Shutdown { response })
+                .await;
+            let _ = receiver.await;
+        }
+        Ok(())
+    }
+}
+
+fn split_store_by_shard(store: Store) -> HashMap<u32, Store> {
+    let mut by_shard: HashMap<u32, Store> = HashMap::new();
+    let mut directory = HashMap::new();
+    for instance in store.instances.values() {
+        directory.insert(
+            instance_key(&instance.workflow_id, &instance.run_id),
+            instance.partition_shard,
+        );
+    }
+    for (key, instance) in store.instances {
+        by_shard
+            .entry(instance.partition_shard)
+            .or_insert_with(Store::default)
+            .instances
+            .insert(key, instance);
+    }
+    for signal in store.signals {
+        if let Some(shard_id) = directory.get(&instance_key(&signal.workflow_id, &signal.run_id)) {
+            by_shard
+                .entry(*shard_id)
+                .or_insert_with(Store::default)
+                .signals
+                .push(signal);
+        }
+    }
+    for child in store.children {
+        if let Some(shard_id) = directory.get(&instance_key(
+            &child.parent_workflow_id,
+            &child.parent_run_id,
+        )) {
+            by_shard
+                .entry(*shard_id)
+                .or_insert_with(Store::default)
+                .children
+                .push(child);
+        }
+    }
+    for (task_id, task) in store.tasks {
+        let shard = by_shard
+            .entry(task.partition_shard)
+            .or_insert_with(Store::default);
+        shard
+            .task_order
+            .insert((task.sort_key.clone(), task_id.clone()));
+        shard.tasks.insert(task_id, task);
+    }
+    for claim in store.completed_activation_claims {
+        if let Some(shard_id) = directory.get(&instance_key(&claim.workflow_id, &claim.run_id)) {
+            by_shard
+                .entry(*shard_id)
+                .or_insert_with(Store::default)
+                .completed_activation_claims
+                .push(claim);
+        }
+    }
+    for (shard_id, lease) in store.shard_leases {
+        by_shard
+            .entry(shard_id)
+            .or_insert_with(Store::default)
+            .shard_leases
+            .insert(shard_id, lease);
+    }
+    for shard in by_shard.values_mut() {
+        shard.next_signal_id = store.next_signal_id;
+        shard.next_effect_id = store.next_effect_id;
+        shard.next_child_id = store.next_child_id;
+    }
+    by_shard
+}
+
+fn merge_shard_stores(stores: Vec<Store>) -> Store {
+    let mut merged = Store::default();
+    for store in stores {
+        merged.instances.extend(store.instances);
+        merged.signals.extend(store.signals);
+        merged.children.extend(store.children);
+        merged.task_order.extend(store.task_order);
+        merged.tasks.extend(store.tasks);
+        merged
+            .claimed_sequence_epochs
+            .extend(store.claimed_sequence_epochs);
+        merged
+            .completed_activation_claims
+            .extend(store.completed_activation_claims);
+        merged.shard_leases.extend(store.shard_leases);
+        merged.next_signal_id = merged.next_signal_id.max(store.next_signal_id);
+        merged.next_effect_id = merged.next_effect_id.max(store.next_effect_id);
+        merged.next_child_id = merged.next_child_id.max(store.next_child_id);
+    }
+    merged
 }
 
 #[derive(Clone)]
 pub struct NullDurabilityProvider {
-    inner: ShardEngineProvider,
+    inner: ShardRouter,
 }
 
 impl NullDurabilityProvider {
     pub fn new() -> Self {
         Self {
-            inner: ShardEngineProvider::in_memory(),
+            inner: ShardRouter::in_memory(),
         }
     }
 }
@@ -2031,7 +3061,7 @@ enum JournalOperation {
 
 #[derive(Clone)]
 pub struct SqliteDurabilityProvider {
-    inner: ShardEngineProvider,
+    inner: ShardRouter,
     writer: SqliteWriter,
     snapshot_interval: u64,
 }
@@ -2284,7 +3314,7 @@ impl SqliteDurabilityProvider {
         let state = load_sqlite_store(&connection)?;
         let writer = SqliteWriter::start(connection)?;
         Ok(Self {
-            inner: ShardEngineProvider::from_store(state),
+            inner: ShardRouter::from_store(state),
             writer,
             snapshot_interval: options.snapshot_interval.max(1),
         })
@@ -2305,7 +3335,7 @@ impl SqliteDurabilityProvider {
         let operation_json = serde_json::to_string(&operation)?;
         let entry_id = self.writer.append_journal(operation_json).await?;
         if entry_id % self.snapshot_interval == 0 {
-            let snapshot = serde_json::to_string(&self.inner.snapshot_store()?)?;
+            let snapshot = serde_json::to_string(&self.inner.snapshot_store().await?)?;
             self.writer.write_snapshot(entry_id, snapshot).await?;
         }
         Ok(())
@@ -2315,15 +3345,22 @@ impl SqliteDurabilityProvider {
         &self,
         ref_: &InstanceRef,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        self.inner.load_instance(ref_)
+        <ShardRouter as DurabilityProvider>::load_instance(
+            &self.inner,
+            ref_,
+            LoadInstanceOptions {
+                include_effects: true,
+            },
+        )
+        .await
     }
 
-    pub fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        self.inner.list_children()
+    pub async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::list_children(&self.inner).await
     }
 
-    pub fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        self.inner.list_signals()
+    pub async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::list_signals(&self.inner).await
     }
 }
 
@@ -2333,7 +3370,8 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        let output = self.inner.claim_shard_sync(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::claim_shard(&self.inner, input.clone()).await?;
         if output.is_some() {
             self.append_journal_operation(JournalOperation::ClaimShard(input))
                 .await?;
@@ -2341,10 +3379,37 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         Ok(output)
     }
 
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        let output = <ShardRouter as DurabilityProvider>::claim_shard_tasks(
+            &self.inner,
+            claim.clone(),
+            input.clone(),
+        )
+        .await?;
+        if let Some((lease, _)) = &output {
+            self.append_journal_operation(JournalOperation::ClaimShard(claim))
+                .await?;
+            self.append_journal_operation(JournalOperation::ClaimShardTasks {
+                session: OpenShardInput {
+                    shard_id: lease.shard_id,
+                    owner_id: Some(lease.owner_id.clone()),
+                    lease_epoch: Some(lease.lease_epoch),
+                },
+                input,
+            })
+            .await?;
+        }
+        Ok(output)
+    }
+
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
         Arc::new(SqliteShardSession {
             provider: self.clone(),
-            inner: <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input),
+            inner: <ShardRouter as DurabilityProvider>::open_shard(&self.inner, input),
         })
     }
 
@@ -2352,7 +3417,9 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        let output = self.inner.create_instance(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input.clone())
+                .await?;
         self.append_journal_operation(JournalOperation::CreateInstance(input))
             .await?;
         Ok(output)
@@ -2362,7 +3429,9 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        let output = self.inner.create_child_instance(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::create_child_instance(&self.inner, input.clone())
+                .await?;
         self.append_journal_operation(JournalOperation::CreateChildInstance(input))
             .await?;
         Ok(output)
@@ -2373,21 +3442,19 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+        <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         let output =
-            <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input.clone())
-                .await?;
+            <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input.clone()).await?;
         self.append_journal_operation(JournalOperation::AppendSignal(input))
             .await?;
         Ok(output)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::cancel_child(&self.inner, input.clone()).await?;
         self.append_journal_operation(JournalOperation::CancelChild(input))
             .await
     }
@@ -2396,18 +3463,17 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        let output = <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::get_or_reserve_effect(&self.inner, input.clone())
+                .await?;
         if let EffectReservation::Reserved { effect_id, .. } = &output {
-            let effect = reserved_effect_record_from_provider(
+            let effect = reserved_effect_record_from_router(
                 &self.inner,
                 &input.workflow_id,
                 &input.run_id,
                 effect_id,
-            )?;
+            )
+            .await?;
             self.append_journal_operation(JournalOperation::PutEffectRecord {
                 workflow_id: input.workflow_id,
                 run_id: input.run_id,
@@ -2419,23 +3485,20 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone()).await?;
         self.append_journal_operation(JournalOperation::HeartbeatEffect(input))
             .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::complete_effect(&self.inner, input.clone()).await?;
         self.append_journal_operation(JournalOperation::CompleteEffect(input))
             .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
         let output =
-            <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input.clone())
-                .await?;
+            <ShardRouter as DurabilityProvider>::fail_effect(&self.inner, input.clone()).await?;
         self.append_journal_operation(JournalOperation::FailEffect(input))
             .await?;
         Ok(output)
@@ -2445,11 +3508,9 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        let output = <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::commit_checkpoint(&self.inner, input.clone())
+                .await?;
         if output.ok {
             self.append_journal_operation(JournalOperation::CommitCheckpoint(input))
                 .await?;
@@ -2461,11 +3522,9 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        let output = <ShardEngineProvider as DurabilityProvider>::commit_activations(
-            &self.inner,
-            inputs.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::commit_activations(&self.inner, inputs.clone())
+                .await?;
         if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
             self.append_journal_operation(JournalOperation::CommitActivations(inputs))
                 .await?;
@@ -2480,7 +3539,7 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         if inputs.is_empty() {
             return Ok(());
         }
-        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
+        <ShardRouter as DurabilityProvider>::record_activation_failures(
             &self.inner,
             inputs.clone(),
         )
@@ -2490,18 +3549,19 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        self.inner.list_instances()
+        <ShardRouter as DurabilityProvider>::list_instances(&self.inner).await
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        self.inner.list_signals()
+        <ShardRouter as DurabilityProvider>::list_signals(&self.inner).await
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        self.inner.list_children()
+        <ShardRouter as DurabilityProvider>::list_children(&self.inner).await
     }
 
     async fn shutdown(&self) -> Result<(), WorkflowError> {
+        self.inner.shutdown().await?;
         self.writer.shutdown().await
     }
 }
@@ -2760,16 +3820,16 @@ fn load_sqlite_store(connection: &rusqlite::Connection) -> Result<Store, Workflo
         Err(rusqlite::Error::QueryReturnedNoRows) => (0, Store::default()),
         Err(error) => return Err(error.into()),
     };
-    let provider = ShardEngineProvider::from_store(store);
+    let mut provider = ShardEngine::from_store(store);
     let mut statement = connection.prepare(
         "SELECT operation_json FROM shard_journal WHERE entry_id > ?1 ORDER BY entry_id ASC",
     )?;
     let rows = statement.query_map([last_entry_id], |row| row.get::<_, String>(0))?;
     for row in rows {
         let operation = serde_json::from_str::<JournalOperation>(&row?)?;
-        apply_journal_operation(&provider, operation)?;
+        apply_journal_operation(&mut provider, operation)?;
     }
-    provider.snapshot_store()
+    Ok(provider.snapshot_store())
 }
 
 fn sqlite_table_columns(
@@ -2786,7 +3846,7 @@ fn sqlite_table_columns(
 }
 
 fn apply_journal_operation(
-    provider: &ShardEngineProvider,
+    provider: &mut ShardEngine,
     operation: JournalOperation,
 ) -> Result<(), WorkflowError> {
     match operation {
@@ -2809,13 +3869,7 @@ fn apply_journal_operation(
             provider.release_activation_sync(&activation_id, &worker_id)?;
         }
         JournalOperation::ClaimShardTasks { session, input } => {
-            let session = ShardEngineSession {
-                provider: provider.clone(),
-                shard_id: session.shard_id,
-                owner_id: session.owner_id,
-                lease_epoch: session.lease_epoch,
-            };
-            claim_tasks_for_provider(provider, &session, input)?;
+            provider.claim_tasks_for_session(&session, input)?;
         }
         JournalOperation::CreateInstance(input) => {
             provider.create_instance(input)?;
@@ -2852,7 +3906,7 @@ fn apply_journal_operation(
             run_id,
             effect,
         } => {
-            put_effect_record(provider, &workflow_id, &run_id, effect)?;
+            provider.put_effect_record(&workflow_id, &run_id, effect)?;
         }
         JournalOperation::HeartbeatEffect(input) => {
             provider.heartbeat_effect(
@@ -2913,44 +3967,20 @@ fn apply_journal_operation(
     Ok(())
 }
 
-fn put_effect_record(
-    provider: &ShardEngineProvider,
-    workflow_id: &str,
-    run_id: &str,
-    effect: EffectRecord,
-) -> Result<(), WorkflowError> {
-    let mut state = provider.lock()?;
-    if let Some(number) = effect
-        .effect_id
-        .strip_prefix("effect-")
-        .and_then(|suffix| suffix.parse::<u64>().ok())
-    {
-        state.next_effect_id = state.next_effect_id.max(number + 1);
-    }
-    let instance = require_instance_mut(&mut state, workflow_id, run_id)?;
-    if let Some(existing) = instance
-        .effects
-        .iter_mut()
-        .find(|existing| existing.effect_id == effect.effect_id)
-    {
-        *existing = effect;
-    } else {
-        instance.effects.push(effect);
-    }
-    provider.save_locked(&state)
-}
-
-fn reserved_effect_record_from_provider(
-    provider: &ShardEngineProvider,
+async fn reserved_effect_record_from_router(
+    provider: &ShardRouter,
     workflow_id: &str,
     run_id: &str,
     effect_id: &str,
 ) -> Result<EffectRecord, WorkflowError> {
     provider
-        .load_instance(&InstanceRef::new(
-            workflow_id.to_string(),
-            run_id.to_string(),
-        ))?
+        .load_instance(
+            &InstanceRef::new(workflow_id.to_string(), run_id.to_string()),
+            LoadInstanceOptions {
+                include_effects: true,
+            },
+        )
+        .await?
         .and_then(|instance| {
             instance
                 .effects
@@ -3016,6 +4046,16 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
     ) -> Result<Option<ShardLease>, WorkflowError> {
         self.provider_for_shard(input.shard_id)?
             .claim_shard(input)
+            .await
+    }
+
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        self.provider_for_shard(claim.shard_id)?
+            .claim_shard_tasks(claim, input)
             .await
     }
 
@@ -3184,6 +4224,13 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
         output.sort_by(|left, right| left.child_record_id.cmp(&right.child_record_id));
         Ok(output)
     }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        for shard_id in 0..self.shard_count {
+            self.provider_for_shard(shard_id)?.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 struct FailedShardSession {
@@ -3286,7 +4333,7 @@ pub struct PostgresDurabilityProviderOptions {
 
 #[derive(Clone)]
 pub struct PostgresDurabilityProvider {
-    inner: ShardEngineProvider,
+    inner: ShardRouter,
     pool: Arc<PostgresClientPool>,
     schema: String,
     physical_partitions: u32,
@@ -3341,7 +4388,7 @@ impl PostgresDurabilityProvider {
         let pool =
             Arc::new(PostgresClientPool::create(&options.connection_string, pool_size).await?);
         let provider = Self {
-            inner: ShardEngineProvider::in_memory(),
+            inner: ShardRouter::in_memory(),
             pool,
             schema,
             physical_partitions: options.physical_partitions,
@@ -3352,7 +4399,7 @@ impl PostgresDurabilityProvider {
         provider.initialize_postgres_schema().await?;
         let state = provider.load_postgres_store().await?;
         Ok(Self {
-            inner: ShardEngineProvider::from_store(state),
+            inner: ShardRouter::from_store(state),
             ..provider
         })
     }
@@ -3468,7 +4515,7 @@ impl PostgresDurabilityProvider {
         operation: JournalOperation,
     ) -> Result<(), WorkflowError> {
         let operation_json = serde_json::to_string(&operation)?;
-        let shard_id = self.postgres_shard_for_operation(&operation)?;
+        let shard_id = self.postgres_shard_for_operation(&operation).await?;
         let shard_id_i32 = shard_id as i32;
         let client_handle = self.pool.next();
         let client = client_handle.lock().await;
@@ -3497,7 +4544,7 @@ impl PostgresDurabilityProvider {
             .await?;
         let next_entry_id: i64 = row.get(0);
         if self.snapshot_interval > 0 && next_entry_id as u64 % self.snapshot_interval == 0 {
-            let snapshot = serde_json::to_string(&self.inner.snapshot_store()?)?;
+            let snapshot = serde_json::to_string(&self.inner.snapshot_store().await?)?;
             client
                 .execute(
                     &format!(
@@ -3546,7 +4593,7 @@ impl PostgresDurabilityProvider {
         } else {
             (None, Store::default())
         };
-        let provider = ShardEngineProvider::from_store(store);
+        let mut provider = ShardEngine::from_store(store);
         let mut rows = Vec::new();
         for partition in 0..self.physical_partitions {
             let table = self.postgres_table("shard_journal", partition);
@@ -3581,12 +4628,12 @@ impl PostgresDurabilityProvider {
         rows.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
         for row in rows {
             let operation = serde_json::from_str::<JournalOperation>(&row.3)?;
-            apply_journal_operation(&provider, operation)?;
+            apply_journal_operation(&mut provider, operation)?;
         }
-        provider.snapshot_store()
+        Ok(provider.snapshot_store())
     }
 
-    fn postgres_shard_for_operation(
+    async fn postgres_shard_for_operation(
         &self,
         operation: &JournalOperation,
     ) -> Result<u32, WorkflowError> {
@@ -3596,55 +4643,64 @@ impl PostgresDurabilityProvider {
             | JournalOperation::ReleaseShard { shard_id, .. } => Ok(*shard_id),
             JournalOperation::ReleaseActivation { activation_id, .. } => self
                 .shard_for_activation(activation_id)
+                .await
                 .ok_or_else(|| WorkflowError::new("unknown activation shard for release")),
             JournalOperation::ClaimShardTasks { session, .. } => Ok(session.shard_id),
             JournalOperation::CreateInstance(input) => Ok(input.partition_shard),
             JournalOperation::CreateChildInstance(input) => Ok(input.partition_shard),
             JournalOperation::AppendSignal(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
             JournalOperation::CancelChild(input) => {
                 self.shard_for_ref(&input.parent_workflow_id, &input.parent_run_id)
+                    .await
             }
             JournalOperation::ReserveEffect(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
             JournalOperation::PutEffectRecord {
                 workflow_id,
                 run_id,
                 ..
-            } => self.shard_for_ref(workflow_id, run_id),
+            } => self.shard_for_ref(workflow_id, run_id).await,
             JournalOperation::HeartbeatEffect(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
             JournalOperation::CompleteEffect(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
             JournalOperation::FailEffect(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
             JournalOperation::CommitCheckpoint(input) => {
-                self.shard_for_ref(&input.workflow_id, &input.run_id)
+                self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
-            JournalOperation::CommitActivations(inputs) => inputs
-                .first()
-                .map(|input| self.shard_for_ref(&input.workflow_id, &input.run_id))
-                .transpose()?
-                .ok_or_else(|| WorkflowError::new("empty activation commit batch")),
-            JournalOperation::RecordActivationFailures(inputs) => inputs
-                .first()
-                .map(|input| self.shard_for_ref(&input.workflow_id, &input.run_id))
-                .transpose()?
-                .ok_or_else(|| WorkflowError::new("empty activation failure batch")),
+            JournalOperation::CommitActivations(inputs) => {
+                if let Some(input) = inputs.first() {
+                    self.shard_for_ref(&input.workflow_id, &input.run_id).await
+                } else {
+                    Err(WorkflowError::new("empty activation commit batch"))
+                }
+            }
+            JournalOperation::RecordActivationFailures(inputs) => {
+                if let Some(input) = inputs.first() {
+                    self.shard_for_ref(&input.workflow_id, &input.run_id).await
+                } else {
+                    Err(WorkflowError::new("empty activation failure batch"))
+                }
+            }
         }
     }
 
-    fn shard_for_ref(&self, workflow_id: &str, run_id: &str) -> Result<u32, WorkflowError> {
+    async fn shard_for_ref(&self, workflow_id: &str, run_id: &str) -> Result<u32, WorkflowError> {
         self.inner
-            .load_instance(&InstanceRef::new(
-                workflow_id.to_string(),
-                run_id.to_string(),
-            ))?
+            .load_instance(
+                &InstanceRef::new(workflow_id.to_string(), run_id.to_string()),
+                LoadInstanceOptions {
+                    include_effects: false,
+                },
+            )
+            .await?
             .map(|instance| instance.partition_shard)
             .ok_or_else(|| {
                 WorkflowError::new(format!(
@@ -3653,8 +4709,8 @@ impl PostgresDurabilityProvider {
             })
     }
 
-    fn shard_for_activation(&self, activation_id: &str) -> Option<u32> {
-        self.inner.snapshot_store().ok().and_then(|store| {
+    async fn shard_for_activation(&self, activation_id: &str) -> Option<u32> {
+        self.inner.snapshot_store().await.ok().and_then(|store| {
             store
                 .tasks
                 .values()
@@ -3707,7 +4763,8 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        let output = self.inner.claim_shard_sync(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::claim_shard(&self.inner, input.clone()).await?;
         if output.is_some() {
             self.append_postgres_operation(JournalOperation::ClaimShard(input))
                 .await?;
@@ -3715,10 +4772,37 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         Ok(output)
     }
 
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        let output = <ShardRouter as DurabilityProvider>::claim_shard_tasks(
+            &self.inner,
+            claim.clone(),
+            input.clone(),
+        )
+        .await?;
+        if let Some((lease, _)) = &output {
+            self.append_postgres_operation(JournalOperation::ClaimShard(claim))
+                .await?;
+            self.append_postgres_operation(JournalOperation::ClaimShardTasks {
+                session: OpenShardInput {
+                    shard_id: lease.shard_id,
+                    owner_id: Some(lease.owner_id.clone()),
+                    lease_epoch: Some(lease.lease_epoch),
+                },
+                input,
+            })
+            .await?;
+        }
+        Ok(output)
+    }
+
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
         Arc::new(PostgresShardSession {
             provider: self.clone(),
-            inner: <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input),
+            inner: <ShardRouter as DurabilityProvider>::open_shard(&self.inner, input),
         })
     }
 
@@ -3726,7 +4810,9 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        let output = self.inner.create_instance(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input.clone())
+                .await?;
         self.append_postgres_operation(JournalOperation::CreateInstance(input))
             .await?;
         Ok(output)
@@ -3736,17 +4822,27 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        if let Some(parent) = self.inner.load_instance(&InstanceRef::new(
-            input.parent_workflow_id.clone(),
-            input.parent_run_id.clone(),
-        ))? {
+        if let Some(parent) = <ShardRouter as DurabilityProvider>::load_instance(
+            &self.inner,
+            &InstanceRef::new(
+                input.parent_workflow_id.clone(),
+                input.parent_run_id.clone(),
+            ),
+            LoadInstanceOptions {
+                include_effects: false,
+            },
+        )
+        .await?
+        {
             if input.partition_shard != parent.partition_shard {
                 return Err(WorkflowError::new(
                     "Postgres provider requires local child workflow starts to be shard-affine",
                 ));
             }
         }
-        let output = self.inner.create_child_instance(input.clone())?;
+        let output =
+            <ShardRouter as DurabilityProvider>::create_child_instance(&self.inner, input.clone())
+                .await?;
         self.append_postgres_operation(JournalOperation::CreateChildInstance(input))
             .await?;
         Ok(output)
@@ -3757,21 +4853,19 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+        <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         let output =
-            <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input.clone())
-                .await?;
+            <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input.clone()).await?;
         self.append_postgres_operation(JournalOperation::AppendSignal(input))
             .await?;
         Ok(output)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::cancel_child(&self.inner, input.clone()).await?;
         self.append_postgres_operation(JournalOperation::CancelChild(input))
             .await
     }
@@ -3780,18 +4874,17 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        let output = <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::get_or_reserve_effect(&self.inner, input.clone())
+                .await?;
         if let EffectReservation::Reserved { effect_id, .. } = &output {
-            let effect = reserved_effect_record_from_provider(
+            let effect = reserved_effect_record_from_router(
                 &self.inner,
                 &input.workflow_id,
                 &input.run_id,
                 effect_id,
-            )?;
+            )
+            .await?;
             self.append_postgres_operation(JournalOperation::PutEffectRecord {
                 workflow_id: input.workflow_id,
                 run_id: input.run_id,
@@ -3803,23 +4896,20 @@ impl DurabilityProvider for PostgresDurabilityProvider {
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::heartbeat_effect(&self.inner, input.clone()).await?;
         self.append_postgres_operation(JournalOperation::HeartbeatEffect(input))
             .await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input.clone())
-            .await?;
+        <ShardRouter as DurabilityProvider>::complete_effect(&self.inner, input.clone()).await?;
         self.append_postgres_operation(JournalOperation::CompleteEffect(input))
             .await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
         let output =
-            <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input.clone())
-                .await?;
+            <ShardRouter as DurabilityProvider>::fail_effect(&self.inner, input.clone()).await?;
         self.append_postgres_operation(JournalOperation::FailEffect(input))
             .await?;
         Ok(output)
@@ -3829,10 +4919,14 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        let parent = self.inner.load_instance(&InstanceRef::new(
-            input.workflow_id.clone(),
-            input.run_id.clone(),
-        ))?;
+        let parent = <ShardRouter as DurabilityProvider>::load_instance(
+            &self.inner,
+            &InstanceRef::new(input.workflow_id.clone(), input.run_id.clone()),
+            LoadInstanceOptions {
+                include_effects: false,
+            },
+        )
+        .await?;
         if let Some(parent) = parent {
             if input
                 .child_starts
@@ -3851,11 +4945,9 @@ impl DurabilityProvider for PostgresDurabilityProvider {
                 });
             }
         }
-        let output = <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(
-            &self.inner,
-            input.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::commit_checkpoint(&self.inner, input.clone())
+                .await?;
         if output.ok {
             self.append_postgres_operation(JournalOperation::CommitCheckpoint(input))
                 .await?;
@@ -3867,11 +4959,9 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        let output = <ShardEngineProvider as DurabilityProvider>::commit_activations(
-            &self.inner,
-            inputs.clone(),
-        )
-        .await?;
+        let output =
+            <ShardRouter as DurabilityProvider>::commit_activations(&self.inner, inputs.clone())
+                .await?;
         if output.results.iter().all(|result| result.ok) && !inputs.is_empty() {
             self.append_postgres_operation(JournalOperation::CommitActivations(inputs))
                 .await?;
@@ -3886,7 +4976,7 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         if inputs.is_empty() {
             return Ok(());
         }
-        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
+        <ShardRouter as DurabilityProvider>::record_activation_failures(
             &self.inner,
             inputs.clone(),
         )
@@ -3896,15 +4986,19 @@ impl DurabilityProvider for PostgresDurabilityProvider {
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_instances(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_instances(&self.inner).await
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_signals(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_signals(&self.inner).await
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_children(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_children(&self.inner).await
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        self.inner.shutdown().await
     }
 }
 
@@ -4137,15 +5231,22 @@ fn postgres_partition_suffix(partition: u32) -> String {
 }
 
 #[derive(Clone)]
-struct ShardEngineSession {
-    provider: ShardEngineProvider,
+struct ShardRouterSession {
+    router: ShardRouter,
+    handle: ShardActorHandle,
     shard_id: u32,
     owner_id: Option<String>,
     lease_epoch: Option<u64>,
 }
 
+impl ShardRouterSession {
+    async fn execute(&self, operation: EngineOperation) -> Result<EngineOutput, WorkflowError> {
+        execute_on_actor(self.shard_id, &self.handle, operation).await
+    }
+}
+
 #[async_trait]
-impl ShardDurabilitySession for ShardEngineSession {
+impl ShardDurabilitySession for ShardRouterSession {
     fn shard_id(&self) -> u32 {
         self.shard_id
     }
@@ -4162,7 +5263,20 @@ impl ShardDurabilitySession for ShardEngineSession {
         &self,
         input: ClaimShardTasksInput,
     ) -> Result<ClaimShardTasksResult, WorkflowError> {
-        claim_tasks_for_provider(&self.provider, self, input)
+        let output = self
+            .execute(EngineOperation::ClaimTasks {
+                session: OpenShardInput {
+                    shard_id: self.shard_id,
+                    owner_id: self.owner_id.clone(),
+                    lease_epoch: self.lease_epoch,
+                },
+                input,
+            })
+            .await?;
+        let EngineOutput::ClaimTasks(output) = output else {
+            unreachable!("claim tasks operation returned wrong output");
+        };
+        Ok(output)
     }
 
     async fn read_instance(
@@ -4170,79 +5284,99 @@ impl ShardDurabilitySession for ShardEngineSession {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.provider, ref_, options)
-            .await
+        self.router.load_instance_internal(ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::append_signal(&self.provider, input).await
+        <ShardRouter as DurabilityProvider>::append_signal(&self.router, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.provider, input).await
+        <ShardRouter as DurabilityProvider>::cancel_child(&self.router, input).await
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(&self.provider, input)
-            .await
+        <ShardRouter as DurabilityProvider>::get_or_reserve_effect(&self.router, input).await
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.provider, input).await
+        <ShardRouter as DurabilityProvider>::heartbeat_effect(&self.router, input).await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.provider, input).await
+        <ShardRouter as DurabilityProvider>::complete_effect(&self.router, input).await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.provider, input).await
+        <ShardRouter as DurabilityProvider>::fail_effect(&self.router, input).await
     }
 
     async fn commit_checkpoint(
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        if let Err(error) = self.provider.assert_activation_claim_sync(
-            &input.activation_id,
-            self.owner_id(),
-            self.lease_epoch(),
-            input.now,
-        ) {
-            return Ok(CommitCheckpointResult {
-                ok: false,
-                sequence: input.expected_sequence,
-                reason: Some("lost_activation_lease".to_string()),
-                retryable: Some(true),
-                error: Some(SerializedError {
-                    name: Some("LostActivationLease".to_string()),
-                    message: error.message,
+        let output = self
+            .execute(EngineOperation::CommitCheckpoint {
+                session: Some(OpenShardInput {
+                    shard_id: self.shard_id,
+                    owner_id: self.owner_id.clone(),
+                    lease_epoch: self.lease_epoch,
                 }),
-            });
+                input,
+            })
+            .await?;
+        let EngineOutput::CommitCheckpoint {
+            result,
+            instances,
+            invalidate_cache,
+        } = output
+        else {
+            unreachable!("commit checkpoint operation returned wrong output");
+        };
+        if invalidate_cache {
+            self.router.cache_clear()?;
         }
-        <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(&self.provider, input).await
+        self.router.cache_insert_many(instances)?;
+        Ok(result)
     }
 
     async fn commit_activations(
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::commit_activations(&self.provider, inputs)
-            .await
+        let output = self
+            .execute(EngineOperation::CommitActivations {
+                session: Some(OpenShardInput {
+                    shard_id: self.shard_id,
+                    owner_id: self.owner_id.clone(),
+                    lease_epoch: self.lease_epoch,
+                }),
+                inputs,
+            })
+            .await?;
+        let EngineOutput::CommitActivations {
+            result,
+            instances,
+            invalidate_cache,
+        } = output
+        else {
+            unreachable!("commit activations operation returned wrong output");
+        };
+        if invalidate_cache {
+            self.router.cache_clear()?;
+        }
+        self.router.cache_insert_many(instances)?;
+        Ok(result)
     }
 
     async fn record_activation_failures(
         &self,
         inputs: Vec<RecordActivationFailureInput>,
     ) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(
-            &self.provider,
-            inputs,
-        )
-        .await
+        <ShardRouter as DurabilityProvider>::record_activation_failures(&self.router, inputs).await
     }
 
     async fn release_activation(
@@ -4250,39 +5384,80 @@ impl ShardDurabilitySession for ShardEngineSession {
         activation_id: &str,
         worker_id: &str,
     ) -> Result<(), WorkflowError> {
-        self.provider
-            .release_activation_sync(activation_id, worker_id)?;
+        self.execute(EngineOperation::ReleaseActivation {
+            activation_id: activation_id.to_string(),
+            worker_id: worker_id.to_string(),
+        })
+        .await?;
         Ok(())
     }
 
     async fn heartbeat(&self, now: DateTime<Utc>, lease_ms: u64) -> Result<(), WorkflowError> {
         if let Some(owner_id) = &self.owner_id {
-            self.provider
-                .heartbeat_shard_sync(self.shard_id, owner_id, now, lease_ms)?;
+            self.execute(EngineOperation::HeartbeatShard {
+                shard_id: self.shard_id,
+                owner_id: owner_id.clone(),
+                now,
+                lease_ms,
+            })
+            .await?;
         }
         Ok(())
     }
 
     async fn release(&self) -> Result<(), WorkflowError> {
         if let Some(owner_id) = &self.owner_id {
-            self.provider.release_shard_sync(self.shard_id, owner_id)?;
+            self.execute(EngineOperation::ReleaseShard {
+                shard_id: self.shard_id,
+                owner_id: owner_id.clone(),
+            })
+            .await?;
         }
         Ok(())
     }
 }
 
 #[async_trait]
-impl DurabilityProvider for ShardEngineProvider {
+impl DurabilityProvider for ShardRouter {
     async fn claim_shard(
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        self.claim_shard_sync(input)
+        let shard_id = input.shard_id;
+        let output = self
+            .execute(shard_id, EngineOperation::ClaimShard(input))
+            .await?;
+        let EngineOutput::OptionalShardLease(output) = output else {
+            unreachable!("claim shard operation returned wrong output");
+        };
+        Ok(output)
+    }
+
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        let shard_id = claim.shard_id;
+        let output = self
+            .execute(
+                shard_id,
+                EngineOperation::ClaimShardAndTasks { claim, input },
+            )
+            .await?;
+        let EngineOutput::ClaimShardAndTasks(output) = output else {
+            unreachable!("claim shard and tasks operation returned wrong output");
+        };
+        Ok(output)
     }
 
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
-        Arc::new(ShardEngineSession {
-            provider: self.clone(),
+        let handle = self
+            .ensure_actor(input.shard_id)
+            .expect("failed to open shard actor");
+        Arc::new(ShardRouterSession {
+            router: self.clone(),
+            handle,
             shard_id: input.shard_id,
             owner_id: input.owner_id,
             lease_epoch: input.lease_epoch,
@@ -4293,14 +5468,50 @@ impl DurabilityProvider for ShardEngineProvider {
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        ShardEngineProvider::create_instance(self, input)
+        let shard_id = input.partition_shard;
+        let output = self
+            .execute(shard_id, EngineOperation::CreateInstance(input))
+            .await?;
+        let EngineOutput::InstanceCreated {
+            ref_: output,
+            instance,
+        } = output
+        else {
+            unreachable!("create instance operation returned wrong output");
+        };
+        self.directory_insert(&output, shard_id)?;
+        self.cache_insert(instance)?;
+        Ok(output)
     }
 
     async fn create_child_instance(
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        ShardEngineProvider::create_child_instance(self, input)
+        let parent = InstanceRef::new(
+            input.parent_workflow_id.clone(),
+            input.parent_run_id.clone(),
+        );
+        let parent_shard = self.shard_for_ref(&parent).await?;
+        if input.partition_shard != parent_shard {
+            return Err(WorkflowError::new(
+                "local child workflow starts must be shard-affine",
+            ));
+        }
+        let child_ref = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let output = self
+            .execute(parent_shard, EngineOperation::CreateChildInstance(input))
+            .await?;
+        let EngineOutput::ChildCreated {
+            handle: output,
+            instance,
+        } = output
+        else {
+            unreachable!("create child operation returned wrong output");
+        };
+        self.directory_insert(&child_ref, parent_shard)?;
+        self.cache_insert(instance)?;
+        Ok(output)
     }
 
     async fn load_instance(
@@ -4308,118 +5519,230 @@ impl DurabilityProvider for ShardEngineProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        let mut instance = ShardEngineProvider::load_instance(self, ref_)?;
-        if !options.include_effects {
-            if let Some(instance) = &mut instance {
-                instance.effects.clear();
-            }
-        }
-        Ok(instance)
+        self.load_instance_internal(ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        ShardEngineProvider::append_signal(
-            self,
-            input.workflow_id,
-            input.run_id,
-            input.r#type,
-            input.payload,
-            input.received_at,
-        )
+        let shard_id = self
+            .shard_for_ref(&InstanceRef::new(
+                input.workflow_id.clone(),
+                input.run_id.clone(),
+            ))
+            .await?;
+        let output = self
+            .execute(shard_id, EngineOperation::AppendSignal(input))
+            .await?;
+        let EngineOutput::Signal(output) = output else {
+            unreachable!("append signal operation returned wrong output");
+        };
+        Ok(output)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        ShardEngineProvider::cancel_child(self, input)
+        let parent_ref = InstanceRef::new(
+            input.parent_workflow_id.clone(),
+            input.parent_run_id.clone(),
+        );
+        let child_ref = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let shard_id = self.shard_for_ref(&parent_ref).await?;
+        self.execute(shard_id, EngineOperation::CancelChild(input))
+            .await?;
+        self.cache_remove(&parent_ref)?;
+        self.cache_remove(&child_ref)?;
+        Ok(())
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        ShardEngineProvider::get_or_reserve_effect(
-            self,
-            &input.workflow_id,
-            &input.run_id,
-            &input.activation_id,
-            &input.key,
-            &input.worker_id,
-            input.now,
-            input.options,
-            input.max_attempts,
-        )
+        let ref_ = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let shard_id = self.shard_for_ref(&ref_).await?;
+        let output = self
+            .execute(shard_id, EngineOperation::ReserveEffect(input))
+            .await?;
+        let EngineOutput::EffectReservation(output) = output else {
+            unreachable!("reserve effect operation returned wrong output");
+        };
+        self.cache_remove(&ref_)?;
+        Ok(output)
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        ShardEngineProvider::heartbeat_effect(
-            self,
-            &input.workflow_id,
-            &input.run_id,
-            &input.effect_id,
-            &input.attempt_id,
-            &input.worker_id,
-            input.now,
-            input.details,
-        )
+        let ref_ = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let shard_id = self.shard_for_ref(&ref_).await?;
+        self.execute(shard_id, EngineOperation::HeartbeatEffect(input))
+            .await?;
+        self.cache_remove(&ref_)?;
+        Ok(())
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        ShardEngineProvider::complete_effect(
-            self,
-            &input.workflow_id,
-            &input.run_id,
-            &input.effect_id,
-            &input.attempt_id,
-            &input.worker_id,
-            input.now,
-            input.result,
-        )
+        let ref_ = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let shard_id = self.shard_for_ref(&ref_).await?;
+        self.execute(shard_id, EngineOperation::CompleteEffect(input))
+            .await?;
+        self.cache_remove(&ref_)?;
+        Ok(())
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        ShardEngineProvider::fail_effect(
-            self,
-            &input.workflow_id,
-            &input.run_id,
-            &input.effect_id,
-            &input.attempt_id,
-            &input.worker_id,
-            input.error,
-            input.now,
-            input.retryable,
-        )
+        let ref_ = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
+        let shard_id = self.shard_for_ref(&ref_).await?;
+        let output = self
+            .execute(shard_id, EngineOperation::FailEffect(input))
+            .await?;
+        let EngineOutput::FailEffect(output) = output else {
+            unreachable!("fail effect operation returned wrong output");
+        };
+        self.cache_remove(&ref_)?;
+        Ok(output)
     }
 
     async fn commit_checkpoint(
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        ShardEngineProvider::commit_checkpoint(self, input)
+        let shard_id = self
+            .shard_for_ref(&InstanceRef::new(
+                input.workflow_id.clone(),
+                input.run_id.clone(),
+            ))
+            .await?;
+        if input
+            .child_starts
+            .iter()
+            .any(|start| start.partition_shard != shard_id)
+        {
+            return Ok(CommitCheckpointResult {
+                ok: false,
+                sequence: input.expected_sequence,
+                reason: Some("cross_shard_child_start".to_string()),
+                retryable: Some(false),
+                error: Some(SerializedError {
+                    name: None,
+                    message: "local child workflow starts must stay on the parent shard"
+                        .to_string(),
+                }),
+            });
+        }
+        let child_refs = input
+            .child_starts
+            .iter()
+            .map(|start| InstanceRef::new(start.workflow_id.clone(), start.run_id.clone()))
+            .collect::<Vec<_>>();
+        let output = self
+            .execute(
+                shard_id,
+                EngineOperation::CommitCheckpoint {
+                    session: None,
+                    input,
+                },
+            )
+            .await?;
+        let EngineOutput::CommitCheckpoint {
+            result: output,
+            instances,
+            invalidate_cache,
+        } = output
+        else {
+            unreachable!("commit checkpoint operation returned wrong output");
+        };
+        if invalidate_cache {
+            self.cache_clear()?;
+        }
+        self.cache_insert_many(instances)?;
+        if output.ok {
+            for ref_ in child_refs {
+                self.directory_insert(&ref_, shard_id)?;
+            }
+        }
+        Ok(output)
     }
 
     async fn commit_activations(
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        ShardEngineProvider::commit_activations(self, inputs)
+        if inputs.is_empty() {
+            return Ok(CommitActivationsResult {
+                results: Vec::new(),
+            });
+        }
+        let shard_id = self
+            .shard_for_ref(&InstanceRef::new(
+                inputs[0].workflow_id.clone(),
+                inputs[0].run_id.clone(),
+            ))
+            .await?;
+        let output = self
+            .execute(
+                shard_id,
+                EngineOperation::CommitActivations {
+                    session: None,
+                    inputs,
+                },
+            )
+            .await?;
+        let EngineOutput::CommitActivations {
+            result: output,
+            instances,
+            invalidate_cache,
+        } = output
+        else {
+            unreachable!("commit activations operation returned wrong output");
+        };
+        if invalidate_cache {
+            self.cache_clear()?;
+        }
+        self.cache_insert_many(instances)?;
+        Ok(output)
     }
 
     async fn record_activation_failures(
         &self,
         inputs: Vec<RecordActivationFailureInput>,
     ) -> Result<(), WorkflowError> {
-        ShardEngineProvider::record_activation_failures(self, inputs)
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let refs = inputs
+            .iter()
+            .map(|input| InstanceRef::new(input.workflow_id.clone(), input.run_id.clone()))
+            .collect::<Vec<_>>();
+        let shard_id = self
+            .shard_for_ref(&InstanceRef::new(
+                inputs[0].workflow_id.clone(),
+                inputs[0].run_id.clone(),
+            ))
+            .await?;
+        self.execute(shard_id, EngineOperation::RecordActivationFailures(inputs))
+            .await?;
+        for ref_ in refs {
+            self.cache_remove(&ref_)?;
+        }
+        Ok(())
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        ShardEngineProvider::list_instances(self)
+        Ok(self
+            .snapshot_store()
+            .await?
+            .instances
+            .into_values()
+            .collect())
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        ShardEngineProvider::list_signals(self)
+        Ok(self.snapshot_store().await?.signals)
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        ShardEngineProvider::list_children(self)
+        Ok(self.snapshot_store().await?.children)
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        ShardRouter::shutdown(self).await
     }
 }
 
@@ -4429,25 +5752,33 @@ impl DurabilityProvider for NullDurabilityProvider {
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::claim_shard(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::claim_shard(&self.inner, input).await
+    }
+
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::claim_shard_tasks(&self.inner, claim, input).await
     }
 
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession> {
-        <ShardEngineProvider as DurabilityProvider>::open_shard(&self.inner, input)
+        <ShardRouter as DurabilityProvider>::open_shard(&self.inner, input)
     }
 
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
     ) -> Result<InstanceRef, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::create_instance(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input).await
     }
 
     async fn create_child_instance(
         &self,
         input: CreateChildInstanceInput,
     ) -> Result<ChildHandleValue, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::create_child_instance(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::create_child_instance(&self.inner, input).await
     }
 
     async fn load_instance(
@@ -4455,68 +5786,71 @@ impl DurabilityProvider for NullDurabilityProvider {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+        <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::append_signal(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::cancel_child(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::cancel_child(&self.inner, input).await
     }
 
     async fn get_or_reserve_effect(
         &self,
         input: ReserveEffectInput,
     ) -> Result<EffectReservation, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::get_or_reserve_effect(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::get_or_reserve_effect(&self.inner, input).await
     }
 
     async fn heartbeat_effect(&self, input: HeartbeatEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::heartbeat_effect(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::heartbeat_effect(&self.inner, input).await
     }
 
     async fn complete_effect(&self, input: CompleteEffectInput) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::complete_effect(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::complete_effect(&self.inner, input).await
     }
 
     async fn fail_effect(&self, input: FailEffectInput) -> Result<FailEffectResult, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::fail_effect(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::fail_effect(&self.inner, input).await
     }
 
     async fn commit_checkpoint(
         &self,
         input: CommitCheckpointInput,
     ) -> Result<CommitCheckpointResult, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::commit_checkpoint(&self.inner, input).await
+        <ShardRouter as DurabilityProvider>::commit_checkpoint(&self.inner, input).await
     }
 
     async fn commit_activations(
         &self,
         inputs: Vec<CommitCheckpointInput>,
     ) -> Result<CommitActivationsResult, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::commit_activations(&self.inner, inputs).await
+        <ShardRouter as DurabilityProvider>::commit_activations(&self.inner, inputs).await
     }
 
     async fn record_activation_failures(
         &self,
         inputs: Vec<RecordActivationFailureInput>,
     ) -> Result<(), WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::record_activation_failures(&self.inner, inputs)
-            .await
+        <ShardRouter as DurabilityProvider>::record_activation_failures(&self.inner, inputs).await
     }
 
     async fn list_instances(&self) -> Result<Vec<PersistedInstance>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_instances(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_instances(&self.inner).await
     }
 
     async fn list_signals(&self) -> Result<Vec<SignalRecord>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_signals(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_signals(&self.inner).await
     }
 
     async fn list_children(&self) -> Result<Vec<ChildRecord>, WorkflowError> {
-        <ShardEngineProvider as DurabilityProvider>::list_children(&self.inner).await
+        <ShardRouter as DurabilityProvider>::list_children(&self.inner).await
+    }
+
+    async fn shutdown(&self) -> Result<(), WorkflowError> {
+        self.inner.shutdown().await
     }
 }
 
@@ -4819,6 +6153,9 @@ fn insert_task(state: &mut Store, instance: &PersistedInstance, input: InsertTas
         .map(|suffix| format!("{activation_id}/{suffix}"))
         .unwrap_or_else(|| activation_id.clone());
     delete_task(state, &task_id);
+    state
+        .task_order
+        .insert((input.sort_key.clone(), task_id.clone()));
     state.tasks.insert(
         task_id.clone(),
         MemoryTask {
@@ -5027,9 +6364,20 @@ fn cancel_child_tree_for_parent_close(
 fn delete_task(state: &mut Store, task_id: &str) {
     if let Some(task) = state.tasks.remove(task_id) {
         state
+            .task_order
+            .remove(&(task.sort_key.clone(), task.task_id.clone()));
+        state
             .claimed_sequence_epochs
             .remove(&sequence_key_for_task(&task));
     }
+}
+
+fn rebuild_task_order(state: &mut Store) {
+    state.task_order = state
+        .tasks
+        .values()
+        .map(|task| (task.sort_key.clone(), task.task_id.clone()))
+        .collect();
 }
 
 fn sequence_key_for_task(task: &MemoryTask) -> String {
@@ -5220,201 +6568,6 @@ fn expire_activity_timeouts(
     for (activation_id, blocked_until) in releases {
         release_tasks_for_activation(state, &activation_id, blocked_until);
     }
-}
-
-fn claim_tasks_for_provider(
-    provider: &ShardEngineProvider,
-    session: &ShardEngineSession,
-    input: ClaimShardTasksInput,
-) -> Result<ClaimShardTasksResult, WorkflowError> {
-    if input.limit == 0 {
-        return Err(WorkflowError::new("limit must be positive"));
-    }
-    let Some(owner_id) = &session.owner_id else {
-        return Err(WorkflowError::new(format!(
-            "shard {} is not opened with an owner",
-            session.shard_id
-        )));
-    };
-    let mut state = provider.lock()?;
-    let lease = state
-        .shard_leases
-        .get(&session.shard_id)
-        .ok_or_else(|| WorkflowError::new(format!("lost shard lease: {}", session.shard_id)))?;
-    if lease.owner_id != *owner_id || lease.lease_until < input.now {
-        return Err(WorkflowError::new(format!(
-            "lost shard lease: {}",
-            session.shard_id
-        )));
-    }
-    if let Some(epoch) = session.lease_epoch {
-        if epoch != lease.lease_epoch {
-            return Err(WorkflowError::new(format!(
-                "lost shard lease: {}",
-                session.shard_id
-            )));
-        }
-    }
-    let lease_epoch = lease.lease_epoch;
-
-    expire_activity_timeouts(
-        &mut state,
-        input.now,
-        None,
-        Some(owner_id),
-        Some(session.shard_id),
-    );
-    refresh_migration_tasks(&mut state, session.shard_id, input.now, &input.workflows);
-
-    let mut candidates = state
-        .tasks
-        .values()
-        .filter(|task| task.partition_shard == session.shard_id)
-        .filter(|task| task.ready_at <= input.now)
-        .filter(|task| {
-            task.blocked_until
-                .map_or(true, |blocked| blocked <= input.now)
-        })
-        .filter(|task| {
-            input
-                .workflows
-                .get(&task.workflow_name)
-                .is_some_and(|version| task.workflow_version <= *version)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
-
-    let mut claims = Vec::new();
-    let mut claimed_sequences = std::collections::HashSet::new();
-    for candidate in candidates {
-        if claims.len() >= input.limit {
-            break;
-        }
-        let sequence_key = sequence_key_for_task(&candidate);
-        if claimed_sequences.contains(&sequence_key) {
-            continue;
-        }
-        if let Some(existing_epoch) = state.claimed_sequence_epochs.get(&sequence_key).copied() {
-            if existing_epoch == lease_epoch {
-                continue;
-            }
-            state.claimed_sequence_epochs.remove(&sequence_key);
-        }
-        let has_unexpired_claim = state.tasks.values().any(|task| {
-            task.workflow_id == candidate.workflow_id
-                && task.run_id == candidate.run_id
-                && task.sequence == candidate.sequence
-                && task
-                    .lease_until
-                    .is_some_and(|lease_until| lease_until > input.now)
-                && task.claim_owner_id.is_some()
-        });
-        if has_unexpired_claim {
-            continue;
-        }
-
-        let Some(instance) = state
-            .instances
-            .get(&instance_key(&candidate.workflow_id, &candidate.run_id))
-            .cloned()
-        else {
-            delete_task(&mut state, &candidate.task_id);
-            continue;
-        };
-        if instance.status != PersistedStatus::Running || instance.sequence != candidate.sequence {
-            delete_task(&mut state, &candidate.task_id);
-            continue;
-        }
-
-        if let Some(task) = state.tasks.get_mut(&candidate.task_id) {
-            task.claim_owner_id = Some(owner_id.clone());
-            task.claim_epoch = Some(lease_epoch);
-            task.lease_until =
-                Some(input.now + chrono::Duration::milliseconds(input.lease_ms as i64));
-        }
-        state
-            .claimed_sequence_epochs
-            .insert(sequence_key.clone(), lease_epoch);
-        claimed_sequences.insert(sequence_key);
-
-        let lease_until = input.now + chrono::Duration::milliseconds(input.lease_ms as i64);
-        let activation = match candidate.kind {
-            MemoryTaskKind::Migration => ClaimedActivation::Migration {
-                activation_id: candidate.activation_id.clone(),
-                workflow_name: candidate.workflow_name.clone(),
-                workflow_id: candidate.workflow_id.clone(),
-                run_id: candidate.run_id.clone(),
-                sequence: candidate.sequence,
-                activation_time: input.now,
-                lease_until,
-            },
-            MemoryTaskKind::Run => ClaimedActivation::Run {
-                activation_id: candidate.activation_id.clone(),
-                workflow_name: candidate.workflow_name.clone(),
-                workflow_id: candidate.workflow_id.clone(),
-                run_id: candidate.run_id.clone(),
-                sequence: candidate.sequence,
-                activation_time: input.now,
-                lease_until,
-            },
-            MemoryTaskKind::Event => ClaimedActivation::Event {
-                activation_id: candidate.activation_id.clone(),
-                workflow_name: candidate.workflow_name.clone(),
-                workflow_id: candidate.workflow_id.clone(),
-                run_id: candidate.run_id.clone(),
-                sequence: candidate.sequence,
-                activation_time: input.now,
-                wait_name: candidate.wait_name.clone().unwrap_or_default(),
-                event: candidate
-                    .event
-                    .clone()
-                    .ok_or_else(|| WorkflowError::new("event task missing event"))?,
-                lease_until,
-            },
-        };
-        let effects = instance
-            .effects
-            .iter()
-            .filter(|effect| effect.activation_id == candidate.activation_id)
-            .cloned()
-            .collect();
-        claims.push(ClaimedActivationWithInstance {
-            activation,
-            instance,
-            effects,
-            lease: ActivationClaimLease::Shard {
-                shard_id: session.shard_id,
-                epoch: lease_epoch,
-            },
-        });
-    }
-
-    let next_wake_at = state
-        .tasks
-        .values()
-        .filter(|task| task.partition_shard == session.shard_id)
-        .filter(|task| {
-            input
-                .workflows
-                .get(&task.workflow_name)
-                .is_some_and(|version| task.workflow_version <= *version)
-        })
-        .filter_map(|task| {
-            if let Some(blocked) = task.blocked_until {
-                if blocked > input.now {
-                    return Some(blocked);
-                }
-            }
-            (task.ready_at > input.now).then_some(task.ready_at)
-        })
-        .min();
-
-    provider.save_locked(&state)?;
-    Ok(ClaimShardTasksResult {
-        claims,
-        next_wake_at,
-    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5849,6 +7002,24 @@ pub trait DurabilityProvider: Send + Sync {
         &self,
         input: ClaimShardInput,
     ) -> Result<Option<ShardLease>, WorkflowError>;
+
+    async fn claim_shard_tasks(
+        &self,
+        claim: ClaimShardInput,
+        input: ClaimShardTasksInput,
+    ) -> Result<Option<(ShardLease, ClaimShardTasksResult)>, WorkflowError> {
+        let Some(lease) = self.claim_shard(claim).await? else {
+            return Ok(None);
+        };
+        let session = self.open_shard(OpenShardInput {
+            shard_id: lease.shard_id,
+            owner_id: Some(lease.owner_id.clone()),
+            lease_epoch: Some(lease.lease_epoch),
+        });
+        let tasks = session.claim_tasks(input).await?;
+        Ok(Some((lease, tasks)))
+    }
+
     fn open_shard(&self, input: OpenShardInput) -> Arc<dyn ShardDurabilitySession>;
 
     async fn create_instance(
@@ -6106,6 +7277,7 @@ impl DurableRuntime {
     ) -> Result<DrainResult, WorkflowError> {
         let max_activations = options.max_activations.unwrap_or(usize::MAX);
         let mut activations = 0;
+        let mut successful_shards = HashMap::new();
         let mut idle_sleep_ms = options
             .idle_sleep_ms
             .unwrap_or(self.options.min_poll_interval_ms)
@@ -6135,19 +7307,40 @@ impl DurableRuntime {
                 .idle_sleep_ms
                 .unwrap_or(self.options.min_poll_interval_ms)
                 .max(1);
+            let mut pending_commits = Vec::new();
             for activation in batch {
-                if let Err(error) = self.run_activation(activation.clone()).await {
-                    let _ = self.release_claimed_activation(&activation).await;
-                    return Err(error);
+                match self.prepare_activation_commit(activation.clone()).await {
+                    Ok(ActivationRunOutcome::Prepared(input)) => {
+                        pending_commits.push((activation, input));
+                    }
+                    Ok(ActivationRunOutcome::Skipped) => {
+                        let _ = self.release_claimed_activation(&activation).await;
+                    }
+                    Err(error) => {
+                        match self.commit_prepared_activations(&pending_commits).await {
+                            Ok(committed_shards) => {
+                                successful_shards.extend(committed_shards);
+                            }
+                            Err(commit_error) => {
+                                let _ = self.release_claimed_activation(&activation).await;
+                                let _ = self.release_successful_shards(successful_shards).await;
+                                return Err(commit_error);
+                            }
+                        }
+                        let _ = self.release_claimed_activation(&activation).await;
+                        let _ = self.release_successful_shards(successful_shards).await;
+                        return Err(error);
+                    }
                 }
-                let _ = self.release_claimed_activation(&activation).await;
                 activations += 1;
                 if activations >= max_activations {
                     break;
                 }
             }
+            successful_shards.extend(self.commit_prepared_activations(&pending_commits).await?);
         }
 
+        self.release_successful_shards(successful_shards).await?;
         Ok(DrainResult { activations })
     }
 
@@ -6215,32 +7408,27 @@ impl DurableRuntime {
             if ready.len() >= limit {
                 break;
             }
-            let Some(lease) = self
+            let Some((_lease, claims)) = self
                 .provider
-                .claim_shard(ClaimShardInput {
-                    shard_id,
-                    owner_id: self.options.worker_id.clone(),
-                    now,
-                    lease_ms: self.options.shard_lease_ms,
-                })
+                .claim_shard_tasks(
+                    ClaimShardInput {
+                        shard_id,
+                        owner_id: self.options.worker_id.clone(),
+                        now,
+                        lease_ms: self.options.shard_lease_ms,
+                    },
+                    ClaimShardTasksInput {
+                        workflows: workflows.clone(),
+                        shard_count: self.options.shard_count,
+                        now,
+                        lease_ms: self.options.activation_lease_ms,
+                        limit: limit - ready.len(),
+                    },
+                )
                 .await?
             else {
                 continue;
             };
-            let session = self.provider.open_shard(OpenShardInput {
-                shard_id: lease.shard_id,
-                owner_id: Some(lease.owner_id.clone()),
-                lease_epoch: Some(lease.lease_epoch),
-            });
-            let claims = session
-                .claim_tasks(ClaimShardTasksInput {
-                    workflows: workflows.clone(),
-                    shard_count: self.options.shard_count,
-                    now,
-                    lease_ms: self.options.activation_lease_ms,
-                    limit: limit - ready.len(),
-                })
-                .await?;
             for claim in claims.claims {
                 if let Some(activation) = self.ready_activation_from_claim(claim)? {
                     ready.push(activation);
@@ -6324,16 +7512,85 @@ impl DurableRuntime {
         }
     }
 
-    async fn run_activation(&self, activation: ReadyActivation) -> Result<(), WorkflowError> {
-        let ref_ = InstanceRef::new(
-            activation.instance.workflow_id.clone(),
-            activation.instance.run_id.clone(),
-        );
-        let latest = self.require_instance(&ref_).await?;
+    async fn release_successful_shards(
+        &self,
+        shards: HashMap<u32, u64>,
+    ) -> Result<(), WorkflowError> {
+        for (shard_id, epoch) in shards {
+            let session = self.provider.open_shard(OpenShardInput {
+                shard_id,
+                owner_id: Some(self.options.worker_id.clone()),
+                lease_epoch: Some(epoch),
+            });
+            session.release().await?;
+        }
+        Ok(())
+    }
+
+    async fn commit_prepared_activations(
+        &self,
+        pending: &[(ReadyActivation, CommitCheckpointInput)],
+    ) -> Result<HashMap<u32, u64>, WorkflowError> {
+        let mut successful_shards = HashMap::new();
+        let mut shard_groups: HashMap<(u32, u64), Vec<(ReadyActivation, CommitCheckpointInput)>> =
+            HashMap::new();
+        for (activation, input) in pending.iter().cloned() {
+            match activation.lease {
+                ActivationClaimLease::Shard { shard_id, epoch } => {
+                    shard_groups
+                        .entry((shard_id, epoch))
+                        .or_default()
+                        .push((activation, input));
+                }
+                ActivationClaimLease::Activation => {
+                    let result = self.provider.commit_checkpoint(input).await?;
+                    if result.ok {
+                        continue;
+                    }
+                    if result.retryable.unwrap_or(false) {
+                        continue;
+                    }
+                    self.handle_commit_result(result)?;
+                }
+            }
+        }
+
+        for ((shard_id, epoch), group) in shard_groups {
+            let session = self.provider.open_shard(OpenShardInput {
+                shard_id,
+                owner_id: Some(self.options.worker_id.clone()),
+                lease_epoch: Some(epoch),
+            });
+            let inputs = group
+                .iter()
+                .map(|(_, input)| input.clone())
+                .collect::<Vec<_>>();
+            let output = session.commit_activations(inputs).await?;
+            for ((activation, _), result) in group.iter().zip(output.results) {
+                if result.ok {
+                    successful_shards.insert(shard_id, epoch);
+                    continue;
+                }
+                if result.retryable.unwrap_or(false) {
+                    let _ = self.release_claimed_activation(activation).await;
+                    continue;
+                }
+                self.handle_commit_result(result)?;
+            }
+        }
+
+        Ok(successful_shards)
+    }
+
+    async fn prepare_activation_commit(
+        &self,
+        activation: ReadyActivation,
+    ) -> Result<ActivationRunOutcome, WorkflowError> {
+        let latest = activation.instance.clone();
         if latest.status != PersistedStatus::Running
             || latest.sequence != activation.instance.sequence
         {
-            return Ok(());
+            return Ok(ActivationRunOutcome::Skipped);
         }
 
         if activation.kind == ReadyActivationKind::Migration {
@@ -6345,27 +7602,20 @@ impl DurableRuntime {
             } else {
                 Vec::new()
             };
-            let commit = self
-                .commit_claimed_activation(
-                    &activation,
-                    CommitCheckpointInput {
-                        workflow_id: latest.workflow_id,
-                        run_id: latest.run_id,
-                        expected_sequence: latest.sequence,
-                        activation_id: activation.activation_id.clone(),
-                        workflow_version: activation.workflow.version(),
-                        next,
-                        waits,
-                        now: self.now(),
-                        consume_signal_id: None,
-                        consume_child_record_id: None,
-                        effects: Vec::new(),
-                        child_starts: Vec::new(),
-                    },
-                )
-                .await?;
-            self.handle_commit_result(commit)?;
-            return Ok(());
+            return Ok(ActivationRunOutcome::Prepared(CommitCheckpointInput {
+                workflow_id: latest.workflow_id,
+                run_id: latest.run_id,
+                expected_sequence: latest.sequence,
+                activation_id: activation.activation_id.clone(),
+                workflow_version: activation.workflow.version(),
+                next,
+                waits,
+                now: self.now(),
+                consume_signal_id: None,
+                consume_child_record_id: None,
+                effects: Vec::new(),
+                child_starts: Vec::new(),
+            }));
         }
 
         let common = latest
@@ -6442,52 +7692,24 @@ impl DurableRuntime {
             Vec::new()
         };
 
-        let commit = self
-            .commit_claimed_activation(
-                &activation,
-                CommitCheckpointInput {
-                    workflow_id: latest.workflow_id,
-                    run_id: latest.run_id,
-                    expected_sequence: latest.sequence,
-                    activation_id: activation.activation_id.clone(),
-                    workflow_version: activation.workflow.version(),
-                    next,
-                    waits,
-                    now: self.now(),
-                    consume_signal_id,
-                    consume_child_record_id,
-                    effects: ctx
-                        .commit_effects
-                        .into_values()
-                        .filter(|effect| {
-                            !matches!(effect, CheckpointEffectMutation::Completed { .. })
-                        })
-                        .collect(),
-                    child_starts: ctx.commit_child_starts.into_values().collect(),
-                },
-            )
-            .await?;
-        self.handle_commit_result(commit)?;
-
-        Ok(())
-    }
-
-    async fn commit_claimed_activation(
-        &self,
-        activation: &ReadyActivation,
-        input: CommitCheckpointInput,
-    ) -> Result<CommitCheckpointResult, WorkflowError> {
-        match activation.lease {
-            ActivationClaimLease::Shard { shard_id, epoch } => {
-                let session = self.provider.open_shard(OpenShardInput {
-                    shard_id,
-                    owner_id: Some(self.options.worker_id.clone()),
-                    lease_epoch: Some(epoch),
-                });
-                session.commit_checkpoint(input).await
-            }
-            ActivationClaimLease::Activation => self.provider.commit_checkpoint(input).await,
-        }
+        Ok(ActivationRunOutcome::Prepared(CommitCheckpointInput {
+            workflow_id: latest.workflow_id,
+            run_id: latest.run_id,
+            expected_sequence: latest.sequence,
+            activation_id: activation.activation_id.clone(),
+            workflow_version: activation.workflow.version(),
+            next,
+            waits,
+            now: self.now(),
+            consume_signal_id,
+            consume_child_record_id,
+            effects: ctx
+                .commit_effects
+                .into_values()
+                .filter(|effect| !matches!(effect, CheckpointEffectMutation::Completed { .. }))
+                .collect(),
+            child_starts: ctx.commit_child_starts.into_values().collect(),
+        }))
     }
 
     fn handle_commit_result(&self, result: CommitCheckpointResult) -> Result<(), WorkflowError> {
@@ -7032,6 +8254,12 @@ enum ReadyActivationKind {
     Migration,
     Run,
     Event,
+}
+
+#[derive(Clone, Debug)]
+enum ActivationRunOutcome {
+    Prepared(CommitCheckpointInput),
+    Skipped,
 }
 
 fn typed_snapshot<W>(

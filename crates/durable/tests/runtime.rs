@@ -6,11 +6,12 @@ use durable::{
     CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput, ClaimShardTasksInput,
     ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider, DurableRuntime,
     DurableWait, EffectReservation, FailEffectInput, FailEffectResult, HeartbeatEffectInput,
-    InstanceRef, InstanceStatusValue, LoadInstanceOptions, OpenShardInput, ParentClosePolicy,
-    PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
-    PostgresDurabilityProviderOptions, ReserveEffectInput, RunWorkerOptions, RuntimeOptions,
-    SerializedError, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
-    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
+    InstanceRef, InstanceStatusValue, LoadInstanceOptions, NullDurabilityProvider, OpenShardInput,
+    ParentClosePolicy, PersistedInstance, PersistedStatus, PhaseSnapshot,
+    PostgresDurabilityProvider, PostgresDurabilityProviderOptions, ReserveEffectInput,
+    RunWorkerOptions, RuntimeOptions, SerializedError, SignalRecord, SqliteDurabilityOptions,
+    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation,
+    WorkflowError,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -661,7 +662,7 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
         },
     )
     .unwrap();
-    let signals = reloaded.list_signals().unwrap();
+    let signals = reloaded.list_signals().await.unwrap();
     assert_eq!(signals.len(), 2);
     assert_eq!(signals[0].payload["index"], 1);
     assert_eq!(signals[1].payload["index"], 2);
@@ -934,6 +935,193 @@ async fn provider_parent_close_applies_cancel_and_abandon_child_policies() {
         .unwrap()
         .unwrap();
     assert_eq!(abandoned_child.status, PersistedStatus::Running);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shard_actors_claim_independent_shards_without_global_execution_store() {
+    let provider = NullDurabilityProvider::new();
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    for (workflow_id, shard_id) in [("actor-shard-0", 0), ("actor-shard-1", 1)] {
+        provider
+            .create_instance(CreateInstanceInput {
+                workflow_name: "actor_claim".to_string(),
+                workflow_version: 1,
+                workflow_id: workflow_id.to_string(),
+                run_id: "run-1".to_string(),
+                partition_shard: shard_id,
+                common: serde_json::json!({}),
+                phase: PhaseSnapshot {
+                    name: "running".to_string(),
+                    data: serde_json::json!({}),
+                },
+                waits: vec![DurableWait::Run {
+                    name: "__run".to_string(),
+                    ready_at: now,
+                }],
+                now,
+                parent: None,
+                conflict_policy: Some(ConflictPolicy::Fail),
+            })
+            .await
+            .unwrap();
+    }
+
+    let lease_0 = provider
+        .claim_shard(ClaimShardInput {
+            shard_id: 0,
+            owner_id: "worker-0".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let lease_1 = provider
+        .claim_shard(ClaimShardInput {
+            shard_id: 1,
+            owner_id: "worker-1".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let session_0 = provider.open_shard(OpenShardInput {
+        shard_id: 0,
+        owner_id: Some(lease_0.owner_id),
+        lease_epoch: Some(lease_0.lease_epoch),
+    });
+    let session_1 = provider.open_shard(OpenShardInput {
+        shard_id: 1,
+        owner_id: Some(lease_1.owner_id),
+        lease_epoch: Some(lease_1.lease_epoch),
+    });
+    let workflows = HashMap::from([("actor_claim".to_string(), 1)]);
+    let claims_0 = session_0
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: workflows.clone(),
+            shard_count: 2,
+            now,
+            lease_ms: 60_000,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let claims_1 = session_1
+        .claim_tasks(ClaimShardTasksInput {
+            workflows,
+            shard_count: 2,
+            now,
+            lease_ms: 60_000,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(claims_0.claims.len(), 1);
+    assert_eq!(claims_0.claims[0].instance.workflow_id, "actor-shard-0");
+    assert_eq!(claims_1.claims.len(), 1);
+    assert_eq!(claims_1.claims[0].instance.workflow_id, "actor-shard-1");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shard_directory_routes_signals_to_custom_partition_shard() {
+    let provider = NullDurabilityProvider::new();
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let ref_ = provider
+        .create_instance(CreateInstanceInput {
+            workflow_name: "actor_signal".to_string(),
+            workflow_version: 1,
+            workflow_id: "custom-shard-signal".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 3,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![DurableWait::Signal {
+                name: "continue".to_string(),
+                r#type: "continue".to_string(),
+                scope: durable::WaitScope::Phase,
+            }],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+        })
+        .await
+        .unwrap();
+    provider
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "continue".to_string(),
+            payload: serde_json::json!({ "ok": true }),
+            received_at: now,
+        })
+        .await
+        .unwrap();
+
+    let wrong_lease = provider
+        .claim_shard(ClaimShardInput {
+            shard_id: 0,
+            owner_id: "wrong-worker".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let right_lease = provider
+        .claim_shard(ClaimShardInput {
+            shard_id: 3,
+            owner_id: "right-worker".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let wrong_session = provider.open_shard(OpenShardInput {
+        shard_id: 0,
+        owner_id: Some(wrong_lease.owner_id),
+        lease_epoch: Some(wrong_lease.lease_epoch),
+    });
+    let right_session = provider.open_shard(OpenShardInput {
+        shard_id: 3,
+        owner_id: Some(right_lease.owner_id),
+        lease_epoch: Some(right_lease.lease_epoch),
+    });
+    let workflows = HashMap::from([("actor_signal".to_string(), 1)]);
+
+    let wrong_claims = wrong_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: workflows.clone(),
+            shard_count: 4,
+            now,
+            lease_ms: 60_000,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let right_claims = right_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows,
+            shard_count: 4,
+            now,
+            lease_ms: 60_000,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert!(wrong_claims.claims.is_empty());
+    assert_eq!(right_claims.claims.len(), 1);
+    assert_eq!(
+        right_claims.claims[0].instance.workflow_id,
+        ref_.workflow_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
