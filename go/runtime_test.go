@@ -491,6 +491,152 @@ func TestRuntimeTimerWaitFiresAfterClockAdvances(t *testing.T) {
 	}
 }
 
+func TestRunShardStepProcessesOnlyRequestedShard(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{
+		WorkerID:         "step-worker",
+		ShardCount:       3,
+		DispatchShardIDs: []int{0},
+		Clock:            clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := testWorkflow{name: "run_shard_step_workflow"}
+	refs := map[int]durable.StartWorkflowResult{}
+	for shardID := 0; shardID < 3; shardID++ {
+		ref, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowIDForShard(t, shardID, 3)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual := runtime.ShardForRef(ref); actual != shardID {
+			t.Fatalf("ref shard = %d, want %d", actual, shardID)
+		}
+		refs[shardID] = ref
+	}
+
+	result, err := runtime.RunShardStep(ctx, durable.RunShardStepOptions{
+		ShardID:                  1,
+		MaxActivations:           1,
+		MaxConcurrentActivations: 1,
+		ActivationPrefetchLimit:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ClaimedShard || result.Activations != 1 || result.ShardID != 1 {
+		t.Fatalf("run shard step = %#v", result)
+	}
+
+	for shardID, ref := range refs {
+		instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if instance == nil {
+			t.Fatalf("missing instance for shard %d", shardID)
+		}
+		wantSequence := int64(0)
+		if shardID == 1 {
+			wantSequence = 1
+		}
+		if instance.Sequence != wantSequence {
+			t.Fatalf("shard %d sequence = %d, want %d", shardID, instance.Sequence, wantSequence)
+		}
+	}
+}
+
+func TestRunShardStepReportsWhenAnotherWorkerOwnsShard(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	lease, err := provider.ClaimShard(ctx, durable.ClaimDispatchShardInput{
+		ShardID: 0,
+		OwnerID: "other-worker",
+		Now:     clock.Now(),
+		Lease:   time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease == nil {
+		t.Fatal("expected other worker to claim shard")
+	}
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{
+		WorkerID:   "step-worker",
+		ShardCount: 1,
+		Clock:      clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runtime.RunShardStep(ctx, durable.RunShardStepOptions{ShardID: 0, MaxActivations: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ClaimedShard || result.Activations != 0 || result.ShardID != 0 {
+		t.Fatalf("run shard step = %#v", result)
+	}
+}
+
+func TestRunShardStepReturnsNextWakeAtForFutureTimer(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{
+		WorkerID:         "step-worker",
+		ShardCount:       3,
+		DispatchShardIDs: []int{0},
+		Clock:            clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	due := t0.Add(time.Hour)
+	workflow := timerWorkflow{due: due}
+	ref, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowIDForShard(t, 2, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := runtime.ShardForRef(ref); actual != 2 {
+		t.Fatalf("ref shard = %d, want 2", actual)
+	}
+
+	result, err := runtime.RunShardStep(ctx, durable.RunShardStepOptions{ShardID: 2, MaxActivations: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ClaimedShard || result.Activations != 0 || result.ShardID != 2 || !result.NextWakeAt.Equal(due) {
+		t.Fatalf("run shard step = %#v, want next wake %s", result, due)
+	}
+}
+
+func TestRunShardStepValidatesShardIDs(t *testing.T) {
+	ctx := context.Background()
+	runtime, err := durable.NewRuntime(shardengine.New(), durable.RuntimeOptions{
+		WorkerID:   "step-worker",
+		ShardCount: 2,
+		Clock:      (&manualClock{now: t0}).Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, shardID := range []int{-1, 2} {
+		_, err := runtime.RunShardStep(ctx, durable.RunShardStepOptions{ShardID: shardID})
+		if err == nil {
+			t.Fatalf("shard id %d unexpectedly succeeded", shardID)
+		}
+		want := fmt.Sprintf("shard id %d outside 0..1", shardID)
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	}
+}
+
 type activityWorkflow struct {
 	calls *int
 	eager bool

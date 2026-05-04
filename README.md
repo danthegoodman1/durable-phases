@@ -33,11 +33,13 @@ The TypeScript demos in [`src/demos/`](src/demos/), Rust examples in
 - bounded unbound-loop processing with `stay()`
 - a tiny local child workflow
 - checkpoint-boundary workflow migration
+- custom runner loops over the public one-shard step API
 
-The Go examples are intentionally authored as real `go:generate` examples:
-each named example package contains the developer-written workflow types,
-`//durable:*` annotations, handwritten phase logic, and checked-in generated
-`durable_gen.go`.
+Most Go workflow examples are intentionally authored as real `go:generate`
+examples: the annotation-based packages contain developer-written workflow
+types, `//durable:*` annotations, handwritten phase logic, and checked-in
+generated `durable_gen.go`. The custom-runner example implements the public
+workflow interface directly so the runner boundary stays visible.
 
 Short inline TypeScript activities and local child starts default to checkpoint
 durability, so they are persisted atomically with the workflow checkpoint.
@@ -47,7 +49,7 @@ later steps.
 
 ## Custom runners
 
-TypeScript and Rust runtimes expose bounded shard-step APIs for scheduler
+TypeScript, Rust, and Go runtimes expose bounded shard-step APIs for scheduler
 integrations:
 
 ```ts
@@ -70,6 +72,16 @@ let result = runtime.run_shard_step(RunShardStepOptions {
 }).await?;
 ```
 
+```go
+shardID := runtime.ShardForRef(ref)
+result, err := runtime.RunShardStep(ctx, durable.RunShardStepOptions{
+    ShardID:                  shardID,
+    MaxActivations:           1,
+    MaxConcurrentActivations: 1,
+    ActivationPrefetchLimit:  1,
+})
+```
+
 This is intended for custom schedulers where the infrastructure, not the
 runtime, decides when to kick work. The shape is:
 
@@ -85,8 +97,9 @@ signal that may make the shard ready before the stored wake. Duplicate kicks are
 fine; shard leases and checkpoint fencing remain the correctness boundary.
 
 The demos in `src/demos/custom-runner.ts` and
-`crates/durable/examples/custom-runner.rs` use tiny local scheduler loops
-so the adapter boundary stays visible.
+`crates/durable/examples/custom-runner.rs`, and
+`go/examples/custom-runner/main.go` use tiny local scheduler loops so the
+adapter boundary stays visible.
 
 ## SQLite
 

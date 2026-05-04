@@ -42,6 +42,15 @@ type DrainOptions struct {
 	ActivationCommitMaxDelay  time.Duration
 }
 
+type RunShardStepOptions struct {
+	ShardID                   int
+	MaxActivations            int
+	MaxConcurrentActivations  int
+	ActivationPrefetchLimit   int
+	ActivationCommitBatchSize int
+	ActivationCommitMaxDelay  time.Duration
+}
+
 type RunWorkerOptions struct {
 	MaxActivations            int
 	StopWhenIdle              bool
@@ -55,6 +64,13 @@ type RunWorkerOptions struct {
 type DrainResult struct {
 	Activations int
 	NextWakeAt  time.Time
+}
+
+type RunShardStepResult struct {
+	ShardID      int
+	ClaimedShard bool
+	Activations  int
+	NextWakeAt   time.Time
 }
 
 type Runtime struct {
@@ -212,6 +228,11 @@ func (r *Runtime) GetWorkflowRuns(ctx context.Context, input GetWorkflowRunsInpu
 	return r.provider.GetWorkflowRuns(ctx, input)
 }
 
+func (r *Runtime) ShardForRef(run WorkflowRunRef) int {
+	ref := run.InstanceReference()
+	return WorkflowPartitionShard(ref.WorkflowID, ref.RunID, r.options.ShardCount)
+}
+
 func (r *Runtime) Drain(ctx context.Context, options DrainOptions) (DrainResult, error) {
 	shardSessions, err := r.claimShardSessions(ctx)
 	if err != nil {
@@ -229,6 +250,37 @@ func (r *Runtime) Drain(ctx context.Context, options DrainOptions) (DrainResult,
 		activationCommitBatchSize: positive(options.ActivationCommitBatchSize, r.options.ActivationCommitBatchSize),
 		activationCommitMaxDelay:  defaultDuration(options.ActivationCommitMaxDelay, r.options.ActivationCommitMaxDelay),
 	})
+}
+
+func (r *Runtime) RunShardStep(ctx context.Context, options RunShardStepOptions) (RunShardStepResult, error) {
+	if err := validateShardID(options.ShardID, r.options.ShardCount, "shard id"); err != nil {
+		return RunShardStepResult{}, err
+	}
+	result := RunShardStepResult{ShardID: options.ShardID}
+	session, claimed, err := r.claimShardSession(ctx, options.ShardID)
+	if err != nil {
+		return result, err
+	}
+	if !claimed {
+		return result, nil
+	}
+	result.ClaimedShard = true
+	defer func() {
+		_ = session.Release(context.Background())
+	}()
+	drainResult, err := r.drainOwnedShards(ctx, []ShardDurabilitySession{session}, drainSettings{
+		maxActivations:            positive(options.MaxActivations, 100),
+		maxConcurrentActivations:  positive(options.MaxConcurrentActivations, r.options.MaxConcurrentActivations),
+		activationPrefetchLimit:   positive(options.ActivationPrefetchLimit, r.options.ActivationPrefetchLimit),
+		activationCommitBatchSize: positive(options.ActivationCommitBatchSize, r.options.ActivationCommitBatchSize),
+		activationCommitMaxDelay:  defaultDuration(options.ActivationCommitMaxDelay, r.options.ActivationCommitMaxDelay),
+	})
+	result.Activations = drainResult.Activations
+	result.NextWakeAt = drainResult.NextWakeAt
+	if err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (r *Runtime) RunWorker(ctx context.Context, options RunWorkerOptions) (DrainResult, error) {
@@ -406,18 +458,18 @@ func (r *Runtime) prepareActivationCommit(ctx context.Context, claim runtimeClai
 		}}, nil
 	}
 	dctx := &Context{
-		runtime:         r,
-		provider:        r.provider,
-		workflowID:      instance.WorkflowID,
-		runID:           instance.RunID,
-		partitionShard:  instance.PartitionShard,
-		sequence:        instance.Sequence,
-		activationID:    activation.ActivationID,
-		workerID:        r.options.WorkerID,
-		shardCount:      r.options.ShardCount,
-		commitEffects:   map[string]CheckpointEffectMutation{},
-		commitChildren:  map[string]CheckpointChildStart{},
-		commitChildRefs: map[string]string{},
+		runtime:              r,
+		provider:             r.provider,
+		workflowID:           instance.WorkflowID,
+		runID:                instance.RunID,
+		partitionShard:       instance.PartitionShard,
+		sequence:             instance.Sequence,
+		activationID:         activation.ActivationID,
+		workerID:             r.options.WorkerID,
+		shardCount:           r.options.ShardCount,
+		commitEffects:        map[string]CheckpointEffectMutation{},
+		commitChildren:       map[string]CheckpointChildStart{},
+		commitChildRefs:      map[string]string{},
 		commitChildWorkflows: map[string]string{},
 	}
 	var transition Transition
@@ -499,20 +551,31 @@ func (r *Runtime) commitPrepared(ctx context.Context, prepared []preparedActivat
 func (r *Runtime) claimShardSessions(ctx context.Context) ([]ShardDurabilitySession, error) {
 	var sessions []ShardDurabilitySession
 	for _, shardID := range r.options.DispatchShardIDs {
-		lease, err := r.provider.ClaimShard(ctx, ClaimDispatchShardInput{
-			ShardID: shardID,
-			OwnerID: r.options.WorkerID,
-			Now:     r.now(),
-			Lease:   r.options.DispatchLease,
-		})
+		session, claimed, err := r.claimShardSession(ctx, shardID)
 		if err != nil {
 			return nil, err
 		}
-		if lease != nil {
-			sessions = append(sessions, r.provider.OpenShard(OpenShardInput{ShardID: lease.ShardID, OwnerID: lease.OwnerID, LeaseUntil: lease.LeaseUntil, LeaseEpoch: lease.LeaseEpoch}))
+		if claimed {
+			sessions = append(sessions, session)
 		}
 	}
 	return sessions, nil
+}
+
+func (r *Runtime) claimShardSession(ctx context.Context, shardID int) (ShardDurabilitySession, bool, error) {
+	lease, err := r.provider.ClaimShard(ctx, ClaimDispatchShardInput{
+		ShardID: shardID,
+		OwnerID: r.options.WorkerID,
+		Now:     r.now(),
+		Lease:   r.options.DispatchLease,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if lease == nil {
+		return nil, false, nil
+	}
+	return r.provider.OpenShard(OpenShardInput{ShardID: lease.ShardID, OwnerID: lease.OwnerID, LeaseUntil: lease.LeaseUntil, LeaseEpoch: lease.LeaseEpoch}), true, nil
 }
 
 func (r *Runtime) applyTransition(workflow Workflow, instance PersistedInstance, transition Transition) (InstanceStatus, error) {
@@ -634,13 +697,20 @@ func (r *Runtime) count(name string, tags map[string]any) {
 func validateShardIDs(ids []int, shardCount int) error {
 	seen := map[int]struct{}{}
 	for _, id := range ids {
-		if id < 0 || id >= shardCount {
-			return fmt.Errorf("dispatch shard id %d outside 0..%d", id, shardCount-1)
+		if err := validateShardID(id, shardCount, "dispatch shard id"); err != nil {
+			return err
 		}
 		if _, ok := seen[id]; ok {
 			return fmt.Errorf("dispatch shard ids must not contain duplicates")
 		}
 		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+func validateShardID(id, shardCount int, label string) error {
+	if id < 0 || id >= shardCount {
+		return fmt.Errorf("%s %d outside 0..%d", label, id, shardCount-1)
 	}
 	return nil
 }
@@ -697,18 +767,18 @@ func earliestTime(a, b time.Time) time.Time {
 }
 
 type Context struct {
-	runtime         *Runtime
-	provider        DurabilityProvider
-	workflowID      string
-	runID           string
-	partitionShard  int
-	sequence        int64
-	activationID    string
-	workerID        string
-	shardCount      int
-	commitEffects   map[string]CheckpointEffectMutation
-	commitChildren  map[string]CheckpointChildStart
-	commitChildRefs map[string]string
+	runtime              *Runtime
+	provider             DurabilityProvider
+	workflowID           string
+	runID                string
+	partitionShard       int
+	sequence             int64
+	activationID         string
+	workerID             string
+	shardCount           int
+	commitEffects        map[string]CheckpointEffectMutation
+	commitChildren       map[string]CheckpointChildStart
+	commitChildRefs      map[string]string
 	commitChildWorkflows map[string]string
 }
 

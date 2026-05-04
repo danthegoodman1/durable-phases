@@ -12,6 +12,7 @@ var examples = []string{
 	"stay-loop",
 	"child-workflow",
 	"migration",
+	"custom-runner",
 }
 
 func main() {
