@@ -45,6 +45,32 @@ Heartbeat or timeout activities use eager per-attempt durability. Remote
 children, tenant-aware partitioning, and external activity workers are left for
 later steps.
 
+## Custom runners
+
+TypeScript runtimes expose a bounded shard-step API for scheduler integrations:
+
+```ts
+const shardId = runtime.shardForRef(ref)
+const result = await runtime.runShardStep({
+  shardId,
+  maxActivations: 1,
+  maxConcurrentActivations: 1,
+  activationPrefetchLimit: 1,
+  signal,
+})
+```
+
+This is intended for systems like Convex where the infrastructure, not the
+runtime, decides when to kick work. The shape is:
+
+```text
+start/signal -> compute shard -> enqueue action -> runShardStep
+runShardStep -> enqueue again, schedule nextWakeAt, or let a watchdog recover
+```
+
+The demo in `src/demos/custom-runner.ts` uses a tiny local scheduler loop
+instead of Convex so the adapter boundary stays visible.
+
 ## SQLite
 
 The default SQLite provider is a single file configured for crash durability

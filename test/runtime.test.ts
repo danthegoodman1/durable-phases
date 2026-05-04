@@ -680,6 +680,16 @@ function workflowIdForDifferentShard(prefix: string, excludedShard: number, shar
   throw new Error(`Could not find workflow id outside shard ${excludedShard}`)
 }
 
+function workflowIdForShard(prefix: string, shard: number, shardCount: number): string {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const workflowId = `${prefix}-${attempt}`
+    if (workflowPartitionShard(workflowId, "run-1", shardCount) === shard) {
+      return workflowId
+    }
+  }
+  throw new Error(`Could not find workflow id for shard ${shard}`)
+}
+
 describe("durable workflow PoC", () => {
   it("dedupes starts by workflow id and paginates workflow runs in both directions", async () => {
     const path = await storePath()
@@ -1138,6 +1148,148 @@ describe("durable workflow PoC", () => {
           synchronous: "normal",
         } as never),
     ).toThrow("SqliteDurabilityProvider uses fixed SQLite synchronous=FULL")
+  })
+
+  it("runShardStep processes only the requested shard", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const shardCount = 3
+    const StepWorkflow = defineWorkflow({
+      name: "step_requested_shard",
+      version: 1,
+      input: z.object({ shard: z.number() }),
+      output: z.object({ shard: z.number() }),
+      initial(input) {
+        return start({ phase: "finish", data: { shard: input.shard } })
+      },
+      phases: {
+        finish: phase({
+          state: z.object({ shard: z.number() }),
+          run: async ({ data }) => complete({ shard: data.shard }),
+        }),
+      },
+    })
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [StepWorkflow],
+      shardCount,
+      dispatchShardIds: [0],
+      workerId: "step-worker",
+    })
+
+    const refs = await Promise.all(
+      Array.from({ length: shardCount }, (_value, shard) =>
+        runtime.start(
+          StepWorkflow,
+          { shard },
+          { workflowId: workflowIdForShard(`step-requested-${shard}`, shard, shardCount) },
+        ),
+      ),
+    )
+    refs.forEach((ref, shard) => {
+      expect(runtime.shardForRef(ref)).toBe(shard)
+    })
+
+    await expect(runtime.runShardStep({ shardId: 1, maxActivations: 1 })).resolves.toEqual({
+      shardId: 1,
+      claimedShard: true,
+      activations: 1,
+    })
+
+    await expect(provider.loadInstance(refs[1])).resolves.toMatchObject({
+      status: "completed",
+      sequence: 1,
+      output: { shard: 1 },
+    })
+    await expect(provider.loadInstance(refs[0])).resolves.toMatchObject({
+      status: "running",
+      sequence: 0,
+    })
+    await expect(provider.loadInstance(refs[2])).resolves.toMatchObject({
+      status: "running",
+      sequence: 0,
+    })
+  })
+
+  it("runShardStep reports when another worker owns the shard", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const provider = testProvider(path)
+    await provider.claimDispatchShard({
+      shardId: 0,
+      ownerId: "existing-owner",
+      now: clock.clock().toISOString(),
+      leaseMs: 60_000,
+    })
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      shardCount: 2,
+      workerId: "step-worker",
+    })
+
+    await expect(runtime.runShardStep({ shardId: 0, maxActivations: 1 })).resolves.toEqual({
+      shardId: 0,
+      claimedShard: false,
+      activations: 0,
+    })
+  })
+
+  it("runShardStep returns nextWakeAt for a future timer on the requested shard", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const shardCount = 3
+    const fireAt = addMs(clock.clock().toISOString(), 5_000)
+    const TimerWorkflow = defineWorkflow({
+      name: "step_future_timer",
+      version: 1,
+      input: z.object({ fireAt: z.string() }),
+      output: z.object({ firedAt: z.string() }),
+      initial(input) {
+        return start({ phase: "waiting", data: { fireAt: input.fireAt } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ fireAt: z.string() }),
+          on: {
+            wake: timer(({ data }) => data.fireAt, async ({ event }) =>
+              complete({ firedAt: event.firedAt }),
+            ),
+          },
+        }),
+      },
+    })
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [TimerWorkflow],
+      shardCount,
+      workerId: "timer-step-worker",
+    })
+    const workflowId = workflowIdForShard("step-future-timer", 2, shardCount)
+    const ref = await runtime.start(TimerWorkflow, { fireAt }, { workflowId })
+
+    await expect(runtime.runShardStep({ shardId: runtime.shardForRef(ref), maxActivations: 1 })).resolves.toEqual({
+      shardId: 2,
+      claimedShard: true,
+      activations: 0,
+      nextWakeAt: fireAt,
+    })
+  })
+
+  it("runShardStep validates shard ids", async () => {
+    const provider = testProvider(await storePath())
+    const runtime = new DurableRuntime(provider, { shardCount: 2 })
+
+    await expect(runtime.runShardStep({ shardId: -1 })).rejects.toThrow(
+      "shardId must be an integer between 0 and 1",
+    )
+    await expect(runtime.runShardStep({ shardId: 2 })).rejects.toThrow(
+      "shardId must be an integer between 0 and 1",
+    )
+    await expect(runtime.runShardStep({ shardId: 0.5 })).rejects.toThrow(
+      "shardId must be an integer between 0 and 1",
+    )
   })
 
   it("configures file-backed SQLite with WAL and FULL synchronization", async () => {

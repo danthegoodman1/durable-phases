@@ -101,6 +101,15 @@ export type DrainOptions = {
   signal?: AbortSignal
 }
 
+export type RunShardStepOptions = DrainOptions & {
+  shardId: number
+}
+
+export type RunShardStepResult = DrainResult & {
+  shardId: number
+  claimedShard: boolean
+}
+
 type ActivationTaskOutcome =
   | { kind: "handled"; activation: ClaimedActivation }
   | { kind: "retry_scheduled"; activation: ClaimedActivation }
@@ -304,6 +313,11 @@ export class DurableRuntime {
     }
   }
 
+  shardForRef(ref: InstanceRef | string): number {
+    const normalizedRef = normalizeRef(ref)
+    return workflowPartitionShard(normalizedRef.workflowId, normalizedRef.runId, this.shardCount)
+  }
+
   async start<W extends AnyWorkflow>(
     workflow: W,
     input: InputOf<W>,
@@ -415,6 +429,30 @@ export class DurableRuntime {
     } finally {
       dispatchHeartbeat?.stop()
       await this.releaseShardSessions(shardSessions)
+    }
+  }
+
+  async runShardStep(options: RunShardStepOptions): Promise<RunShardStepResult> {
+    const shardId = validateShardId(options.shardId, this.shardCount)
+    const { shardId: _shardId, ...drainOptions } = options
+    const session = await this.claimShardSession(shardId)
+    if (!session) {
+      return { shardId, claimedShard: false, activations: 0 }
+    }
+
+    let dispatchHeartbeat: DispatchHeartbeat | undefined
+    let dispatchFailure: Promise<DispatchHeartbeatFailure> | undefined
+    try {
+      dispatchHeartbeat = this.startDispatchShardHeartbeat([session])
+      dispatchFailure = dispatchHeartbeat.failure.catch((error: unknown) => ({
+        kind: "dispatch_heartbeat_failed",
+        error,
+      }))
+      const result = await this.drainOwnedShards([session], drainOptions, dispatchFailure)
+      return { ...result, shardId, claimedShard: true }
+    } finally {
+      dispatchHeartbeat?.stop()
+      await this.releaseShardSessions([session])
     }
   }
 
@@ -915,14 +953,9 @@ export class DurableRuntime {
   private async claimShardSessions(): Promise<ShardDurabilitySession[]> {
     const sessions: ShardDurabilitySession[] = []
     for (const shardId of this.dispatchShardIds) {
-      const lease = await this.provider.claimShard({
-        shardId,
-        ownerId: this.workerId,
-        now: this.now(),
-        leaseMs: this.dispatchLeaseMs,
-      })
-      if (lease) {
-        sessions.push(this.provider.openShard(lease))
+      const session = await this.claimShardSession(shardId)
+      if (session) {
+        sessions.push(session)
       }
     }
     const shardIds = sessions.map((session) => session.shardId)
@@ -936,6 +969,16 @@ export class DurableRuntime {
       workerId: this.workerId,
     })
     return sessions
+  }
+
+  private async claimShardSession(shardId: number): Promise<ShardDurabilitySession | null> {
+    const lease = await this.provider.claimShard({
+      shardId,
+      ownerId: this.workerId,
+      now: this.now(),
+      leaseMs: this.dispatchLeaseMs,
+    })
+    return lease ? this.provider.openShard(lease) : null
   }
 
   private async heartbeatShardSessions(sessions: ShardDurabilitySession[]): Promise<void> {
@@ -2521,6 +2564,13 @@ function normalizeDispatchShardIds(
     }
   }
   return uniqueShardIds
+}
+
+function validateShardId(shardId: number, shardCount: number): number {
+  if (!Number.isInteger(shardId) || shardId < 0 || shardId >= shardCount) {
+    throw new Error(`shardId must be an integer between 0 and ${shardCount - 1}`)
+  }
+  return shardId
 }
 
 function positiveInteger(value: number, name: string): number {
