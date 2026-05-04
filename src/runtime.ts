@@ -74,6 +74,10 @@ export type DurableRuntimeOptions = DurableObservability & {
   workflows?: AnyWorkflow[]
 }
 
+export type SignalOptions = {
+  idempotencyKey?: string
+}
+
 export type DrainResult = {
   activations: number
   nextWakeAt?: string
@@ -364,6 +368,7 @@ export class DurableRuntime {
     ref: InstanceRef | string,
     type: string,
     payload: unknown,
+    options: SignalOptions = {},
   ): Promise<SignalRecord> {
     this.registerWorkflows([workflow])
     const normalizedRef = normalizeRef(ref)
@@ -375,6 +380,7 @@ export class DurableRuntime {
       type,
       payload: toJson(parsedPayload),
       receivedAt: this.now(),
+      idempotencyKey: options.idempotencyKey,
     })
     this.log("info", "workflow.signal", {
       workflowName: workflow.name,

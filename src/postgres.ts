@@ -482,10 +482,16 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
   }
 
   async appendSignalForShard(shardId: number, input: AppendSignalInput): Promise<SignalRecord> {
+    let shouldAppend = true
     return this.mutateShard(
       shardId,
       { op: "appendSignal", input },
-      () => this.projectionForShard(shardId).engine.appendSignal(input),
+      () => {
+        const engine = this.projectionForShard(shardId).engine
+        shouldAppend = !engine.findSignalByIdempotencyKey(input)
+        return engine.appendSignal(input)
+      },
+      { shouldAppend: () => shouldAppend },
     )
   }
 

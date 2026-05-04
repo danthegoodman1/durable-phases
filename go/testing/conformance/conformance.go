@@ -246,6 +246,52 @@ func AssertProviderConformance(t *testing.T, factory Factory) {
 		})
 	})
 
+	t.Run(factory.Name+"/signal-idempotency", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			ref := createInstance(t, ctx, provider, createOptions{workflowID: "signal-idempotency", waits: []durable.DurableWait{signalWait("finish")}})
+			session := ownShard(t, ctx, provider, "worker-a", t0, longLease)
+			first, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(1)}, ReceivedAt: t0, IdempotencyKey: "request-1",
+			})
+			requireNoError(t, err)
+			duplicate, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(99)}, ReceivedAt: t1, IdempotencyKey: "request-1",
+			})
+			requireNoError(t, err)
+			requireEqual(t, first, duplicate)
+			signals, err := provider.ListSignals(ctx)
+			requireNoError(t, err)
+			requireEqual(t, 1, len(signals))
+			second, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(2)}, ReceivedAt: t2, IdempotencyKey: "request-2",
+			})
+			requireNoError(t, err)
+			if second.SignalID == first.SignalID {
+				t.Fatalf("second idempotency key reused signal id %s", second.SignalID)
+			}
+			claim := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t0, longLease, workflows), "signal")
+			requireEqual(t, first.SignalID, claim.Activation.Event.ConsumeSignalID)
+			committed, err := session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, ExpectedSequence: 0, ActivationID: claim.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.Running(map[string]any{}, durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}), Waits: []durable.DurableWait{signalWait("finish")}, Now: t2, ConsumeSignalID: claim.Activation.Event.ConsumeSignalID,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 1)
+			afterConsumed, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(100)}, ReceivedAt: t5, IdempotencyKey: "request-1",
+			})
+			requireNoError(t, err)
+			requireEqual(t, first.SignalID, afterConsumed.SignalID)
+			requireEqual(t, "request-1", afterConsumed.IdempotencyKey)
+			if afterConsumed.ConsumedBySequence == nil || *afterConsumed.ConsumedBySequence != 1 {
+				t.Fatalf("duplicate after consumption returned sequence %#v", afterConsumed.ConsumedBySequence)
+			}
+			next := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t5, longLease, workflows), "signal")
+			requireEqual(t, second.SignalID, next.Activation.Event.ConsumeSignalID)
+		})
+	})
+
 	t.Run(factory.Name+"/effects-retry-timeout-and-memoization", func(t *testing.T) {
 		withStore(t, factory, func(ctx context.Context, store Store) {
 			provider := store.New(t).Provider

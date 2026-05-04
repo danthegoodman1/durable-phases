@@ -286,9 +286,12 @@ type SignalRecord = {
   type: string
   payload: JsonObject
   receivedAt: string
+  idempotencyKey?: string
   consumedBySequence?: number
 }
 ```
+
+Signal sends may include an optional caller-provided `idempotencyKey`. The key is scoped to one workflow run and signal type. If a later send uses the same `workflowId`, `runId`, `type`, and `idempotencyKey`, the provider must return the original signal record and must not create or deliver another signal. The first payload wins.
 
 The signal inbox is logically unbounded for execution semantics.
 
@@ -953,6 +956,7 @@ The provider may offer stronger read modes, but the portable runtime contract on
 ```text
 assign runtime receivedAt
 assign stable signalId
+return existing signal when idempotencyKey matches workflowId/runId/type
 persist the signal as unconsumed
 wake matching current waits if possible
 ```

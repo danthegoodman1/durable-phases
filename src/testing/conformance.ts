@@ -585,6 +585,119 @@ export function describeDurabilityProviderConformance(
       })
     })
 
+    it("deduplicates signal appends by workflow run, type, and idempotency key", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const ref = await createConformanceInstance(provider, {
+          workflowId: "signal-idempotency",
+          waits: [signalWait("finish")],
+        })
+        await ownShard(provider, "worker-a")
+
+        const first = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 1 },
+          receivedAt: T0,
+          idempotencyKey: "request-1",
+        })
+        const duplicate = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 99 },
+          receivedAt: T1,
+          idempotencyKey: "request-1",
+        })
+        expect(duplicate).toEqual(first)
+        await expect(provider.listSignals()).resolves.toHaveLength(1)
+
+        const second = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 2 },
+          receivedAt: T2,
+          idempotencyKey: "request-2",
+        })
+        expect(second.signalId).not.toBe(first.signalId)
+
+        const activation = requireSignalEventActivation(await claim(provider, "worker-a", T0))
+        expect(activation.event.consumeSignalId).toBe(first.signalId)
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 0,
+            activationId: activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: running({}, "waiting", {}),
+            waits: [signalWait("finish")],
+            now: T2,
+            consumeSignalId: activation.event.consumeSignalId,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+
+        const afterConsumed = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 100 },
+          receivedAt: T5,
+          idempotencyKey: "request-1",
+        })
+        expect(afterConsumed).toMatchObject({
+          signalId: first.signalId,
+          idempotencyKey: "request-1",
+          consumedBySequence: 1,
+        })
+
+        const nextActivation = requireSignalEventActivation(await claim(provider, "worker-a", T5))
+        expect(nextActivation.event.consumeSignalId).toBe(second.signalId)
+      })
+    })
+
+    it("deduplicates concurrent idempotent signal appends across provider instances and replay", async () => {
+      await withStore(factory, async (store) => {
+        const providerA = await store.createProvider()
+        const providerB = await store.createProvider()
+        const ref = await createConformanceInstance(providerA, {
+          workflowId: "signal-idempotency-race",
+          waits: [signalWait("finish")],
+        })
+
+        const [first, duplicate] = await Promise.all([
+          providerA.appendSignal({
+            ...ref,
+            type: "finish",
+            payload: { sender: "a" },
+            receivedAt: T0,
+            idempotencyKey: "request-1",
+          }),
+          providerB.appendSignal({
+            ...ref,
+            type: "finish",
+            payload: { sender: "b" },
+            receivedAt: T1,
+            idempotencyKey: "request-1",
+          }),
+        ])
+
+        expect(duplicate).toEqual(first)
+        await expect(providerA.listSignals()).resolves.toEqual([first])
+
+        const replayed = await store.createProvider()
+        await expect(replayed.listSignals()).resolves.toEqual([first])
+        await expect(
+          replayed.appendSignal({
+            ...ref,
+            type: "finish",
+            payload: { sender: "replayed" },
+            receivedAt: T2,
+            idempotencyKey: "request-1",
+          }),
+        ).resolves.toEqual(first)
+        await expect(replayed.listSignals()).resolves.toEqual([first])
+      })
+    })
+
     it("rejects lost activation leases and leaves claimed signals consumable", async () => {
       await withStore(factory, async (store) => {
         const providerA = await store.createProvider()

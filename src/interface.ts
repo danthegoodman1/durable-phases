@@ -31,6 +31,7 @@ export type SignalRecord = {
   type: string
   payload: JsonValue
   receivedAt: string
+  idempotencyKey?: string
   consumedBySequence?: number
 }
 
@@ -173,6 +174,7 @@ export type AppendSignalInput = {
   type: string
   payload: JsonValue
   receivedAt: string
+  idempotencyKey?: string
 }
 
 export type DispatchShardLease = {
@@ -548,6 +550,7 @@ export type DurabilityProvider = {
   loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
   getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
+  listSignals(): SignalRecord[] | Promise<SignalRecord[]>
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>
   releaseDispatchShard(input: ReleaseDispatchShardInput): Promise<void>

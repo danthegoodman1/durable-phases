@@ -10,7 +10,7 @@ use durable::{
     LoadInstanceOptions, NullDurabilityProvider, OpenShardInput, ParentClosePolicy,
     PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
     PostgresDurabilityProviderOptions, ReserveEffectInput, RunShardStepOptions, RunWorkerOptions,
-    RuntimeOptions, SerializedError, SignalRecord, SqliteDurabilityOptions,
+    RuntimeOptions, SerializedError, SignalOptions, SignalRecord, SqliteDurabilityOptions,
     SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation,
     WorkflowError, WorkflowIdReusePolicy, WorkflowRunDirection,
 };
@@ -763,6 +763,81 @@ async fn persists_signals_and_consumes_atomically_with_go_checkpoint() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn runtime_signal_with_options_deduplicates_idempotency_key() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+    runtime.register::<TestChildWorkflow>().unwrap();
+
+    let ref_ = runtime
+        .start::<TestWorkflow>(
+            TestInput {
+                label: "Ada".to_string(),
+                items: vec!["a".to_string()],
+            },
+            StartOptions {
+                workflow_id: Some("idempotent-signal-runtime".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+    let first = runtime
+        .signal_with_options(
+            &ref_,
+            "begin",
+            Empty {},
+            SignalOptions {
+                idempotency_key: Some("send-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let duplicate = runtime
+        .signal_with_options(
+            &ref_,
+            "begin",
+            Empty {},
+            SignalOptions {
+                idempotency_key: Some("send-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+    let after_consumed = runtime
+        .signal_with_options(
+            &ref_,
+            "begin",
+            Empty {},
+            SignalOptions {
+                idempotency_key: Some("send-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_consumed.signal_id, first.signal_id);
+    assert_eq!(after_consumed.consumed_by_sequence, Some(2));
+    assert_eq!(runtime_signals(&runtime).await.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn uses_checkpoint_for_bounded_loop_pattern() {
     let _guard = TEST_LOCK.lock().unwrap();
     parent_child::reset_processed();
@@ -1120,9 +1195,22 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
             r#type: "continue".to_string(),
             payload: serde_json::json!({ "index": 1 }),
             received_at: now,
+            idempotency_key: Some("request-1".to_string()),
         })
         .await
         .unwrap();
+    let duplicate = provider
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "continue".to_string(),
+            payload: serde_json::json!({ "index": 99 }),
+            received_at: now + Duration::milliseconds(500),
+            idempotency_key: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate.payload["index"], 1);
     provider
         .append_signal(AppendSignalInput {
             workflow_id: ref_.workflow_id.clone(),
@@ -1130,6 +1218,7 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
             r#type: "continue".to_string(),
             payload: serde_json::json!({ "index": 2 }),
             received_at: now + Duration::seconds(1),
+            idempotency_key: None,
         })
         .await
         .unwrap();
@@ -1550,6 +1639,7 @@ async fn shard_directory_routes_signals_to_custom_partition_shard() {
             r#type: "continue".to_string(),
             payload: serde_json::json!({ "ok": true }),
             received_at: now,
+            idempotency_key: None,
         })
         .await
         .unwrap();

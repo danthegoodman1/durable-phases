@@ -193,16 +193,25 @@ func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, opti
 	return ref, err
 }
 
+type SignalOptions struct {
+	IdempotencyKey string
+}
+
 func (r *Runtime) Signal(ctx context.Context, workflow Workflow, run WorkflowRunRef, typ string, payload JSON) (SignalRecord, error) {
+	return r.SignalWithOptions(ctx, workflow, run, typ, payload, SignalOptions{})
+}
+
+func (r *Runtime) SignalWithOptions(ctx context.Context, workflow Workflow, run WorkflowRunRef, typ string, payload JSON, options SignalOptions) (SignalRecord, error) {
 	r.Register(workflow)
 	ref := run.InstanceReference()
 	session := r.provider.OpenShard(OpenShardInput{ShardID: WorkflowPartitionShard(ref.WorkflowID, ref.RunID, r.options.ShardCount)})
 	signal, err := session.AppendSignal(ctx, AppendSignalInput{
-		WorkflowID: ref.WorkflowID,
-		RunID:      ref.RunID,
-		Type:       typ,
-		Payload:    payload,
-		ReceivedAt: r.now(),
+		WorkflowID:     ref.WorkflowID,
+		RunID:          ref.RunID,
+		Type:           typ,
+		Payload:        payload,
+		ReceivedAt:     r.now(),
+		IdempotencyKey: options.IdempotencyKey,
 	})
 	if err == nil {
 		r.log("info", "workflow.signal", map[string]any{"workflowName": workflow.Name(), "type": typ, "workerId": r.options.WorkerID})

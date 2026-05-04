@@ -235,9 +235,12 @@ func (p *Provider) LoadInstance(ctx context.Context, ref durable.InstanceRef, op
 }
 
 func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
-	out, err := p.engine.AppendSignal(ctx, input)
+	out, created, err := p.engine.AppendSignalWithStatus(ctx, input)
 	if err != nil {
 		return out, err
+	}
+	if !created {
+		return out, nil
 	}
 	return out, p.persist(ctx)
 }

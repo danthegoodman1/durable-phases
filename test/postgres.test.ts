@@ -199,6 +199,67 @@ describeIfPostgres("PostgresDurabilityProvider append store", () => {
     )
   })
 
+  it("does not append extra journal entries for duplicate idempotent signals", async () => {
+    await withProvider(async (provider, schema) => {
+      await provider.createInstance({
+        workflowName: "pg_idempotent_signal",
+        workflowVersion: 1,
+        workflowId: "pg-idempotent-signal",
+        runId: "run-1",
+        partitionShard: 0,
+        common: {},
+        phase: { name: "waiting", data: {} },
+        waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+        now: "2026-01-01T00:00:00.000Z",
+      })
+
+      const first = await provider.appendSignal({
+        workflowId: "pg-idempotent-signal",
+        runId: "run-1",
+        type: "finish",
+        payload: { sender: "first" },
+        receivedAt: "2026-01-01T00:00:01.000Z",
+        idempotencyKey: "request-1",
+      })
+      await expect(
+        provider.appendSignal({
+          workflowId: "pg-idempotent-signal",
+          runId: "run-1",
+          type: "finish",
+          payload: { sender: "duplicate" },
+          receivedAt: "2026-01-01T00:00:02.000Z",
+          idempotencyKey: "request-1",
+        }),
+      ).resolves.toEqual(first)
+
+      const secondProvider = await PostgresDurabilityProvider.create({
+        connectionString,
+        schema,
+      })
+      try {
+        await expect(
+          secondProvider.appendSignal({
+            workflowId: "pg-idempotent-signal",
+            runId: "run-1",
+            type: "finish",
+            payload: { sender: "second-provider" },
+            receivedAt: "2026-01-01T00:00:03.000Z",
+            idempotencyKey: "request-1",
+          }),
+        ).resolves.toEqual(first)
+      } finally {
+        await secondProvider.close()
+      }
+
+      await expect(
+        scalar<number>(
+          schema,
+          `SELECT count(*)::int FROM {schema}.shard_journal_p00 WHERE shard_id = 0`,
+        ),
+      ).resolves.toBe(2)
+    })
+  })
+
   it("uses shard epochs to fence stale commits after shard takeover", async () => {
     await withProvider(async (provider) => {
       await provider.createInstance({

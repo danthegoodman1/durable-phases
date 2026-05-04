@@ -296,7 +296,15 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   }
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
-    return this.mutate({ op: "appendSignal", input }, () => this.store.engine.appendSignal(input))
+    let shouldAppend = true
+    return this.mutate(
+      { op: "appendSignal", input },
+      () => {
+        shouldAppend = !this.store.engine.findSignalByIdempotencyKey(input)
+        return this.store.engine.appendSignal(input)
+      },
+      { shouldAppend: () => shouldAppend },
+    )
   }
 
   async claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null> {

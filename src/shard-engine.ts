@@ -427,6 +427,20 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       .map((signal) => this.clone(signal))
   }
 
+  findSignalByIdempotencyKey(input: AppendSignalInput): SignalRecord | undefined {
+    const idempotencyKey = input.idempotencyKey || undefined
+    if (!idempotencyKey) {
+      return undefined
+    }
+    const existing = [...this.signals.values()].find((signal) =>
+      signal.workflowId === input.workflowId &&
+      signal.runId === input.runId &&
+      signal.type === input.type &&
+      signal.idempotencyKey === idempotencyKey
+    )
+    return existing ? this.clone(existing) : undefined
+  }
+
   listChildren(): ChildRecord[] {
     return [...this.children.values()]
       .sort((left, right) => left.childRecordId.localeCompare(right.childRecordId))
@@ -477,6 +491,11 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     const instance = this.instances.get(refKey(input))
+    const existing = this.findSignalByIdempotencyKey(input)
+    if (existing) {
+      return existing
+    }
+    const idempotencyKey = input.idempotencyKey || undefined
     const signal: SignalRecord = {
       signalId: `signal-${++this.signalCounter}`,
       workflowId: input.workflowId,
@@ -484,6 +503,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       type: input.type,
       payload: this.clone(input.payload),
       receivedAt: input.receivedAt,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
     }
     this.signals.set(signal.signalId, signal)
     if (instance?.status === "running") {

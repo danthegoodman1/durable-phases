@@ -226,6 +226,7 @@ type SignalRecord struct {
 	Type               string    `json:"type"`
 	Payload            JSON      `json:"payload"`
 	ReceivedAt         time.Time `json:"receivedAt"`
+	IdempotencyKey     string    `json:"idempotencyKey,omitempty"`
 	ConsumedBySequence *int64    `json:"consumedBySequence,omitempty"`
 }
 
@@ -450,11 +451,12 @@ type CancelChildInput struct {
 }
 
 type AppendSignalInput struct {
-	WorkflowID string    `json:"workflowId"`
-	RunID      string    `json:"runId"`
-	Type       string    `json:"type"`
-	Payload    JSON      `json:"payload"`
-	ReceivedAt time.Time `json:"receivedAt"`
+	WorkflowID     string    `json:"workflowId"`
+	RunID          string    `json:"runId"`
+	Type           string    `json:"type"`
+	Payload        JSON      `json:"payload"`
+	ReceivedAt     time.Time `json:"receivedAt"`
+	IdempotencyKey string    `json:"idempotencyKey,omitempty"`
 }
 
 type DispatchShardLease struct {

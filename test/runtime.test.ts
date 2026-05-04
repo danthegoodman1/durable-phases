@@ -55,6 +55,13 @@ function sqlitePragma(provider: SqliteDurabilityProvider, sql: string): unknown 
   }).db.pragma(sql, { simple: true })
 }
 
+function sqliteScalar<T>(provider: SqliteDurabilityProvider, sql: string): T {
+  const row = (provider as unknown as {
+    db: { prepare(statement: string): { get(): Record<string, T> } }
+  }).db.prepare(sql).get()
+  return Object.values(row)[0] as T
+}
+
 afterEach(async () => {
   for (const provider of testProviders) {
     provider.close()
@@ -1694,6 +1701,53 @@ describe("durable workflow PoC", () => {
     expect((await provider.listSignals())[0].consumedBySequence).toBe(2)
   })
 
+  it("does not append extra SQLite journal entries for duplicate idempotent signals", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const now = "2026-01-01T00:00:00.000Z"
+    const ref = await provider.createInstance({
+      workflowName: "sqlite_idempotent_signal",
+      workflowVersion: 1,
+      workflowId: "sqlite-idempotent-signal",
+      runId: "run-1",
+      partitionShard: 0,
+      common: {},
+      phase: { name: "waiting", data: {} },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase" }],
+      now,
+    })
+
+    const first = await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: { index: 1 },
+      receivedAt: now,
+      idempotencyKey: "request-1",
+    })
+    await expect(
+      provider.appendSignal({
+        ...ref,
+        type: "finish",
+        payload: { index: 99 },
+        receivedAt: "2026-01-01T00:00:01.000Z",
+        idempotencyKey: "request-1",
+      }),
+    ).resolves.toEqual(first)
+    const second = await provider.appendSignal({
+      ...ref,
+      type: "finish",
+      payload: { index: 2 },
+      receivedAt: "2026-01-01T00:00:02.000Z",
+      idempotencyKey: "request-2",
+    })
+
+    expect(sqliteScalar<number>(provider, "SELECT count(*) AS count FROM shard_journal")).toBe(3)
+    provider.close()
+
+    const restarted = testProvider(path)
+    await expect(restarted.listSignals()).resolves.toEqual([first, second])
+  })
+
   it("uses stay() for the bounded unbound-loop pattern", async () => {
     const path = await storePath()
     const clock = manualClock()
@@ -3242,6 +3296,38 @@ describe("durable workflow PoC", () => {
       output: { ok: true },
     })
     expect((await provider.listSignals())[0].consumedBySequence).toBe(1)
+  })
+
+  it("deduplicates runtime signal sends with an idempotency key", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const SignalWorkflow = defineWorkflow({
+      name: "idempotent_signal_runtime",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const runtime = new DurableRuntime(provider, { workflows: [SignalWorkflow] })
+    const ref = await runtime.start(SignalWorkflow, {}, { workflowId: "idempotent-signal-runtime" })
+
+    const first = await runtime.signal(SignalWorkflow, ref, "finish", {}, { idempotencyKey: "send-1" })
+    const duplicate = await runtime.signal(SignalWorkflow, ref, "finish", {}, { idempotencyKey: "send-1" })
+    expect(duplicate).toEqual(first)
+
+    await runtime.drain()
+    const afterConsumed = await runtime.signal(SignalWorkflow, ref, "finish", {}, { idempotencyKey: "send-1" })
+    expect(afterConsumed).toMatchObject({ signalId: first.signalId, consumedBySequence: 1 })
+    expect(await provider.listSignals()).toHaveLength(1)
   })
 
   it("requires shard ownership and lets expired shard leases be reclaimed", async () => {

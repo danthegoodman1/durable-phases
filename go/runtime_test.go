@@ -2,6 +2,7 @@ package durable_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -164,6 +165,56 @@ func TestRuntimeSignalFlowAndQuery(t *testing.T) {
 	}
 	if query.(map[string]any)["status"] != "completed" {
 		t.Fatalf("query = %#v", query)
+	}
+}
+
+func TestRuntimeSignalWithOptionsDeduplicatesIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{
+		WorkerID:   "worker-a",
+		ShardCount: 1,
+		Clock:      clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := testWorkflow{name: "idempotent_signal_runtime"}
+	ref, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: "idempotent-signal-runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
+		t.Fatalf("drain boot = %#v, %v", result, err)
+	}
+	first, err := runtime.SignalWithOptions(ctx, workflow, ref, "finish", map[string]any{"ok": true}, durable.SignalOptions{IdempotencyKey: "send-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := runtime.SignalWithOptions(ctx, workflow, ref, "finish", map[string]any{"ok": false}, durable.SignalOptions{IdempotencyKey: "send-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SignalID != duplicate.SignalID || first.IdempotencyKey != duplicate.IdempotencyKey {
+		t.Fatalf("duplicate = %#v, want %#v", duplicate, first)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
+		t.Fatalf("drain signal = %#v, %v", result, err)
+	}
+	afterConsumed, err := runtime.SignalWithOptions(ctx, workflow, ref, "finish", map[string]any{"ok": false}, durable.SignalOptions{IdempotencyKey: "send-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterConsumed.SignalID != first.SignalID || afterConsumed.ConsumedBySequence == nil || *afterConsumed.ConsumedBySequence != 2 {
+		t.Fatalf("after consumed duplicate = %#v", afterConsumed)
+	}
+	signals, err := provider.ListSignals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 {
+		t.Fatalf("signals = %#v", signals)
 	}
 }
 
@@ -361,6 +412,72 @@ func TestSQLiteProviderRestartsFromJournal(t *testing.T) {
 	}
 	if instance == nil || instance.Common.(map[string]any)["value"] != "saved" {
 		t.Fatalf("restarted instance = %#v", instance)
+	}
+}
+
+func TestSQLiteProviderIdempotentSignalReplaySkipsDuplicateJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	provider, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := provider.CreateInstance(ctx, durable.CreateInstanceInput{
+		WorkflowName: "sqlite_signal_replay", WorkflowVersion: 1, WorkflowID: "sqlite-signal-replay", RunID: "run-1", PartitionShard: 0,
+		Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{durable.SignalWait("finish", "finish", false)}, Now: t0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(1)}, ReceivedAt: t0, IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(99)}, ReceivedAt: t0.Add(time.Millisecond), IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.SignalID != first.SignalID || duplicate.Payload.(map[string]any)["index"] != float64(1) {
+		t.Fatalf("duplicate = %#v, want %#v", duplicate, first)
+	}
+	if _, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(2)}, ReceivedAt: t0.Add(2 * time.Millisecond), IdempotencyKey: "request-2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var journalEntries int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM shard_journal`).Scan(&journalEntries); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if journalEntries != 3 {
+		t.Fatalf("journal entries = %d, want 3", journalEntries)
+	}
+
+	restarted, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close(ctx)
+	signals, err := restarted.ListSignals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 2 || signals[0].Payload.(map[string]any)["index"] != float64(1) || signals[1].Payload.(map[string]any)["index"] != float64(2) {
+		t.Fatalf("replayed signals = %#v", signals)
 	}
 }
 

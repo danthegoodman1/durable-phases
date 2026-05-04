@@ -360,26 +360,42 @@ func (p *Provider) ShardForActivation(activationID string) (int, bool) {
 }
 
 func (p *Provider) AppendSignal(_ context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
+	signal, _, err := p.AppendSignalWithStatus(context.Background(), input)
+	return signal, err
+}
+
+func (p *Provider) AppendSignalWithStatus(_ context.Context, input durable.AppendSignalInput) (durable.SignalRecord, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.instances[refKey(input.WorkflowID, input.RunID)]; !ok {
-		return durable.SignalRecord{}, fmt.Errorf("cannot signal unknown workflow: %s/%s", input.WorkflowID, input.RunID)
+		return durable.SignalRecord{}, false, fmt.Errorf("cannot signal unknown workflow: %s/%s", input.WorkflowID, input.RunID)
+	}
+	if input.IdempotencyKey != "" {
+		for _, signal := range p.signals {
+			if signal.WorkflowID == input.WorkflowID &&
+				signal.RunID == input.RunID &&
+				signal.Type == input.Type &&
+				signal.IdempotencyKey == input.IdempotencyKey {
+				return clone(signal), false, nil
+			}
+		}
 	}
 	p.signalCounter++
 	signal := durable.SignalRecord{
-		SignalID:   fmt.Sprintf("signal-%d", p.signalCounter),
-		WorkflowID: input.WorkflowID,
-		RunID:      input.RunID,
-		Type:       input.Type,
-		Payload:    clone(input.Payload),
-		ReceivedAt: input.ReceivedAt,
+		SignalID:       fmt.Sprintf("signal-%d", p.signalCounter),
+		WorkflowID:     input.WorkflowID,
+		RunID:          input.RunID,
+		Type:           input.Type,
+		Payload:        clone(input.Payload),
+		ReceivedAt:     input.ReceivedAt,
+		IdempotencyKey: input.IdempotencyKey,
 	}
 	p.signals[signal.SignalID] = signal
 	instance := p.instances[refKey(input.WorkflowID, input.RunID)]
 	if instance.Status == "running" {
 		p.refreshSignalTasksForInstanceLocked(instance)
 	}
-	return clone(signal), nil
+	return clone(signal), true, nil
 }
 
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
@@ -720,6 +736,23 @@ func (p *Provider) ListSignals(_ context.Context) ([]durable.SignalRecord, error
 		return sortKey(out[i].ReceivedAt, out[i].SignalID) < sortKey(out[j].ReceivedAt, out[j].SignalID)
 	})
 	return out, nil
+}
+
+func (p *Provider) FindSignalByIdempotencyKey(_ context.Context, input durable.AppendSignalInput) (durable.SignalRecord, bool) {
+	if input.IdempotencyKey == "" {
+		return durable.SignalRecord{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, signal := range p.signals {
+		if signal.WorkflowID == input.WorkflowID &&
+			signal.RunID == input.RunID &&
+			signal.Type == input.Type &&
+			signal.IdempotencyKey == input.IdempotencyKey {
+			return clone(signal), true
+		}
+	}
+	return durable.SignalRecord{}, false
 }
 
 func (p *Provider) ListChildren(_ context.Context) ([]durable.ChildRecord, error) {
@@ -1757,7 +1790,7 @@ func sortKey(parts ...any) string {
 	for _, part := range parts {
 		switch v := part.(type) {
 		case time.Time:
-			strs = append(strs, v.UTC().Format(time.RFC3339Nano))
+			strs = append(strs, v.UTC().Format("2006-01-02T15:04:05.000000000Z07:00"))
 		default:
 			strs = append(strs, fmt.Sprint(v))
 		}

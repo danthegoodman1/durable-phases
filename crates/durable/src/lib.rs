@@ -882,6 +882,8 @@ pub struct SignalRecord {
     pub r#type: String,
     pub payload: JsonValue,
     pub received_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub consumed_by_sequence: Option<u64>,
 }
 
@@ -1232,7 +1234,29 @@ impl ShardEngine {
         r#type: String,
         payload: JsonValue,
         received_at: DateTime<Utc>,
+        idempotency_key: Option<String>,
     ) -> Result<SignalRecord, WorkflowError> {
+        Ok(self
+            .append_signal_with_status(
+                workflow_id,
+                run_id,
+                r#type,
+                payload,
+                received_at,
+                idempotency_key,
+            )?
+            .0)
+    }
+
+    pub fn append_signal_with_status(
+        &mut self,
+        workflow_id: String,
+        run_id: String,
+        r#type: String,
+        payload: JsonValue,
+        received_at: DateTime<Utc>,
+        idempotency_key: Option<String>,
+    ) -> Result<(SignalRecord, bool), WorkflowError> {
         let state = &mut self.state;
         let key = instance_key(&workflow_id, &run_id);
         let Some(instance) = state.instances.get(&key) else {
@@ -1241,6 +1265,18 @@ impl ShardEngine {
                 workflow_id, run_id
             )));
         };
+
+        let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
+        if let Some(idempotency_key) = &idempotency_key {
+            if let Some(signal) = state.signals.iter().find(|signal| {
+                signal.workflow_id == workflow_id
+                    && signal.run_id == run_id
+                    && signal.r#type == r#type
+                    && signal.idempotency_key.as_deref() == Some(idempotency_key.as_str())
+            }) {
+                return Ok((signal.clone(), false));
+            }
+        }
 
         if instance.status != PersistedStatus::Running {
             return Err(WorkflowError::new(format!(
@@ -1256,6 +1292,7 @@ impl ShardEngine {
             r#type,
             payload,
             received_at,
+            idempotency_key,
             consumed_by_sequence: None,
         };
         state.next_signal_id += 1;
@@ -1264,7 +1301,7 @@ impl ShardEngine {
             refresh_signal_tasks_for_instance(state, &instance);
         }
         save_engine(state)?;
-        Ok(signal)
+        Ok((signal, true))
     }
 
     pub fn get_or_reserve_effect(
@@ -2362,7 +2399,10 @@ enum EngineOutput {
         instance: PersistedInstance,
     },
     OptionalInstance(Option<PersistedInstance>),
-    Signal(SignalRecord),
+    Signal {
+        record: SignalRecord,
+        created: bool,
+    },
     EffectReservation(EffectReservation),
     FailEffect(FailEffectResult),
     CommitCheckpoint {
@@ -2430,14 +2470,15 @@ impl EngineOperation {
                 Ok(EngineOutput::OptionalInstance(instance))
             }
             EngineOperation::AppendSignal(input) => engine
-                .append_signal(
+                .append_signal_with_status(
                     input.workflow_id,
                     input.run_id,
                     input.r#type,
                     input.payload,
                     input.received_at,
+                    input.idempotency_key,
                 )
-                .map(EngineOutput::Signal),
+                .map(|(record, created)| EngineOutput::Signal { record, created }),
             EngineOperation::CancelChild(input) => {
                 engine.cancel_child(input)?;
                 Ok(EngineOutput::Unit)
@@ -2978,6 +3019,25 @@ impl ShardRouter {
             }
         }
         Ok(instance)
+    }
+
+    async fn append_signal_with_status(
+        &self,
+        input: AppendSignalInput,
+    ) -> Result<(SignalRecord, bool), WorkflowError> {
+        let shard_id = self
+            .shard_for_ref(&InstanceRef::new(
+                input.workflow_id.clone(),
+                input.run_id.clone(),
+            ))
+            .await?;
+        let output = self
+            .execute(shard_id, EngineOperation::AppendSignal(input))
+            .await?;
+        let EngineOutput::Signal { record, created } = output else {
+            unreachable!("append signal operation returned wrong output");
+        };
+        Ok((record, created))
     }
 
     async fn snapshot_store(&self) -> Result<Store, WorkflowError> {
@@ -3555,10 +3615,11 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output =
-            <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input.clone()).await?;
-        self.append_journal_operation(JournalOperation::AppendSignal(input))
-            .await?;
+        let (output, created) = self.inner.append_signal_with_status(input.clone()).await?;
+        if created {
+            self.append_journal_operation(JournalOperation::AppendSignal(input))
+                .await?;
+        }
         Ok(output)
     }
 
@@ -3719,10 +3780,12 @@ impl ShardDurabilitySession for SqliteShardSession {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output = self.inner.append_signal(input.clone()).await?;
-        self.provider
-            .append_journal_operation(JournalOperation::AppendSignal(input))
-            .await?;
+        let (output, created) = self.inner.append_signal_with_status(input.clone()).await?;
+        if created {
+            self.provider
+                .append_journal_operation(JournalOperation::AppendSignal(input))
+                .await?;
+        }
         Ok(output)
     }
 
@@ -4005,6 +4068,7 @@ fn apply_journal_operation(
                 input.r#type,
                 input.payload,
                 input.received_at,
+                input.idempotency_key,
             )?;
         }
         JournalOperation::CancelChild(input) => {
@@ -5041,10 +5105,11 @@ impl DurabilityProvider for PostgresDurabilityProvider {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output =
-            <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input.clone()).await?;
-        self.append_postgres_operation(JournalOperation::AppendSignal(input))
-            .await?;
+        let (output, created) = self.inner.append_signal_with_status(input.clone()).await?;
+        if created {
+            self.append_postgres_operation(JournalOperation::AppendSignal(input))
+                .await?;
+        }
         Ok(output)
     }
 
@@ -5234,13 +5299,15 @@ impl ShardDurabilitySession for PostgresShardSession {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let output = self.inner.append_signal(input.clone()).await?;
-        self.provider
-            .append_postgres_operation_for_shard(
-                self.shard_id(),
-                JournalOperation::AppendSignal(input),
-            )
-            .await?;
+        let (output, created) = self.inner.append_signal_with_status(input.clone()).await?;
+        if created {
+            self.provider
+                .append_postgres_operation_for_shard(
+                    self.shard_id(),
+                    JournalOperation::AppendSignal(input),
+                )
+                .await?;
+        }
         Ok(output)
     }
 
@@ -5514,6 +5581,13 @@ impl ShardDurabilitySession for ShardRouterSession {
         <ShardRouter as DurabilityProvider>::append_signal(&self.router, input).await
     }
 
+    async fn append_signal_with_status(
+        &self,
+        input: AppendSignalInput,
+    ) -> Result<(SignalRecord, bool), WorkflowError> {
+        self.router.append_signal_with_status(input).await
+    }
+
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
         <ShardRouter as DurabilityProvider>::cancel_child(&self.router, input).await
     }
@@ -5756,19 +5830,7 @@ impl DurabilityProvider for ShardRouter {
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
-        let shard_id = self
-            .shard_for_ref(&InstanceRef::new(
-                input.workflow_id.clone(),
-                input.run_id.clone(),
-            ))
-            .await?;
-        let output = self
-            .execute(shard_id, EngineOperation::AppendSignal(input))
-            .await?;
-        let EngineOutput::Signal(output) = output else {
-            unreachable!("append signal operation returned wrong output");
-        };
-        Ok(output)
+        Ok(self.append_signal_with_status(input).await?.0)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
@@ -7110,6 +7172,8 @@ pub struct AppendSignalInput {
     pub r#type: String,
     pub payload: JsonValue,
     pub received_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7217,6 +7281,13 @@ pub trait ShardDurabilitySession: Send + Sync {
     ) -> Result<Option<PersistedInstance>, WorkflowError>;
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError>;
+
+    async fn append_signal_with_status(
+        &self,
+        input: AppendSignalInput,
+    ) -> Result<(SignalRecord, bool), WorkflowError> {
+        Ok((self.append_signal(input).await?, true))
+    }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError>;
 
@@ -7520,6 +7591,20 @@ impl DurableRuntime {
     where
         T: Serialize,
     {
+        self.signal_with_options(ref_, signal_type, payload, SignalOptions::default())
+            .await
+    }
+
+    pub async fn signal_with_options<T>(
+        &self,
+        ref_: &InstanceRef,
+        signal_type: impl Into<String>,
+        payload: T,
+        options: SignalOptions,
+    ) -> Result<SignalRecord, WorkflowError>
+    where
+        T: Serialize,
+    {
         self.provider
             .append_signal(AppendSignalInput {
                 workflow_id: ref_.workflow_id.clone(),
@@ -7527,6 +7612,7 @@ impl DurableRuntime {
                 r#type: signal_type.into(),
                 payload: serde_json::to_value(payload)?,
                 received_at: self.now(),
+                idempotency_key: options.idempotency_key,
             })
             .await
     }
@@ -8218,6 +8304,11 @@ impl DurableRuntime {
 pub struct StartOptions {
     pub workflow_id: Option<String>,
     pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SignalOptions {
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -9251,6 +9342,7 @@ pub mod testing {
             session.release().await.expect("release basic shard failed");
 
             assert_ordered_batch_claims_and_lean_reads(&provider, now).await;
+            assert_signal_idempotency(&provider, now).await;
             assert_lost_activation_lease_preserves_signal(&provider, now).await;
             assert_eager_effect_retry_reclaims_activation(&provider, now).await;
         }
@@ -9321,6 +9413,172 @@ pub mod testing {
                 .expect("release ordered shard failed");
         }
 
+        async fn assert_signal_idempotency<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            let ref_ = create_conformance_instance(
+                provider,
+                "signal-idempotency",
+                "signal_idempotency",
+                vec![DurableWait::Signal {
+                    name: "finish".to_string(),
+                    r#type: "finish".to_string(),
+                    scope: WaitScope::Phase,
+                }],
+                now,
+            )
+            .await;
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "idempotency-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("idempotency shard claim failed")
+                .expect("idempotency shard not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let first = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 1 }),
+                    received_at: now,
+                    idempotency_key: Some("request-1".to_string()),
+                })
+                .await
+                .expect("first signal append failed");
+            let duplicate = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 99 }),
+                    received_at: now + chrono::Duration::seconds(1),
+                    idempotency_key: Some("request-1".to_string()),
+                })
+                .await
+                .expect("duplicate signal append failed");
+            assert_eq!(duplicate, first);
+            assert_eq!(
+                provider
+                    .list_signals()
+                    .await
+                    .expect("list signals failed")
+                    .len(),
+                1
+            );
+            let second = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 2 }),
+                    received_at: now + chrono::Duration::seconds(2),
+                    idempotency_key: Some("request-2".to_string()),
+                })
+                .await
+                .expect("second signal append failed");
+            assert_ne!(second.signal_id, first.signal_id);
+            let claim = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("signal_idempotency".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("idempotency claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("idempotency signal activation missing");
+            let consume_signal_id = match &claim.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!("expected signal activation, got {:?}", other),
+            };
+            assert_eq!(consume_signal_id, first.signal_id);
+            let committed = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Running {
+                        common: serde_json::json!({}),
+                        phase: PhaseSnapshot {
+                            name: "waiting".to_string(),
+                            data: serde_json::json!({}),
+                        },
+                    },
+                    waits: vec![DurableWait::Signal {
+                        name: "finish".to_string(),
+                        r#type: "finish".to_string(),
+                        scope: WaitScope::Phase,
+                    }],
+                    now: now + chrono::Duration::seconds(2),
+                    consume_signal_id: Some(consume_signal_id),
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("idempotency checkpoint failed");
+            assert!(committed.ok, "idempotency commit conflict: {:?}", committed);
+            let after_consumed = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 100 }),
+                    received_at: now + chrono::Duration::seconds(5),
+                    idempotency_key: Some("request-1".to_string()),
+                })
+                .await
+                .expect("post-consumption duplicate append failed");
+            assert_eq!(after_consumed.signal_id, first.signal_id);
+            assert_eq!(after_consumed.idempotency_key.as_deref(), Some("request-1"));
+            assert_eq!(after_consumed.consumed_by_sequence, Some(1));
+            let next = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("signal_idempotency".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::seconds(5),
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("second idempotency claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("second idempotency signal activation missing");
+            let next_signal_id = match &next.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!("expected second signal activation, got {:?}", other),
+            };
+            assert_eq!(next_signal_id, second.signal_id);
+            session
+                .release()
+                .await
+                .expect("release idempotency shard failed");
+        }
+
         async fn assert_lost_activation_lease_preserves_signal<P>(provider: &P, now: DateTime<Utc>)
         where
             P: DurabilityProvider,
@@ -9344,6 +9602,7 @@ pub mod testing {
                     r#type: "finish".to_string(),
                     payload: serde_json::json!({ "ok": true }),
                     received_at: now,
+                    idempotency_key: None,
                 })
                 .await
                 .expect("append signal failed");

@@ -362,9 +362,12 @@ func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalI
 		return durable.SignalRecord{}, err
 	}
 	shardID := p.shardForRef(durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID})
+	created := true
 	return mutate(p, ctx, shardID, operation, func() (durable.SignalRecord, error) {
-		return p.engine.AppendSignal(ctx, input)
-	}, nil)
+		out, nextCreated, err := p.engine.AppendSignalWithStatus(ctx, input)
+		created = nextCreated
+		return out, err
+	}, func(durable.SignalRecord) bool { return created })
 }
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	operation, err := shardengine.NewJournalOperation("claimReadyActivations", shardengine.ClaimReadyActivationsOperationInput{ShardIDs: shardIDs, Input: input})
