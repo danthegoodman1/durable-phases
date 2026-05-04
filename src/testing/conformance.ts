@@ -698,6 +698,170 @@ export function describeDurabilityProviderConformance(
       })
     })
 
+    it("future-only signal waits ignore already-present signals without consuming them", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const ref = await createConformanceInstance(provider, {
+          workflowId: "future-signal",
+          waits: [runWait()],
+        })
+        const oldSignal = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 1 },
+          receivedAt: T0,
+          idempotencyKey: "old",
+        })
+
+        await ownShard(provider, "worker-a")
+        const runActivation = requireActivation(await claim(provider, "worker-a", T0))
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 0,
+            activationId: runActivation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: running({}, "waiting", {}),
+            waits: [futureSignalWait("finish", "finish", 0)],
+            now: T1,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+
+        await expect(
+          provider.appendSignal({
+            ...ref,
+            type: "finish",
+            payload: { index: 99 },
+            receivedAt: T2,
+            idempotencyKey: "old",
+          }),
+        ).resolves.toMatchObject({ signalId: oldSignal.signalId })
+        await expect(claim(provider, "worker-a", T2)).resolves.toMatchObject({ activation: null })
+
+        const newSignal = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 2 },
+          receivedAt: T2,
+          idempotencyKey: "new",
+        })
+        const activation = requireSignalEventActivation(await claim(provider, "worker-a", T2))
+        expect(activation.event.consumeSignalId).toBe(newSignal.signalId)
+
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 1,
+            activationId: activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { ok: true } },
+            waits: [],
+            now: T2,
+            consumeSignalId: activation.event.consumeSignalId,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 2 })
+
+        const signals = await provider.listSignals()
+        expect(signals.find((signal) => signal.signalId === oldSignal.signalId)?.consumedBySequence)
+          .toBeUndefined()
+        expect(signals.find((signal) => signal.signalId === newSignal.signalId)?.consumedBySequence)
+          .toBe(2)
+      })
+    })
+
+    it("preserves future-only signal cursors while the same wait remains active", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const ref = await createConformanceInstance(provider, {
+          workflowId: "future-signal-cursor",
+          waits: [futureSignalWait("finish"), { kind: "timer", name: "tick", fireAt: T0 }],
+        })
+        await ownShard(provider, "worker-a")
+        const timerActivation = requireEventActivation(await claim(provider, "worker-a", T0))
+        expect(timerActivation.event.kind).toBe("timer")
+
+        const signal = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 1 },
+          receivedAt: T1,
+        })
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 0,
+            activationId: timerActivation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: running({}, "waiting", {}),
+            waits: [futureSignalWait("finish", "finish", 999)],
+            now: T1,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+
+        const signalActivation = requireSignalEventActivation(await claim(provider, "worker-a", T1))
+        expect(signalActivation.event.consumeSignalId).toBe(signal.signalId)
+      })
+    })
+
+    it("re-entering a future-only signal wait starts a fresh cursor", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const ref = await createConformanceInstance(provider, {
+          workflowId: "future-signal-reentry",
+          waits: [futureSignalWait("finish"), { kind: "timer", name: "leave", fireAt: T0 }],
+        })
+        await ownShard(provider, "worker-a")
+        const leaveActivation = requireEventActivation(await claim(provider, "worker-a", T0))
+        expect(leaveActivation.event.kind).toBe("timer")
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 0,
+            activationId: leaveActivation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: running({}, "inactive", {}),
+            waits: [runWait(T1)],
+            now: T0,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+
+        const inactiveSignal = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 1 },
+          receivedAt: T1,
+        })
+        const runActivation = requireActivation(await claim(provider, "worker-a", T1))
+        await expect(
+          provider.commitCheckpoint({
+            ...ref,
+            expectedSequence: 1,
+            activationId: runActivation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: running({}, "waiting", {}),
+            waits: [futureSignalWait("finish")],
+            now: T2,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 2 })
+        await expect(claim(provider, "worker-a", T2)).resolves.toMatchObject({ activation: null })
+
+        const newSignal = await provider.appendSignal({
+          ...ref,
+          type: "finish",
+          payload: { index: 2 },
+          receivedAt: T5,
+        })
+        const activation = requireSignalEventActivation(await claim(provider, "worker-a", T5))
+        expect(activation.event.consumeSignalId).toBe(newSignal.signalId)
+        expect(activation.event.consumeSignalId).not.toBe(inactiveSignal.signalId)
+      })
+    })
+
     it("rejects lost activation leases and leaves claimed signals consumable", async () => {
       await withStore(factory, async (store) => {
         const providerA = await store.createProvider()
@@ -1647,6 +1811,17 @@ function runWait(readyAt = T0): DurableWait {
 
 function signalWait(type: string, name = type): DurableWait {
   return { kind: "signal", name, type, scope: "phase" }
+}
+
+function futureSignalWait(type: string, name = type, afterSignalSequence?: number): DurableWait {
+  return {
+    kind: "signal",
+    name,
+    type,
+    scope: "phase",
+    delivery: "future",
+    ...(afterSignalSequence === undefined ? {} : { afterSignalSequence }),
+  }
 }
 
 function childWait(

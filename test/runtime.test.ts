@@ -3330,6 +3330,57 @@ describe("durable workflow PoC", () => {
     expect(await provider.listSignals()).toHaveLength(1)
   })
 
+  it("supports future-only signal waits from the workflow signal API", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const FutureSignalWorkflow = defineWorkflow({
+      name: "future_signal_runtime",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.number() }),
+      initial() {
+        return start({ phase: "boot", data: {} })
+      },
+      phases: {
+        boot: phase({
+          run: async () => go("waiting", {}),
+        }),
+        waiting: phase({
+          on: {
+            finish: signal(
+              z.object({ value: z.number() }),
+              async ({ event }) => complete({ value: event.value }),
+              { delivery: "future" },
+            ),
+          },
+        }),
+      },
+    })
+    const runtime = new DurableRuntime(provider, { workflows: [FutureSignalWorkflow] })
+    const ref = await runtime.start(FutureSignalWorkflow, {}, { workflowId: "future-signal-runtime" })
+    const oldSignal = await runtime.signal(FutureSignalWorkflow, ref, "finish", { value: 1 })
+
+    await runtime.drain({ maxActivations: 1 })
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "running",
+      phase: { name: "waiting" },
+      waits: [{ kind: "signal", name: "finish", type: "finish", scope: "phase", delivery: "future" }],
+    })
+    expect(await runtime.drain()).toEqual({ activations: 0 })
+
+    const newSignal = await runtime.signal(FutureSignalWorkflow, ref, "finish", { value: 2 })
+    await runtime.drain()
+    expect(await provider.loadInstance(ref)).toMatchObject({
+      status: "completed",
+      output: { value: 2 },
+    })
+    const signals = await provider.listSignals()
+    expect(signals.find((signal) => signal.signalId === oldSignal.signalId)?.consumedBySequence)
+      .toBeUndefined()
+    expect(signals.find((signal) => signal.signalId === newSignal.signalId)?.consumedBySequence)
+      .toBe(2)
+  })
+
   it("requires shard ownership and lets expired shard leases be reclaimed", async () => {
     const path = await storePath()
     const provider = testProvider(path)

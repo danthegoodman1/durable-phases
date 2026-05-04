@@ -297,7 +297,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       status: "running",
       common: this.clone(input.common),
       phase: this.clone(input.phase),
-      waits: this.clone(input.waits),
+      waits: this.stampSignalWaits(input.waits),
       createdAt: input.now,
       updatedAt: input.now,
       ...(input.parent ? { parent: this.clone(input.parent) } : {}),
@@ -982,7 +982,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
         status: "running",
         common: this.clone(input.next.common),
         phase: this.clone(input.next.phase),
-        waits: this.clone(input.waits),
+        waits: this.stampSignalWaits(input.waits, current.waits),
       }
     }
     if (input.next.status === "completed") {
@@ -1007,6 +1007,48 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       error: this.clone(input.next.error),
       waits: [],
     }
+  }
+
+  private stampSignalWaits(waits: DurableWait[], previousWaits: DurableWait[] = []): DurableWait[] {
+    return waits.map((wait) => {
+      if (wait.kind !== "signal") {
+        return this.clone(wait)
+      }
+
+      const delivery = signalDelivery(wait)
+      if (delivery !== "future") {
+        const stamped = this.clone(wait)
+        delete stamped.afterSignalSequence
+        return stamped
+      }
+
+      const previous = previousWaits.find((
+        candidate,
+      ): candidate is Extract<DurableWait, { kind: "signal" }> =>
+        candidate.kind === "signal" &&
+        signalDelivery(candidate) === "future" &&
+        candidate.name === wait.name &&
+        candidate.type === wait.type &&
+        candidate.scope === wait.scope &&
+        candidate.afterSignalSequence !== undefined
+      )
+
+      return {
+        ...this.clone(wait),
+        delivery,
+        afterSignalSequence: previous?.afterSignalSequence ?? this.signalCounter,
+      }
+    })
+  }
+
+  private signalIsAfterWaitCursor(
+    signal: SignalRecord,
+    wait: Extract<DurableWait, { kind: "signal" }>,
+  ): boolean {
+    if (signalDelivery(wait) !== "future") {
+      return true
+    }
+    return signalSequence(signal.signalId) > (wait.afterSignalSequence ?? 0)
   }
 
   private replaceTasksForRef(workflowId: string, runId: string): void {
@@ -1087,7 +1129,8 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
           record.workflowId === instance.workflowId &&
           record.runId === instance.runId &&
           record.type === wait.type &&
-          record.consumedBySequence === undefined,
+          record.consumedBySequence === undefined &&
+          this.signalIsAfterWaitCursor(record, wait),
         )
         .sort((left, right) => sortKey(left.receivedAt, left.type, left.signalId)
           .localeCompare(sortKey(right.receivedAt, right.type, right.signalId)))[0]
@@ -1433,7 +1476,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       status: "running",
       common: this.clone(start.common),
       phase: this.clone(start.phase),
-      waits: this.clone(start.waits),
+      waits: this.stampSignalWaits(start.waits),
       createdAt: now,
       updatedAt: now,
       parent: {
@@ -2060,6 +2103,15 @@ function activationIdFromParts(
 
 function compareTasks(left: MemoryTask, right: MemoryTask): number {
   return left.sortKey.localeCompare(right.sortKey)
+}
+
+function signalDelivery(wait: Extract<DurableWait, { kind: "signal" }>): "mailbox" | "future" {
+  return wait.delivery ?? "mailbox"
+}
+
+function signalSequence(signalId: string): number {
+  const match = /^signal-(\d+)$/.exec(signalId)
+  return match ? Number(match[1]) : Number.POSITIVE_INFINITY
 }
 
 function refKey(ref: { workflowId: string; runId: string }): RefKey {

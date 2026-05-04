@@ -23,6 +23,9 @@ mod kw {
     syn::custom_keyword!(run);
     syn::custom_keyword!(on);
     syn::custom_keyword!(signal);
+    syn::custom_keyword!(delivery);
+    syn::custom_keyword!(future);
+    syn::custom_keyword!(mailbox);
     syn::custom_keyword!(timer);
     syn::custom_keyword!(child);
     syn::custom_keyword!(query);
@@ -75,9 +78,17 @@ struct WaitDef {
 }
 
 enum WaitKind {
-    Signal(Type),
+    Signal {
+        event_ty: Type,
+        delivery: SignalDeliveryOption,
+    },
     Timer(Expr),
     Child(Expr),
+}
+
+enum SignalDeliveryOption {
+    Mailbox,
+    Future,
 }
 
 struct HandlerDef {
@@ -249,7 +260,8 @@ fn parse_waits(input: ParseStream<'_>) -> Result<Vec<WaitDef>> {
             input.parse::<Token![<]>()?;
             let event_ty = input.parse::<Type>()?;
             input.parse::<Token![>]>()?;
-            WaitKind::Signal(event_ty)
+            let delivery = parse_signal_delivery(input)?;
+            WaitKind::Signal { event_ty, delivery }
         } else if input.peek(kw::timer) {
             input.parse::<kw::timer>()?;
             let args;
@@ -273,6 +285,30 @@ fn parse_waits(input: ParseStream<'_>) -> Result<Vec<WaitDef>> {
         parse_optional_comma(input)?;
     }
     Ok(waits)
+}
+
+fn parse_signal_delivery(input: ParseStream<'_>) -> Result<SignalDeliveryOption> {
+    if !input.peek(syn::token::Paren) {
+        return Ok(SignalDeliveryOption::Mailbox);
+    }
+
+    let args;
+    parenthesized!(args in input);
+    args.parse::<kw::delivery>()?;
+    args.parse::<Token![=]>()?;
+    let delivery = if args.peek(kw::future) {
+        args.parse::<kw::future>()?;
+        SignalDeliveryOption::Future
+    } else if args.peek(kw::mailbox) {
+        args.parse::<kw::mailbox>()?;
+        SignalDeliveryOption::Mailbox
+    } else {
+        return Err(args.error("expected future or mailbox"));
+    };
+    if !args.is_empty() {
+        return Err(args.error("unexpected signal option"));
+    }
+    Ok(delivery)
 }
 
 fn parse_async_handler(input: ParseStream<'_>) -> Result<HandlerDef> {
@@ -438,9 +474,9 @@ fn expand_workflow(workflow: WorkflowDef) -> Result<TokenStream2> {
     let global_wait_specs = workflow.global.iter().map(|wait| {
         let wait_name_lit = LitStr::new(&wait.name.to_string(), wait.name.span());
         match &wait.kind {
-            WaitKind::Signal(event_ty) => quote! {
-                waits.push(::durable::WaitSpec::signal::<#event_ty>(#wait_name_lit));
-            },
+            WaitKind::Signal { event_ty, delivery } => {
+                expand_signal_wait_spec(event_ty, delivery, &wait_name_lit)
+            }
             WaitKind::Timer(_) | WaitKind::Child(_) => {
                 syn::Error::new(wait.name.span(), "global waits only support signals")
                     .to_compile_error()
@@ -605,12 +641,33 @@ fn phase_variant_ident(phase_name: &Ident) -> Ident {
     Ident::new(&output, phase_name.span())
 }
 
+fn expand_signal_wait_spec(
+    event_ty: &Type,
+    delivery: &SignalDeliveryOption,
+    wait_name_lit: &LitStr,
+) -> TokenStream2 {
+    match delivery {
+        SignalDeliveryOption::Mailbox => quote! {
+            waits.push(::durable::WaitSpec::signal::<#event_ty>(#wait_name_lit));
+        },
+        SignalDeliveryOption::Future => quote! {
+            waits.push(::durable::WaitSpec::signal_with_options::<#event_ty>(
+                #wait_name_lit,
+                ::durable::SignalWaitOptions {
+                    delivery: ::durable::SignalDelivery::Future,
+                    ..::durable::SignalWaitOptions::default()
+                },
+            ));
+        },
+    }
+}
+
 fn expand_wait_spec(wait: &WaitDef) -> TokenStream2 {
     let wait_name_lit = LitStr::new(&wait.name.to_string(), wait.name.span());
     match &wait.kind {
-        WaitKind::Signal(event_ty) => quote! {
-            waits.push(::durable::WaitSpec::signal::<#event_ty>(#wait_name_lit));
-        },
+        WaitKind::Signal { event_ty, delivery } => {
+            expand_signal_wait_spec(event_ty, delivery, &wait_name_lit)
+        }
         WaitKind::Timer(expr) => quote! {
             if let Some(fire_at) = ::durable::IntoTimerFireAt::into_fire_at(#expr) {
                 waits.push(::durable::WaitSpec::timer(#wait_name_lit, fire_at));
@@ -633,7 +690,7 @@ fn expand_phase_event_arm(
     let wait_name_lit = LitStr::new(&wait.name.to_string(), wait.name.span());
     let block = &wait.handler.block;
     let decode_event = match &wait.kind {
-        WaitKind::Signal(event_ty) => quote! {
+        WaitKind::Signal { event_ty, .. } => quote! {
             let event: #event_ty = ::durable::decode_signal_event(event)?;
         },
         WaitKind::Timer(_) => quote! {
@@ -666,7 +723,7 @@ fn expand_global_event_arm(wait: &WaitDef) -> TokenStream2 {
     let wait_name_lit = LitStr::new(&wait.name.to_string(), wait.name.span());
     let block = &wait.handler.block;
     match &wait.kind {
-        WaitKind::Signal(event_ty) => quote! {
+        WaitKind::Signal { event_ty, .. } => quote! {
             #wait_name_lit => {
                 let event: #event_ty = ::durable::decode_signal_event(event)?;
                 let _ = &ctx;

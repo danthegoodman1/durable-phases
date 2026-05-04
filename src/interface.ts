@@ -8,12 +8,20 @@ import type {
   JsonValue,
   PhaseSnapshot,
   SerializedError,
+  SignalDelivery,
   StartWorkflowResult,
 } from "./workflow.js"
 
 export type DurableWait =
   | { kind: "run"; name: "__run"; readyAt: string }
-  | { kind: "signal"; name: string; type: string; scope: "phase" | "global" }
+  | {
+      kind: "signal"
+      name: string
+      type: string
+      scope: "phase" | "global"
+      delivery?: SignalDelivery
+      afterSignalSequence?: number
+    }
   | { kind: "timer"; name: string; fireAt: string }
   | {
       kind: "child"

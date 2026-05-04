@@ -177,16 +177,29 @@ type LoadInstanceOptions struct {
 }
 
 type DurableWait struct {
-	Kind            string    `json:"kind"`
-	Name            string    `json:"name"`
-	ReadyAt         time.Time `json:"readyAt,omitempty"`
-	Type            string    `json:"type,omitempty"`
-	Scope           string    `json:"scope,omitempty"`
-	FireAt          time.Time `json:"fireAt,omitempty"`
-	WorkflowName    string    `json:"workflowName,omitempty"`
-	WorkflowVersion int       `json:"workflowVersion,omitempty"`
-	WorkflowID      string    `json:"workflowId,omitempty"`
-	RunID           string    `json:"runId,omitempty"`
+	Kind                string         `json:"kind"`
+	Name                string         `json:"name"`
+	ReadyAt             time.Time      `json:"readyAt,omitempty"`
+	Type                string         `json:"type,omitempty"`
+	Scope               string         `json:"scope,omitempty"`
+	Delivery            SignalDelivery `json:"delivery,omitempty"`
+	AfterSignalSequence *int64         `json:"afterSignalSequence,omitempty"`
+	FireAt              time.Time      `json:"fireAt,omitempty"`
+	WorkflowName        string         `json:"workflowName,omitempty"`
+	WorkflowVersion     int            `json:"workflowVersion,omitempty"`
+	WorkflowID          string         `json:"workflowId,omitempty"`
+	RunID               string         `json:"runId,omitempty"`
+}
+
+type SignalDelivery string
+
+const (
+	SignalDeliveryMailbox SignalDelivery = "mailbox"
+	SignalDeliveryFuture  SignalDelivery = "future"
+)
+
+type SignalWaitOptions struct {
+	Delivery SignalDelivery
 }
 
 func RunWait(readyAt time.Time) DurableWait {
@@ -194,11 +207,15 @@ func RunWait(readyAt time.Time) DurableWait {
 }
 
 func SignalWait(name, typ string, global bool) DurableWait {
+	return SignalWaitWithOptions(name, typ, global, SignalWaitOptions{})
+}
+
+func SignalWaitWithOptions(name, typ string, global bool, options SignalWaitOptions) DurableWait {
 	scope := "phase"
 	if global {
 		scope = "global"
 	}
-	return DurableWait{Kind: "signal", Name: name, Type: typ, Scope: scope}
+	return DurableWait{Kind: "signal", Name: name, Type: typ, Scope: scope, Delivery: options.Delivery}
 }
 
 func TimerWait(name string, fireAt time.Time) DurableWait {

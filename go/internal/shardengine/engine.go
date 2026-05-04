@@ -250,7 +250,7 @@ func (p *Provider) createInstanceLocked(input durable.CreateInstanceInput) (dura
 		Status:          "running",
 		Common:          clone(input.Common),
 		Phase:           ptr(clone(input.Phase)),
-		Waits:           clone(input.Waits),
+		Waits:           p.stampSignalWaitsLocked(input.Waits, nil),
 		CreatedAt:       input.Now,
 		UpdatedAt:       input.Now,
 		Parent:          clonePtr(input.Parent),
@@ -921,7 +921,7 @@ func (p *Provider) nextInstanceLocked(current durable.PersistedInstance, input d
 		base.Status = "running"
 		base.Common = clone(input.Next.Common)
 		base.Phase = clonePtr(input.Next.Phase)
-		base.Waits = clone(input.Waits)
+		base.Waits = p.stampSignalWaitsLocked(input.Waits, current.Waits)
 	case "completed":
 		base.Status = "completed"
 		base.Output = clone(input.Next.Output)
@@ -933,6 +933,38 @@ func (p *Provider) nextInstanceLocked(current durable.PersistedInstance, input d
 		base.Error = input.Next.Error
 	}
 	return base
+}
+
+func (p *Provider) stampSignalWaitsLocked(waits []durable.DurableWait, previousWaits []durable.DurableWait) []durable.DurableWait {
+	out := clone(waits)
+	for i := range out {
+		wait := &out[i]
+		if wait.Kind != "signal" {
+			continue
+		}
+		if signalDelivery(*wait) != durable.SignalDeliveryFuture {
+			wait.AfterSignalSequence = nil
+			continue
+		}
+		var after *int64
+		for _, previous := range previousWaits {
+			if previous.Kind == "signal" &&
+				signalDelivery(previous) == durable.SignalDeliveryFuture &&
+				previous.Name == wait.Name &&
+				previous.Type == wait.Type &&
+				previous.Scope == wait.Scope &&
+				previous.AfterSignalSequence != nil {
+				after = ptr(*previous.AfterSignalSequence)
+				break
+			}
+		}
+		if after == nil {
+			after = ptr(p.signalCounter)
+		}
+		wait.Delivery = durable.SignalDeliveryFuture
+		wait.AfterSignalSequence = after
+	}
+	return out
 }
 
 func (p *Provider) replaceTasksForInstanceLocked(instance durable.PersistedInstance) {
@@ -991,7 +1023,7 @@ func (p *Provider) insertTaskForWaitLocked(instance durable.PersistedInstance, w
 	case "signal":
 		var signals []durable.SignalRecord
 		for _, signal := range p.signals {
-			if signal.WorkflowID == instance.WorkflowID && signal.RunID == instance.RunID && signal.Type == wait.Type && signal.ConsumedBySequence == nil {
+			if signal.WorkflowID == instance.WorkflowID && signal.RunID == instance.RunID && signal.Type == wait.Type && signal.ConsumedBySequence == nil && signalIsAfterWaitCursor(signal, wait) {
 				signals = append(signals, signal)
 			}
 		}
@@ -1360,7 +1392,7 @@ func (p *Provider) writeChildStartLocked(start durable.CheckpointChildStart, now
 		Status:          "running",
 		Common:          clone(start.Common),
 		Phase:           ptr(clone(start.Phase)),
-		Waits:           clone(start.Waits),
+		Waits:           p.stampSignalWaitsLocked(start.Waits, nil),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		Parent:          &durable.InstanceParent{WorkflowID: parentWorkflowID, RunID: parentRunID, ChildRecordID: childRecordID},
@@ -1796,6 +1828,33 @@ func sortKey(parts ...any) string {
 		}
 	}
 	return strings.Join(strs, "\x00")
+}
+
+func signalDelivery(wait durable.DurableWait) durable.SignalDelivery {
+	if wait.Delivery == "" {
+		return durable.SignalDeliveryMailbox
+	}
+	return wait.Delivery
+}
+
+func signalIsAfterWaitCursor(signal durable.SignalRecord, wait durable.DurableWait) bool {
+	if signalDelivery(wait) != durable.SignalDeliveryFuture {
+		return true
+	}
+	var after int64
+	if wait.AfterSignalSequence != nil {
+		after = *wait.AfterSignalSequence
+	}
+	return signalSequence(signal.SignalID) > after
+}
+
+func signalSequence(signalID string) int64 {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	sequence, err := strconv.ParseInt(strings.TrimPrefix(signalID, "signal-"), 10, 64)
+	if err != nil || !strings.HasPrefix(signalID, "signal-") {
+		return maxInt64
+	}
+	return sequence
 }
 
 func addIndex(index map[string]map[string]struct{}, key, value string) {

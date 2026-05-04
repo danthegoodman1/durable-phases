@@ -2364,7 +2364,14 @@ export class DurableRuntime {
 
     const waits: DurableWait[] = []
     for (const name of Object.keys(workflow.on ?? {}).sort()) {
-      waits.push({ kind: "signal", name, type: name, scope: "global" })
+      const wait = workflow.on?.[name]
+      waits.push({
+        kind: "signal",
+        name,
+        type: name,
+        scope: "global",
+        ...(wait?.delivery === "future" ? { delivery: wait.delivery } : {}),
+      })
     }
 
     const phaseDefinition = workflow.phases[snapshot.phase.name]
@@ -2381,7 +2388,13 @@ export class DurableRuntime {
       left.localeCompare(right),
     )) {
       if (wait.kind === "signal") {
-        waits.push({ kind: "signal", name, type: name, scope: "phase" })
+        waits.push({
+          kind: "signal",
+          name,
+          type: name,
+          scope: "phase",
+          ...(wait.delivery === "future" ? { delivery: wait.delivery } : {}),
+        })
       } else if (wait.kind === "timer") {
         const fireAt = wait.selector({
           common: snapshot.common,

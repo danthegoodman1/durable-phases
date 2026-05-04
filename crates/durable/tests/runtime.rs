@@ -2,7 +2,7 @@ mod examples;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use durable::{
-    complete, start, workflow, ActivityDurability, ActivityOptions, AppendSignalInput,
+    complete, go, start, workflow, ActivityDurability, ActivityOptions, AppendSignalInput,
     CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput, ClaimShardTasksInput,
     CommitCheckpointInput, ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider,
     DurableRuntime, DurableWait, EffectReservation, FailEffectInput, FailEffectResult,
@@ -143,6 +143,56 @@ workflow! {
             on {
                 wake: timer(data.fire_at.clone()) async |data| {
                     complete!(StepTimerOutput { fire_at: data.fire_at })
+                },
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FutureSignalInput {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FutureSignalOutput {
+    value: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FutureSignalBoot {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FutureSignalWaiting {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FutureSignalEvent {
+    value: i32,
+}
+
+workflow! {
+    pub workflow FutureSignalMacroWorkflow {
+        name: "future_signal_macro",
+        version: 1,
+        input: FutureSignalInput,
+        output: FutureSignalOutput,
+        common: Empty,
+
+        initial(_input) {
+            start! {
+                common: Empty {},
+                phase: boot(FutureSignalBoot {}),
+            }
+        }
+
+        phase boot(_data: FutureSignalBoot) {
+            run async |_ctx| {
+                go!(waiting(FutureSignalWaiting {}))
+            }
+        }
+
+        phase waiting(_data: FutureSignalWaiting) {
+            on {
+                finish: signal<FutureSignalEvent>(delivery = future) async |event| {
+                    complete!(FutureSignalOutput { value: event.value })
                 },
             }
         }
@@ -838,6 +888,80 @@ async fn runtime_signal_with_options_deduplicates_idempotency_key() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn workflow_macro_supports_future_only_signal_waits() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+
+    let ref_ = runtime
+        .start::<FutureSignalMacroWorkflow>(
+            FutureSignalInput {},
+            StartOptions {
+                workflow_id: Some("future-signal-macro".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let old_signal = runtime
+        .signal(&ref_, "finish", FutureSignalEvent { value: 1 })
+        .await
+        .unwrap();
+
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+    let waiting = load_runtime_instance(&runtime, &ref_).await;
+    assert_eq!(waiting.phase.as_ref().unwrap().name, "waiting");
+    assert_eq!(waiting.waits.len(), 1);
+    match &waiting.waits[0] {
+        DurableWait::Signal {
+            delivery,
+            after_signal_sequence,
+            ..
+        } => {
+            assert_eq!(*delivery, durable::SignalDelivery::Future);
+            assert_eq!(*after_signal_sequence, Some(1));
+        }
+        other => panic!("expected future signal wait, got {:?}", other),
+    }
+
+    let drained = runtime.drain(DrainOptions::default()).await.unwrap();
+    assert_eq!(drained.activations, 0);
+    let new_signal = runtime
+        .signal(&ref_, "finish", FutureSignalEvent { value: 2 })
+        .await
+        .unwrap();
+    runtime.drain(DrainOptions::default()).await.unwrap();
+    let completed = load_runtime_instance(&runtime, &ref_).await;
+    assert_eq!(completed.status, PersistedStatus::Completed);
+    assert_eq!(completed.output.unwrap()["value"], 2);
+
+    let signals = runtime_signals(&runtime).await;
+    assert_eq!(
+        signals
+            .iter()
+            .find(|signal| signal.signal_id == old_signal.signal_id)
+            .unwrap()
+            .consumed_by_sequence,
+        None
+    );
+    assert_eq!(
+        signals
+            .iter()
+            .find(|signal| signal.signal_id == new_signal.signal_id)
+            .unwrap()
+            .consumed_by_sequence,
+        Some(2)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn uses_checkpoint_for_bounded_loop_pattern() {
     let _guard = TEST_LOCK.lock().unwrap();
     parent_child::reset_processed();
@@ -1180,6 +1304,8 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
                 name: "continue".to_string(),
                 r#type: "continue".to_string(),
                 scope: durable::WaitScope::Phase,
+                delivery: durable::SignalDelivery::Mailbox,
+                after_signal_sequence: None,
             }],
             now,
             parent: None,
@@ -1624,6 +1750,8 @@ async fn shard_directory_routes_signals_to_custom_partition_shard() {
                 name: "continue".to_string(),
                 r#type: "continue".to_string(),
                 scope: durable::WaitScope::Phase,
+                delivery: durable::SignalDelivery::Mailbox,
+                after_signal_sequence: None,
             }],
             now,
             parent: None,

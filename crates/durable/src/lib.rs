@@ -162,6 +162,8 @@ pub enum WaitSpec {
     Signal {
         name: String,
         signal_type: String,
+        #[serde(default, skip_serializing_if = "SignalDelivery::is_mailbox")]
+        delivery: SignalDelivery,
     },
     Timer {
         name: String,
@@ -181,9 +183,17 @@ impl WaitSpec {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
     {
+        Self::signal_with_options::<T>(name, SignalWaitOptions::default())
+    }
+
+    pub fn signal_with_options<T>(name: impl Into<String>, options: SignalWaitOptions) -> Self
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
         Self::Signal {
             name: name.into(),
             signal_type: type_name::<T>().to_string(),
+            delivery: options.delivery,
         }
     }
 
@@ -853,6 +863,10 @@ pub enum DurableWait {
         name: String,
         r#type: String,
         scope: WaitScope,
+        #[serde(default, skip_serializing_if = "SignalDelivery::is_mailbox")]
+        delivery: SignalDelivery,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_signal_sequence: Option<u64>,
     },
     Timer {
         name: String,
@@ -872,6 +886,30 @@ pub enum DurableWait {
 pub enum WaitScope {
     Phase,
     Global,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalDelivery {
+    Mailbox,
+    Future,
+}
+
+impl Default for SignalDelivery {
+    fn default() -> Self {
+        Self::Mailbox
+    }
+}
+
+impl SignalDelivery {
+    fn is_mailbox(&self) -> bool {
+        matches!(self, Self::Mailbox)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignalWaitOptions {
+    pub delivery: SignalDelivery,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1092,6 +1130,7 @@ impl ShardEngine {
             }
         }
 
+        let waits = stamp_signal_waits(&input.waits, &[], current_signal_counter(state));
         let instance = PersistedInstance {
             workflow_name: input.workflow_name,
             workflow_version: input.workflow_version,
@@ -1105,7 +1144,7 @@ impl ShardEngine {
             output: None,
             error: None,
             cancel_reason: None,
-            waits: input.waits,
+            waits,
             effects: Vec::new(),
             created_at: input.now,
             updated_at: input.now,
@@ -1158,6 +1197,7 @@ impl ShardEngine {
         let child_record_id = format!("child-{}", state.next_child_id);
         state.next_child_id += 1;
 
+        let waits = stamp_signal_waits(&input.waits, &[], current_signal_counter(state));
         let child_instance = PersistedInstance {
             workflow_name: input.workflow_name.clone(),
             workflow_version: input.workflow_version,
@@ -1171,7 +1211,7 @@ impl ShardEngine {
             output: None,
             error: None,
             cancel_reason: None,
-            waits: input.waits,
+            waits,
             effects: Vec::new(),
             created_at: input.now,
             updated_at: input.now,
@@ -1591,6 +1631,11 @@ impl ShardEngine {
 
             instance.sequence
         };
+        let current_waits = state
+            .instances
+            .get(&key)
+            .map(|instance| instance.waits.clone())
+            .unwrap_or_default();
 
         let signal_index = if let Some(signal_id) = &input.consume_signal_id {
             let index = state.signals.iter().position(|signal| {
@@ -1682,6 +1727,8 @@ impl ShardEngine {
         }
 
         let next_sequence = current_sequence + 1;
+        let stamped_waits =
+            stamp_signal_waits(&input.waits, &current_waits, current_signal_counter(state));
         let (parent, instance_status, output, error, cancel_reason, updated_instance) = {
             let instance = state
                 .instances
@@ -1690,7 +1737,7 @@ impl ShardEngine {
 
             instance.sequence = next_sequence;
             instance.workflow_version = input.workflow_version;
-            instance.waits = input.waits;
+            instance.waits = stamped_waits;
             instance.updated_at = input.now;
 
             match input.next {
@@ -1785,6 +1832,7 @@ impl ShardEngine {
             if start.conflict_policy == ConflictPolicy::TerminateExisting {
                 delete_instance_records(state, &start.workflow_id, &start.run_id);
             }
+            let waits = stamp_signal_waits(&start.waits, &[], current_signal_counter(state));
             let child_instance = PersistedInstance {
                 workflow_name: start.workflow_name.clone(),
                 workflow_version: start.workflow_version,
@@ -1798,7 +1846,7 @@ impl ShardEngine {
                 output: None,
                 error: None,
                 cancel_reason: None,
-                waits: start.waits,
+                waits,
                 effects: Vec::new(),
                 created_at: input.now,
                 updated_at: input.now,
@@ -6166,6 +6214,55 @@ fn replace_tasks_for_instance(state: &mut Store, instance: &PersistedInstance) {
     }
 }
 
+fn current_signal_counter(state: &Store) -> u64 {
+    state.next_signal_id.saturating_sub(1)
+}
+
+fn stamp_signal_waits(
+    waits: &[DurableWait],
+    previous_waits: &[DurableWait],
+    current_signal_counter: u64,
+) -> Vec<DurableWait> {
+    waits
+        .iter()
+        .cloned()
+        .map(|mut wait| {
+            if let DurableWait::Signal {
+                name,
+                r#type,
+                scope,
+                delivery,
+                after_signal_sequence,
+            } = &mut wait
+            {
+                if *delivery != SignalDelivery::Future {
+                    *after_signal_sequence = None;
+                    return wait;
+                }
+
+                let previous_after = previous_waits.iter().find_map(|previous| match previous {
+                    DurableWait::Signal {
+                        name: previous_name,
+                        r#type: previous_type,
+                        scope: previous_scope,
+                        delivery: SignalDelivery::Future,
+                        after_signal_sequence: Some(previous_after),
+                    } if previous_name == name
+                        && previous_type == r#type
+                        && previous_scope == scope =>
+                    {
+                        Some(*previous_after)
+                    }
+                    _ => None,
+                });
+
+                *after_signal_sequence = Some(previous_after.unwrap_or(current_signal_counter));
+            }
+            wait
+        })
+        .collect()
+}
+
 fn refresh_signal_tasks_for_instance(state: &mut Store, instance: &PersistedInstance) {
     let ids = state
         .tasks
@@ -6326,6 +6423,7 @@ fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &
                         && candidate.run_id == instance.run_id
                         && candidate.r#type == *r#type
                         && candidate.consumed_by_sequence.is_none()
+                        && signal_is_after_wait_cursor(candidate, wait)
                 })
                 .min_by(compare_signals)
                 .cloned()
@@ -8881,10 +8979,12 @@ where
 
 fn wait_spec_to_durable(wait: WaitSpec, scope: WaitScope) -> DurableWait {
     match wait {
-        WaitSpec::Signal { name, .. } => DurableWait::Signal {
+        WaitSpec::Signal { name, delivery, .. } => DurableWait::Signal {
             r#type: name.clone(),
             name,
             scope,
+            delivery,
+            after_signal_sequence: None,
         },
         WaitSpec::Timer { name, fire_at } => DurableWait::Timer { name, fire_at },
         WaitSpec::Child {
@@ -8914,6 +9014,24 @@ fn compare_signals(left: &&SignalRecord, right: &&SignalRecord) -> std::cmp::Ord
             right.r#type.as_str(),
             right.signal_id.as_str(),
         ))
+}
+
+fn signal_is_after_wait_cursor(signal: &SignalRecord, wait: &DurableWait) -> bool {
+    match wait {
+        DurableWait::Signal {
+            delivery: SignalDelivery::Future,
+            after_signal_sequence,
+            ..
+        } => signal_sequence(&signal.signal_id) > after_signal_sequence.unwrap_or(0),
+        _ => true,
+    }
+}
+
+fn signal_sequence(signal_id: &str) -> u64 {
+    signal_id
+        .strip_prefix("signal-")
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn compare_signal_records(left: &SignalRecord, right: &SignalRecord) -> std::cmp::Ordering {
@@ -9343,6 +9461,7 @@ pub mod testing {
 
             assert_ordered_batch_claims_and_lean_reads(&provider, now).await;
             assert_signal_idempotency(&provider, now).await;
+            assert_future_signal_delivery(&provider, now).await;
             assert_lost_activation_lease_preserves_signal(&provider, now).await;
             assert_eager_effect_retry_reclaims_activation(&provider, now).await;
         }
@@ -9425,6 +9544,8 @@ pub mod testing {
                     name: "finish".to_string(),
                     r#type: "finish".to_string(),
                     scope: WaitScope::Phase,
+                    delivery: SignalDelivery::Mailbox,
+                    after_signal_sequence: None,
                 }],
                 now,
             )
@@ -9527,6 +9648,8 @@ pub mod testing {
                         name: "finish".to_string(),
                         r#type: "finish".to_string(),
                         scope: WaitScope::Phase,
+                        delivery: SignalDelivery::Mailbox,
+                        after_signal_sequence: None,
                     }],
                     now: now + chrono::Duration::seconds(2),
                     consume_signal_id: Some(consume_signal_id),
@@ -9579,6 +9702,313 @@ pub mod testing {
                 .expect("release idempotency shard failed");
         }
 
+        async fn assert_future_signal_delivery<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            let ref_ = create_conformance_instance(
+                provider,
+                "future-signal",
+                "future_signal",
+                vec![run_wait(now)],
+                now,
+            )
+            .await;
+            let old_signal = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 1 }),
+                    received_at: now,
+                    idempotency_key: Some("old".to_string()),
+                })
+                .await
+                .expect("old signal append failed");
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "future-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("future shard claim failed")
+                .expect("future shard not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let run = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("future_signal".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("future run claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("future run missing");
+            let committed = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    expected_sequence: run.activation.sequence(),
+                    activation_id: run.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Running {
+                        common: serde_json::json!({}),
+                        phase: PhaseSnapshot {
+                            name: "waiting".to_string(),
+                            data: serde_json::json!({}),
+                        },
+                    },
+                    waits: vec![future_signal_wait_with_after("finish", 0)],
+                    now: now + chrono::Duration::seconds(1),
+                    consume_signal_id: None,
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("future run commit failed");
+            assert!(committed.ok, "future run commit conflict: {:?}", committed);
+            let duplicate = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 99 }),
+                    received_at: now + chrono::Duration::seconds(2),
+                    idempotency_key: Some("old".to_string()),
+                })
+                .await
+                .expect("old duplicate append failed");
+            assert_eq!(duplicate.signal_id, old_signal.signal_id);
+            let empty = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("future_signal".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::seconds(2),
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("future empty claim failed");
+            assert!(empty.claims.is_empty());
+            let new_signal = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 2 }),
+                    received_at: now + chrono::Duration::seconds(2),
+                    idempotency_key: Some("new".to_string()),
+                })
+                .await
+                .expect("new signal append failed");
+            let claim = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("future_signal".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::seconds(2),
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("future signal claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("new future signal missing");
+            let signal_id = match &claim.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!("expected future signal activation, got {:?}", other),
+            };
+            assert_eq!(signal_id, new_signal.signal_id);
+            let committed = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Completed {
+                        output: serde_json::json!({ "ok": true }),
+                    },
+                    waits: Vec::new(),
+                    now: now + chrono::Duration::seconds(2),
+                    consume_signal_id: Some(signal_id),
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("future signal commit failed");
+            assert!(
+                committed.ok,
+                "future signal commit conflict: {:?}",
+                committed
+            );
+            let signals = provider
+                .list_signals()
+                .await
+                .expect("future signal list failed");
+            assert_eq!(
+                signals
+                    .iter()
+                    .find(|signal| signal.signal_id == old_signal.signal_id)
+                    .expect("old signal missing")
+                    .consumed_by_sequence,
+                None
+            );
+            session
+                .release()
+                .await
+                .expect("release future shard failed");
+
+            let cursor_ref = create_conformance_instance(
+                provider,
+                "future-signal-cursor",
+                "future_signal_cursor",
+                vec![
+                    future_signal_wait("finish"),
+                    DurableWait::Timer {
+                        name: "tick".to_string(),
+                        fire_at: now,
+                    },
+                ],
+                now,
+            )
+            .await;
+            let cursor_lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "future-cursor-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("future cursor shard claim failed")
+                .expect("future cursor shard not claimed");
+            let cursor_session = provider.open_shard(OpenShardInput {
+                shard_id: cursor_lease.shard_id,
+                owner_id: Some(cursor_lease.owner_id.clone()),
+                lease_epoch: Some(cursor_lease.lease_epoch),
+            });
+            let timer = cursor_session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("future_signal_cursor".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("future cursor timer claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("future cursor timer missing");
+            let cursor_signal = provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: cursor_ref.workflow_id.clone(),
+                    run_id: cursor_ref.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "index": 1 }),
+                    received_at: now + chrono::Duration::seconds(1),
+                    idempotency_key: None,
+                })
+                .await
+                .expect("future cursor signal append failed");
+            let committed = cursor_session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: cursor_ref.workflow_id.clone(),
+                    run_id: cursor_ref.run_id.clone(),
+                    expected_sequence: timer.activation.sequence(),
+                    activation_id: timer.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Running {
+                        common: serde_json::json!({}),
+                        phase: PhaseSnapshot {
+                            name: "waiting".to_string(),
+                            data: serde_json::json!({}),
+                        },
+                    },
+                    waits: vec![future_signal_wait_with_after("finish", 999)],
+                    now: now + chrono::Duration::seconds(1),
+                    consume_signal_id: None,
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("future cursor commit failed");
+            assert!(
+                committed.ok,
+                "future cursor commit conflict: {:?}",
+                committed
+            );
+            let claim = cursor_session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("future_signal_cursor".to_string(), 1)]),
+                    shard_count: 1,
+                    now: now + chrono::Duration::seconds(1),
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("future cursor signal claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("future cursor signal missing");
+            let signal_id = match &claim.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!("expected preserved future signal, got {:?}", other),
+            };
+            assert_eq!(signal_id, cursor_signal.signal_id);
+            let committed = cursor_session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: cursor_ref.workflow_id.clone(),
+                    run_id: cursor_ref.run_id.clone(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Completed {
+                        output: serde_json::json!({ "ok": true }),
+                    },
+                    waits: Vec::new(),
+                    now: now + chrono::Duration::seconds(1),
+                    consume_signal_id: Some(signal_id),
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("future cursor signal commit failed");
+            assert!(
+                committed.ok,
+                "future cursor signal commit conflict: {:?}",
+                committed
+            );
+            cursor_session
+                .release()
+                .await
+                .expect("release future cursor shard failed");
+        }
+
         async fn assert_lost_activation_lease_preserves_signal<P>(provider: &P, now: DateTime<Utc>)
         where
             P: DurabilityProvider,
@@ -9591,6 +10021,8 @@ pub mod testing {
                     name: "finish".to_string(),
                     r#type: "finish".to_string(),
                     scope: WaitScope::Phase,
+                    delivery: SignalDelivery::Mailbox,
+                    after_signal_sequence: None,
                 }],
                 now,
             )
@@ -9872,6 +10304,27 @@ pub mod testing {
             DurableWait::Run {
                 name: "__run".to_string(),
                 ready_at,
+            }
+        }
+
+        fn future_signal_wait(name: &str) -> DurableWait {
+            future_signal_wait_with_after_optional(name, None)
+        }
+
+        fn future_signal_wait_with_after(name: &str, after_signal_sequence: u64) -> DurableWait {
+            future_signal_wait_with_after_optional(name, Some(after_signal_sequence))
+        }
+
+        fn future_signal_wait_with_after_optional(
+            name: &str,
+            after_signal_sequence: Option<u64>,
+        ) -> DurableWait {
+            DurableWait::Signal {
+                name: name.to_string(),
+                r#type: name.to_string(),
+                scope: WaitScope::Phase,
+                delivery: SignalDelivery::Future,
+                after_signal_sequence,
             }
         }
 

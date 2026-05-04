@@ -150,9 +150,16 @@ export type MigrationResult = {
 
 export type MigrationDefinition = (args: MigrationArgs) => MigrationResult | Promise<MigrationResult>
 
+export type SignalDelivery = "mailbox" | "future"
+
+export type SignalWaitOptions = {
+  delivery?: SignalDelivery
+}
+
 export type SignalWait<Event = unknown> = {
   kind: "signal"
   schema: Schema<Event>
+  delivery?: SignalDelivery
   handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand
 }
 
@@ -263,8 +270,9 @@ export function phase(definition: {
 export function signal<Event>(
   schema: Schema<Event>,
   handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand,
+  options: SignalWaitOptions = {},
 ): SignalWait<Event> {
-  return { kind: "signal", schema, handler }
+  return { kind: "signal", schema, handler, delivery: options.delivery }
 }
 
 export function timer(

@@ -292,6 +292,71 @@ func AssertProviderConformance(t *testing.T, factory Factory) {
 		})
 	})
 
+	t.Run(factory.Name+"/future-only-signals", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			ref := createInstance(t, ctx, provider, createOptions{workflowID: "future-signal", waits: []durable.DurableWait{runWait(t0)}})
+			oldSignal, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(1)}, ReceivedAt: t0, IdempotencyKey: "old",
+			})
+			requireNoError(t, err)
+			session := ownShard(t, ctx, provider, "worker-a", t0, longLease)
+			run := requireClaim(t, claimOne(t, ctx, session, "worker-a", t0, longLease, workflows))
+			committed, err := session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, ExpectedSequence: 0, ActivationID: run.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.Running(map[string]any{}, durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}), Waits: []durable.DurableWait{futureSignalWaitWithAfter("finish", 0)}, Now: t1,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 1)
+			duplicate, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(99)}, ReceivedAt: t2, IdempotencyKey: "old",
+			})
+			requireNoError(t, err)
+			requireEqual(t, oldSignal.SignalID, duplicate.SignalID)
+			requireEqual(t, 0, len(claimOne(t, ctx, session, "worker-a", t2, longLease, workflows).Claims))
+			newSignal, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(2)}, ReceivedAt: t2, IdempotencyKey: "new",
+			})
+			requireNoError(t, err)
+			event := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t2, longLease, workflows), "signal")
+			requireEqual(t, newSignal.SignalID, event.Activation.Event.ConsumeSignalID)
+			committed, err = session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, ExpectedSequence: 1, ActivationID: event.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.InstanceStatus{Status: "completed", Output: map[string]any{"ok": true}}, Now: t2, ConsumeSignalID: event.Activation.Event.ConsumeSignalID,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 2)
+			signals, err := provider.ListSignals(ctx)
+			requireNoError(t, err)
+			for _, signal := range signals {
+				if signal.SignalID == oldSignal.SignalID && signal.ConsumedBySequence != nil {
+					t.Fatalf("old future-ignored signal was consumed: %#v", signal.ConsumedBySequence)
+				}
+			}
+		})
+	})
+
+	t.Run(factory.Name+"/future-signal-cursor-preserved", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			ref := createInstance(t, ctx, provider, createOptions{workflowID: "future-signal-cursor", waits: []durable.DurableWait{futureSignalWait("finish"), durable.TimerWait("tick", t0)}})
+			session := ownShard(t, ctx, provider, "worker-a", t0, longLease)
+			timer := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t0, longLease, workflows), "timer")
+			signal, err := provider.AppendSignal(ctx, durable.AppendSignalInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"index": float64(1)}, ReceivedAt: t1,
+			})
+			requireNoError(t, err)
+			committed, err := session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: ref.WorkflowID, RunID: ref.RunID, ExpectedSequence: 0, ActivationID: timer.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.Running(map[string]any{}, durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}), Waits: []durable.DurableWait{futureSignalWaitWithAfter("finish", 999)}, Now: t1,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 1)
+			event := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t1, longLease, workflows), "signal")
+			requireEqual(t, signal.SignalID, event.Activation.Event.ConsumeSignalID)
+		})
+	})
+
 	t.Run(factory.Name+"/effects-retry-timeout-and-memoization", func(t *testing.T) {
 		withStore(t, factory, func(ctx context.Context, store Store) {
 			provider := store.New(t).Provider
@@ -468,6 +533,16 @@ func runWait(readyAt time.Time) durable.DurableWait {
 
 func signalWait(name string) durable.DurableWait {
 	return durable.SignalWait(name, name, false)
+}
+
+func futureSignalWait(name string) durable.DurableWait {
+	return durable.SignalWaitWithOptions(name, name, false, durable.SignalWaitOptions{Delivery: durable.SignalDeliveryFuture})
+}
+
+func futureSignalWaitWithAfter(name string, after int64) durable.DurableWait {
+	wait := futureSignalWait(name)
+	wait.AfterSignalSequence = &after
+	return wait
 }
 
 func ownShard(t *testing.T, ctx context.Context, provider durable.DurabilityProvider, worker string, now time.Time, lease time.Duration) durable.ShardDurabilitySession {
