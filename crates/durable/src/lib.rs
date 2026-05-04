@@ -7543,6 +7543,10 @@ impl DurableRuntime {
         Ok(serde_json::from_value(value)?)
     }
 
+    pub fn shard_for_ref(&self, ref_: &InstanceRef) -> u32 {
+        workflow_partition_shard(&ref_.workflow_id, &ref_.run_id, self.options.shard_count)
+    }
+
     pub async fn drain(&self, options: DrainOptions) -> Result<DrainResult, WorkflowError> {
         self.run_worker(RunWorkerOptions {
             max_activations: options.max_activations,
@@ -7625,6 +7629,46 @@ impl DurableRuntime {
         Ok(DrainResult { activations })
     }
 
+    pub async fn run_shard_step(
+        &self,
+        options: RunShardStepOptions,
+    ) -> Result<RunShardStepResult, WorkflowError> {
+        validate_shard_id(options.shard_id, self.options.shard_count)?;
+
+        let now = self.now();
+        let Some(lease) = self
+            .provider
+            .claim_shard(ClaimShardInput {
+                shard_id: options.shard_id,
+                owner_id: self.options.worker_id.clone(),
+                now,
+                lease_ms: self.options.shard_lease_ms,
+            })
+            .await?
+        else {
+            return Ok(RunShardStepResult {
+                shard_id: options.shard_id,
+                claimed_shard: false,
+                activations: 0,
+                next_wake_at: None,
+            });
+        };
+
+        let session = self.provider.open_shard(OpenShardInput {
+            shard_id: lease.shard_id,
+            owner_id: Some(lease.owner_id.clone()),
+            lease_epoch: Some(lease.lease_epoch),
+        });
+        let run_result = self.run_owned_shard_step(session.clone(), options).await;
+        let release_result = session.release().await;
+
+        match (run_result, release_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
+        }
+    }
+
     fn now(&self) -> DateTime<Utc> {
         (self.clock)()
     }
@@ -7660,6 +7704,17 @@ impl DurableRuntime {
             })
     }
 
+    fn workflow_versions(&self) -> Result<HashMap<String, u32>, WorkflowError> {
+        let workflows = self
+            .workflows
+            .lock()
+            .map_err(|_| WorkflowError::new("workflow registry lock poisoned"))?;
+        Ok(workflows
+            .iter()
+            .map(|(name, workflow)| (name.clone(), workflow.version()))
+            .collect())
+    }
+
     async fn next_activation_batch(
         &self,
         limit: usize,
@@ -7668,16 +7723,7 @@ impl DurableRuntime {
             return Ok(Vec::new());
         }
         let now = self.now();
-        let workflows = {
-            let workflows = self
-                .workflows
-                .lock()
-                .map_err(|_| WorkflowError::new("workflow registry lock poisoned"))?;
-            workflows
-                .iter()
-                .map(|(name, workflow)| (name.clone(), workflow.version()))
-                .collect::<HashMap<_, _>>()
-        };
+        let workflows = self.workflow_versions()?;
         let shard_ids = if self.options.dispatch_shard_ids.is_empty() {
             (0..self.options.shard_count).collect::<Vec<_>>()
         } else {
@@ -7721,6 +7767,85 @@ impl DurableRuntime {
         }
 
         Ok(ready)
+    }
+
+    async fn run_owned_shard_step(
+        &self,
+        session: Arc<dyn ShardDurabilitySession>,
+        options: RunShardStepOptions,
+    ) -> Result<RunShardStepResult, WorkflowError> {
+        let max_activations = options.max_activations.unwrap_or(usize::MAX);
+        let mut activations = 0;
+        let mut next_wake_at = None;
+
+        while activations < max_activations {
+            if options
+                .cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                break;
+            }
+
+            let remaining = max_activations - activations;
+            let limit = self.options.activation_prefetch_limit.max(1).min(remaining);
+            let batch = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: self.workflow_versions()?,
+                    shard_count: self.options.shard_count,
+                    now: self.now(),
+                    lease_ms: self.options.activation_lease_ms,
+                    limit,
+                })
+                .await?;
+            let claimed = batch.claims.len();
+
+            if claimed == 0 {
+                next_wake_at = batch.next_wake_at;
+                break;
+            }
+
+            let mut pending_commits = Vec::new();
+            for claim in batch.claims {
+                let Some(activation) = self.ready_activation_from_claim(claim)? else {
+                    continue;
+                };
+                match self.prepare_activation_commit(activation.clone()).await {
+                    Ok(ActivationRunOutcome::Prepared(input)) => {
+                        pending_commits.push((activation, input));
+                    }
+                    Ok(ActivationRunOutcome::Skipped) => {
+                        let _ = self.release_activation_claim(&activation).await;
+                    }
+                    Err(error) => {
+                        self.commit_prepared_activations(&pending_commits).await?;
+                        let _ = self.release_claimed_activation(&activation).await;
+                        return Err(error);
+                    }
+                }
+                activations += 1;
+                if activations >= max_activations {
+                    break;
+                }
+            }
+
+            self.commit_prepared_activations(&pending_commits).await?;
+            if activations >= max_activations {
+                next_wake_at = None;
+                break;
+            }
+            if claimed < limit {
+                next_wake_at = batch.next_wake_at;
+                break;
+            }
+        }
+
+        Ok(RunShardStepResult {
+            shard_id: options.shard_id,
+            claimed_shard: true,
+            activations,
+            next_wake_at,
+        })
     }
 
     fn ready_activation_from_claim(
@@ -7770,6 +7895,25 @@ impl DurableRuntime {
                 event: Some(event),
                 lease,
             })),
+        }
+    }
+
+    async fn release_activation_claim(
+        &self,
+        activation: &ReadyActivation,
+    ) -> Result<(), WorkflowError> {
+        match activation.lease {
+            ActivationClaimLease::Shard { shard_id, epoch } => {
+                let session = self.provider.open_shard(OpenShardInput {
+                    shard_id,
+                    owner_id: Some(self.options.worker_id.clone()),
+                    lease_epoch: Some(epoch),
+                });
+                session
+                    .release_activation(&activation.activation_id, &self.options.worker_id)
+                    .await
+            }
+            ActivationClaimLease::Activation => Ok(()),
         }
     }
 
@@ -8112,6 +8256,21 @@ impl Default for RuntimeOptions {
 #[derive(Clone, Debug, Default)]
 pub struct DrainOptions {
     pub max_activations: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunShardStepOptions {
+    pub shard_id: u32,
+    pub max_activations: Option<usize>,
+    pub cancellation: Option<WorkerCancellation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunShardStepResult {
+    pub shard_id: u32,
+    pub claimed_shard: bool,
+    pub activations: usize,
+    pub next_wake_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -8913,6 +9072,19 @@ fn safe_id(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn validate_shard_id(shard_id: u32, shard_count: u32) -> Result<(), WorkflowError> {
+    if shard_count == 0 {
+        return Err(WorkflowError::new("shard_count must be positive"));
+    }
+    if shard_id >= shard_count {
+        return Err(WorkflowError::new(format!(
+            "shard_id must be between 0 and {}",
+            shard_count - 1
+        )));
+    }
+    Ok(())
 }
 
 fn default_child_workflow_id(

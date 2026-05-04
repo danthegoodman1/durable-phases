@@ -47,7 +47,8 @@ later steps.
 
 ## Custom runners
 
-TypeScript runtimes expose a bounded shard-step API for scheduler integrations:
+TypeScript and Rust runtimes expose bounded shard-step APIs for scheduler
+integrations:
 
 ```ts
 const shardId = runtime.shardForRef(ref)
@@ -60,7 +61,16 @@ const result = await runtime.runShardStep({
 })
 ```
 
-This is intended for systems like Convex where the infrastructure, not the
+```rust
+let shard_id = runtime.shard_for_ref(&ref_);
+let result = runtime.run_shard_step(RunShardStepOptions {
+    shard_id,
+    max_activations: Some(1),
+    cancellation: None,
+}).await?;
+```
+
+This is intended for custom schedulers where the infrastructure, not the
 runtime, decides when to kick work. The shape is:
 
 ```text
@@ -68,8 +78,15 @@ start/signal -> compute shard -> enqueue action -> runShardStep
 runShardStep -> enqueue again, schedule nextWakeAt, or let a watchdog recover
 ```
 
-The demo in `src/demos/custom-runner.ts` uses a tiny local scheduler loop
-instead of Convex so the adapter boundary stays visible.
+Custom runners should treat `nextWakeAt` / `next_wake_at` as scheduler state:
+persist the earliest wake for each shard, sleep or schedule the shard runner for
+that time, and kick the shard sooner when new work arrives, such as a start or
+signal that may make the shard ready before the stored wake. Duplicate kicks are
+fine; shard leases and checkpoint fencing remain the correctness boundary.
+
+The demos in `src/demos/custom-runner.ts` and
+`crates/durable/examples/custom-runner.rs` use tiny local scheduler loops
+so the adapter boundary stays visible.
 
 ## SQLite
 

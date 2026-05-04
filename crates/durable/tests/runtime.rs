@@ -9,10 +9,10 @@ use durable::{
     GetWorkflowRunsInput, HeartbeatEffectInput, InstanceRef, InstanceStatusValue,
     LoadInstanceOptions, NullDurabilityProvider, OpenShardInput, ParentClosePolicy,
     PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
-    PostgresDurabilityProviderOptions, ReserveEffectInput, RunWorkerOptions, RuntimeOptions,
-    SerializedError, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
-    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
-    WorkflowIdReusePolicy, WorkflowRunDirection,
+    PostgresDurabilityProviderOptions, ReserveEffectInput, RunShardStepOptions, RunWorkerOptions,
+    RuntimeOptions, SerializedError, SignalRecord, SqliteDurabilityOptions,
+    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation,
+    WorkflowError, WorkflowIdReusePolicy, WorkflowRunDirection,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -71,6 +71,84 @@ workflow! {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepShardInput {
+    shard: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepShardOutput {
+    shard: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepShardPhase {
+    shard: u32,
+}
+
+workflow! {
+    pub workflow StepShardWorkflow {
+        name: "step_requested_shard",
+        version: 1,
+        input: StepShardInput,
+        output: StepShardOutput,
+        common: Empty,
+
+        initial(input) {
+            start! {
+                common: Empty {},
+                phase: finish(StepShardPhase { shard: input.shard }),
+            }
+        }
+
+        phase finish(data: StepShardPhase) {
+            run async |data| {
+                complete!(StepShardOutput { shard: data.shard })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepTimerInput {
+    fire_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepTimerOutput {
+    fire_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StepTimerPhase {
+    fire_at: DateTime<Utc>,
+}
+
+workflow! {
+    pub workflow StepTimerWorkflow {
+        name: "step_future_timer",
+        version: 1,
+        input: StepTimerInput,
+        output: StepTimerOutput,
+        common: Empty,
+
+        initial(input) {
+            start! {
+                common: Empty {},
+                phase: waiting(StepTimerPhase { fire_at: input.fire_at }),
+            }
+        }
+
+        phase waiting(data: StepTimerPhase) {
+            on {
+                wake: timer(data.fire_at.clone()) async |data| {
+                    complete!(StepTimerOutput { fire_at: data.fire_at })
+                },
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ManualClock {
     now: Arc<Mutex<DateTime<Utc>>>,
@@ -104,6 +182,16 @@ fn make_runtime(path: &std::path::Path, clock: &ManualClock) -> DurableRuntime {
         let clock = clock.clone();
         move || clock.now()
     })
+}
+
+fn workflow_id_for_shard(prefix: &str, shard_id: u32, shard_count: u32) -> String {
+    for attempt in 0..10_000 {
+        let workflow_id = format!("{prefix}-{attempt}");
+        if durable::workflow_partition_shard(&workflow_id, "run-1", shard_count) == shard_id {
+            return workflow_id;
+        }
+    }
+    panic!("could not find workflow id for shard {shard_id}");
 }
 
 async fn load_runtime_instance(runtime: &DurableRuntime, ref_: &InstanceRef) -> PersistedInstance {
@@ -376,6 +464,155 @@ async fn workflow_id_reuse_policies_and_run_pagination_work() {
         })
         .await;
     assert!(wrong_direction.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_shard_step_processes_only_the_requested_shard() {
+    let provider = NullDurabilityProvider::new();
+    let clock = ManualClock::new();
+    let mut options = RuntimeOptions::default();
+    options.shard_count = 3;
+    options.dispatch_shard_ids = vec![0];
+    options.worker_id = "step-worker".to_string();
+    let runtime = DurableRuntime::with_options(provider.clone(), options, {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+
+    let mut refs = Vec::new();
+    for shard in 0..3 {
+        let ref_ = runtime
+            .start::<StepShardWorkflow>(
+                StepShardInput { shard },
+                StartOptions {
+                    workflow_id: Some(workflow_id_for_shard(
+                        &format!("step-requested-{shard}"),
+                        shard,
+                        3,
+                    )),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.shard_for_ref(&ref_), shard);
+        refs.push(ref_);
+    }
+
+    let result = runtime
+        .run_shard_step(RunShardStepOptions {
+            shard_id: 1,
+            max_activations: Some(1),
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.shard_id, 1);
+    assert!(result.claimed_shard);
+    assert_eq!(result.activations, 1);
+    assert_eq!(result.next_wake_at, None);
+
+    let first = load_runtime_instance(&runtime, &refs[0]).await;
+    let second = load_runtime_instance(&runtime, &refs[1]).await;
+    let third = load_runtime_instance(&runtime, &refs[2]).await;
+    assert_eq!(first.status, PersistedStatus::Running);
+    assert_eq!(first.sequence, 0);
+    assert_eq!(second.status, PersistedStatus::Completed);
+    assert_eq!(second.sequence, 1);
+    assert_eq!(second.output.unwrap()["shard"], 1);
+    assert_eq!(third.status, PersistedStatus::Running);
+    assert_eq!(third.sequence, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_shard_step_reports_when_another_worker_owns_the_shard() {
+    let provider = NullDurabilityProvider::new();
+    let clock = ManualClock::new();
+    provider
+        .claim_shard(ClaimShardInput {
+            shard_id: 0,
+            owner_id: "existing-owner".to_string(),
+            now: clock.now(),
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let mut options = RuntimeOptions::default();
+    options.shard_count = 2;
+    options.worker_id = "step-worker".to_string();
+    let runtime = DurableRuntime::with_options(provider, options, {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+
+    let result = runtime
+        .run_shard_step(RunShardStepOptions {
+            shard_id: 0,
+            max_activations: Some(1),
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.shard_id, 0);
+    assert!(!result.claimed_shard);
+    assert_eq!(result.activations, 0);
+    assert_eq!(result.next_wake_at, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_shard_step_returns_next_wake_at_for_future_timer() {
+    let provider = NullDurabilityProvider::new();
+    let clock = ManualClock::new();
+    let mut options = RuntimeOptions::default();
+    options.shard_count = 3;
+    options.worker_id = "timer-step-worker".to_string();
+    let runtime = DurableRuntime::with_options(provider, options, {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+    let fire_at = clock.now() + Duration::milliseconds(5_000);
+    let ref_ = runtime
+        .start::<StepTimerWorkflow>(
+            StepTimerInput { fire_at },
+            StartOptions {
+                workflow_id: Some(workflow_id_for_shard("step-future-timer", 2, 3)),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = runtime
+        .run_shard_step(RunShardStepOptions {
+            shard_id: runtime.shard_for_ref(&ref_),
+            max_activations: Some(1),
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.shard_id, 2);
+    assert!(result.claimed_shard);
+    assert_eq!(result.activations, 0);
+    assert_eq!(result.next_wake_at, Some(fire_at));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_shard_step_validates_shard_ids() {
+    let provider = NullDurabilityProvider::new();
+    let mut options = RuntimeOptions::default();
+    options.shard_count = 2;
+    let runtime = DurableRuntime::with_options(provider, options, Utc::now);
+
+    let error = runtime
+        .run_shard_step(RunShardStepOptions {
+            shard_id: 2,
+            max_activations: Some(1),
+            cancellation: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.message, "shard_id must be between 0 and 1");
 }
 
 #[tokio::test(flavor = "current_thread")]

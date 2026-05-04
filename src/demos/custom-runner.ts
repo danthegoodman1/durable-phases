@@ -77,8 +77,8 @@ export async function runCustomRunnerDemo(): Promise<void> {
   })
 
   // This AbortController stands in for whatever lifecycle signal a host gives
-  // a custom runtime. For Convex this might be action duration, cancellation,
-  // or simply a choice to run one bounded step and return.
+  // a custom runtime: cancellation, action duration, or simply a choice to run
+  // one bounded step and return.
   const controller = new AbortController()
 
   // Start one tiny loop per shard. Each loop repeatedly "kicks" its shard by
