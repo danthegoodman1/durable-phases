@@ -681,6 +681,129 @@ function workflowIdForDifferentShard(prefix: string, excludedShard: number, shar
 }
 
 describe("durable workflow PoC", () => {
+  it("dedupes starts by workflow id and paginates workflow runs in both directions", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const SeriesWorkflow = defineWorkflow({
+      name: "series_workflow",
+      version: 1,
+      input: z.object({ outcome: z.enum(["running", "completed", "failed", "canceled"]) }),
+      output: z.object({ ok: z.boolean() }),
+      initial(input) {
+        if (input.outcome === "running") {
+          return start({ phase: "waiting", data: {} })
+        }
+        return start({ phase: "finish", data: { outcome: input.outcome } })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({}), async () => complete({ ok: true })),
+          },
+        }),
+        finish: phase({
+          state: z.object({ outcome: z.enum(["completed", "failed", "canceled"]) }),
+          run: async ({ data }) => {
+            if (data.outcome === "failed") {
+              return fail({ message: "failed" })
+            }
+            if (data.outcome === "canceled") {
+              return cancel("canceled")
+            }
+            return complete({ ok: true })
+          },
+        }),
+      },
+    })
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [SeriesWorkflow],
+    })
+
+    const running = await runtime.start(SeriesWorkflow, { outcome: "running" }, { workflowId: "running-series" })
+    const runningReuse = await runtime.start(SeriesWorkflow, { outcome: "completed" }, { workflowId: "running-series" })
+    expect(running).toMatchObject({ workflowId: "running-series", created: true })
+    expect(runningReuse).toEqual({ ...running, created: false })
+
+    const completed = await runtime.start(SeriesWorkflow, { outcome: "completed" }, { workflowId: "completed-series" })
+    await runtime.drain()
+    clock.advance(1_000)
+    const afterCompleted = await runtime.start(SeriesWorkflow, { outcome: "running" }, { workflowId: "completed-series" })
+    expect(afterCompleted.created).toBe(true)
+    expect(afterCompleted.runId).not.toBe(completed.runId)
+
+    clock.advance(1_000)
+    const failed = await runtime.start(SeriesWorkflow, { outcome: "failed" }, { workflowId: "failed-series" })
+    await runtime.drain()
+    clock.advance(1_000)
+    const afterFailed = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+      workflowId: "failed-series",
+      workflowIdReusePolicy: "failed_only",
+    })
+    expect(afterFailed.created).toBe(true)
+    expect(afterFailed.runId).not.toBe(failed.runId)
+
+    clock.advance(1_000)
+    const canceled = await runtime.start(SeriesWorkflow, { outcome: "canceled" }, { workflowId: "canceled-series" })
+    await runtime.drain()
+    clock.advance(1_000)
+    const afterCanceled = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+      workflowId: "canceled-series",
+      workflowIdReusePolicy: "failed_only",
+    })
+    expect(afterCanceled.created).toBe(true)
+    expect(afterCanceled.runId).not.toBe(canceled.runId)
+
+    const failedOnlyBlocked = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+      workflowId: "completed-series",
+      workflowIdReusePolicy: "failed_only",
+    })
+    expect(failedOnlyBlocked).toEqual({ ...afterCompleted, created: false })
+
+    const alwaysFirst = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+      workflowId: "always-series",
+      workflowIdReusePolicy: "always",
+    })
+    const alwaysSecond = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+      workflowId: "always-series",
+      workflowIdReusePolicy: "always",
+    })
+    expect(alwaysSecond.created).toBe(true)
+    expect(alwaysSecond.runId).not.toBe(alwaysFirst.runId)
+
+    const history: string[] = []
+    for (let index = 0; index < 3; index += 1) {
+      clock.advance(1_000)
+      const ref = await runtime.start(SeriesWorkflow, { outcome: "running" }, {
+        workflowId: "history-series",
+        workflowIdReusePolicy: "always",
+      })
+      history.push(ref.runId)
+    }
+    const firstPage = await runtime.getWorkflowRuns({ id: "history-series", limit: 2 })
+    expect(firstPage.runs.map((run) => run.runId)).toEqual(history.slice(0, 2))
+    expect(firstPage.cursor).toBeDefined()
+    const secondPage = await runtime.getWorkflowRuns({ id: "history-series", cursor: firstPage.cursor, limit: 2 })
+    expect(secondPage.runs.map((run) => run.runId)).toEqual(history.slice(2))
+    expect(secondPage.cursor).toBeUndefined()
+    const tail = await runtime.getWorkflowRuns({ id: "history-series", direction: "desc", limit: 1 })
+    expect(tail.runs.map((run) => run.runId)).toEqual([history[2]])
+    const reverseRest = await runtime.getWorkflowRuns({
+      id: "history-series",
+      direction: "desc",
+      cursor: tail.cursor,
+      limit: 2,
+    })
+    expect(reverseRest.runs.map((run) => run.runId)).toEqual([history[1], history[0]])
+    await expect(runtime.getWorkflowRuns({
+      id: "history-series",
+      direction: "asc",
+      cursor: tail.cursor,
+      limit: 1,
+    })).rejects.toThrow("Invalid workflow runs cursor")
+  })
+
   it("emits runtime and provider observability without high-cardinality metric tags", async () => {
     const path = await storePath()
     const observed = observabilityCollector()
@@ -1624,7 +1747,7 @@ describe("durable workflow PoC", () => {
     expect(observed).toEqual([
       {
         attempt: 1,
-        idempotencyKey: "activity-context/run-1/activity-context/run-1/0/run/__run/with_context",
+        idempotencyKey: `activity-context/${ref.runId}/activity-context/${ref.runId}/0/run/__run/with_context`,
         heartbeatDetails: undefined,
         aborted: false,
       },
@@ -5646,13 +5769,14 @@ describe("durable workflow PoC", () => {
     await runtimeB.drain({ maxActivations: 1 })
 
     expect(handles).toHaveLength(2)
-    expect(handles[1]).toEqual(handles[0])
+    expect(handles[1].workflowId).toBe(handles[0].workflowId)
+    expect(handles[1].runId).not.toBe(handles[0].runId)
     expect(await provider.listChildren()).toHaveLength(1)
     expect(await provider.loadInstance(ref)).toMatchObject({
       status: "completed",
       output: { childWorkflowId: handles[0].workflowId },
     })
-    expect(await provider.loadInstance(handles[0])).toMatchObject({
+    expect(await provider.loadInstance(handles[1])).toMatchObject({
       status: "running",
       phase: { name: "waiting", data: { value: "one" } },
     })
@@ -5709,16 +5833,16 @@ describe("durable workflow PoC", () => {
     })
     const ref = await runtime.start(ParentWorkflow, {}, { workflowId: "checkpoint-child-conflict-parent" })
 
-    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow("existing_child_instance")
-    expect(await provider.loadInstance(ref)).toMatchObject({ status: "running", sequence: 0 })
+    await expect(runtime.drain({ maxActivations: 1 })).resolves.toEqual({ activations: 1 })
+    expect(await provider.loadInstance(ref)).toMatchObject({ status: "completed", sequence: 1 })
     expect(
       (await provider.listChildren()).filter((childRecord) =>
         childRecord.parentWorkflowId === ref.workflowId && childRecord.parentRunId === ref.runId,
       ),
-    ).toEqual([])
+    ).toHaveLength(1)
   })
 
-  it("applies child conflict policies for repeated starts", async () => {
+  it("applies child workflow id reuse policies for repeated starts", async () => {
     const ChildWorkflow = defineWorkflow({
       name: "conflict_child",
       version: 1,
@@ -5734,72 +5858,50 @@ describe("durable workflow PoC", () => {
         }),
       },
     })
-    const UseExistingParent = defineWorkflow({
-      name: "use_existing_parent",
+    const ReuseParent = defineWorkflow({
+      name: "reuse_child_parent",
       version: 1,
       input: z.object({}),
-      output: z.object({ same: z.boolean() }),
+      output: z.object({ same: z.boolean(), secondCreated: z.boolean() }),
       initial() {
         return start({ phase: "run", data: {} })
       },
       phases: {
         run: phase({
           run: async ({ ctx }) => {
-            const first = await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "use-existing-child" })
-            const second = await ctx.child.start("child", ChildWorkflow, { value: "second" }, { workflowId: "use-existing-child" })
-            return complete({ same: first.workflowId === second.workflowId && first.runId === second.runId })
-          },
-        }),
-      },
-    })
-    const FailParent = defineWorkflow({
-      name: "fail_conflict_parent",
-      version: 1,
-      input: z.object({}),
-      output: z.object({ failed: z.boolean() }),
-      initial() {
-        return start({ phase: "run", data: {} })
-      },
-      phases: {
-        run: phase({
-          run: async ({ ctx }) => {
-            await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "fail-child" })
-            try {
-              await ctx.child.start("child", ChildWorkflow, { value: "second" }, { workflowId: "fail-child", conflictPolicy: "fail" })
-              return complete({ failed: false })
-            } catch {
-              return complete({ failed: true })
-            }
-          },
-        }),
-      },
-    })
-    const TerminateParent = defineWorkflow({
-      name: "terminate_conflict_parent",
-      version: 1,
-      input: z.object({}),
-      output: z.object({ value: z.string() }),
-      initial() {
-        return start({ phase: "run", data: {} })
-      },
-      phases: {
-        run: phase({
-          run: async ({ ctx }) => {
-            await ctx.child.start("child", ChildWorkflow, { value: "first" }, { workflowId: "terminate-child" })
-            const second = await ctx.child.start("child", ChildWorkflow, { value: "second" }, {
-              workflowId: "terminate-child",
-              conflictPolicy: "terminate_existing",
+            const first = await ctx.child.start("first", ChildWorkflow, { value: "first" }, { workflowId: "reuse-child" })
+            const second = await ctx.child.start("second", ChildWorkflow, { value: "second" }, { workflowId: "reuse-child" })
+            return complete({
+              same: first.workflowId === second.workflowId && first.runId === second.runId,
+              secondCreated: second.created,
             })
-            return go("waiting", { handle: second })
           },
         }),
-        waiting: phase({
-          state: z.object({ handle: z.any() }),
-          on: {
-            done: child(
-              ({ data }) => data.handle,
-              async ({ event }) => complete({ value: event.ok ? event.output.value : "failed" }),
-            ),
+      },
+    })
+    const AlwaysParent = defineWorkflow({
+      name: "always_child_parent",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ different: z.boolean(), secondCreated: z.boolean() }),
+      initial() {
+        return start({ phase: "run", data: {} })
+      },
+      phases: {
+        run: phase({
+          run: async ({ ctx }) => {
+            const first = await ctx.child.start("first", ChildWorkflow, { value: "first" }, {
+              workflowId: "always-child",
+              workflowIdReusePolicy: "always",
+            })
+            const second = await ctx.child.start("second", ChildWorkflow, { value: "second" }, {
+              workflowId: "always-child",
+              workflowIdReusePolicy: "always",
+            })
+            return complete({
+              different: first.runId !== second.runId,
+              secondCreated: second.created,
+            })
           },
         }),
       },
@@ -5807,31 +5909,25 @@ describe("durable workflow PoC", () => {
 
     const provider = testProvider(await storePath())
     const runtime = new DurableRuntime(provider, {
-      workflows: [ChildWorkflow, UseExistingParent, FailParent, TerminateParent],
-      workerId: "child-conflict-worker",
+      workflows: [ChildWorkflow, ReuseParent, AlwaysParent],
+      workerId: "child-reuse-worker",
     })
 
-    const useExistingRef = await runtime.start(UseExistingParent, {}, { workflowId: "use-existing-parent" })
+    const reuseRef = await runtime.start(ReuseParent, {}, { workflowId: "reuse-parent" })
     await runtime.drain({ maxActivations: 10 })
-    expect(await provider.loadInstance(useExistingRef)).toMatchObject({
+    expect(await provider.loadInstance(reuseRef)).toMatchObject({
       status: "completed",
-      output: { same: true },
+      output: { same: true, secondCreated: false },
     })
+    expect((await provider.listChildren()).filter((record) => record.workflowId === "reuse-child")).toHaveLength(1)
 
-    const failRef = await runtime.start(FailParent, {}, { workflowId: "fail-conflict-parent" })
+    const alwaysRef = await runtime.start(AlwaysParent, {}, { workflowId: "always-parent" })
     await runtime.drain({ maxActivations: 10 })
-    expect(await provider.loadInstance(failRef)).toMatchObject({
+    expect(await provider.loadInstance(alwaysRef)).toMatchObject({
       status: "completed",
-      output: { failed: true },
+      output: { different: true, secondCreated: true },
     })
-
-    const terminateRef = await runtime.start(TerminateParent, {}, { workflowId: "terminate-conflict-parent" })
-    await runtime.drain({ maxActivations: 10 })
-    expect(await provider.loadInstance(terminateRef)).toMatchObject({
-      status: "completed",
-      output: { value: "second" },
-    })
-    expect((await provider.listChildren()).filter((record) => record.workflowId === "terminate-child")).toHaveLength(1)
+    expect((await provider.listChildren()).filter((record) => record.workflowId === "always-child")).toHaveLength(2)
   })
 
   it("exposes only ctx.child.start and ctx.child.cancel", async () => {

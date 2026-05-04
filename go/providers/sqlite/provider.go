@@ -207,7 +207,7 @@ func (p *Provider) OpenShard(input durable.OpenShardInput) durable.ShardDurabili
 	return &session{provider: p, inner: p.engine.OpenShard(input)}
 }
 
-func (p *Provider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (p *Provider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	out, err := p.engine.CreateInstance(ctx, input)
 	if err != nil {
 		return out, err
@@ -338,6 +338,10 @@ func (p *Provider) ListInstances(ctx context.Context, options durable.LoadInstan
 	return p.engine.ListInstances(ctx, options)
 }
 
+func (p *Provider) GetWorkflowRuns(ctx context.Context, input durable.GetWorkflowRunsInput) (durable.GetWorkflowRunsResult, error) {
+	return p.engine.GetWorkflowRuns(ctx, input)
+}
+
 func (p *Provider) ListSignals(ctx context.Context) ([]durable.SignalRecord, error) {
 	return p.engine.ListSignals(ctx)
 }
@@ -365,7 +369,7 @@ func (s *session) ShardID() int      { return s.inner.ShardID() }
 func (s *session) OwnerID() string   { return s.inner.OwnerID() }
 func (s *session) LeaseEpoch() int64 { return s.inner.LeaseEpoch() }
 
-func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	return s.provider.CreateInstance(ctx, input)
 }
 func (s *session) CreateChildInstance(ctx context.Context, input durable.CreateChildInstanceInput) (durable.ChildHandleAny, error) {
@@ -490,10 +494,10 @@ func (p *ShardFileProvider) OpenShard(input durable.OpenShardInput) durable.Shar
 	}
 	return provider.OpenShard(input)
 }
-func (p *ShardFileProvider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (p *ShardFileProvider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	provider, err := p.providerForShard(input.PartitionShard)
 	if err != nil {
-		return durable.InstanceRef{}, err
+		return durable.StartWorkflowResult{}, err
 	}
 	return provider.CreateInstance(ctx, input)
 }
@@ -639,6 +643,14 @@ func (p *ShardFileProvider) ListInstances(ctx context.Context, options durable.L
 	sort.Slice(out, func(i, j int) bool { return out[i].WorkflowID < out[j].WorkflowID })
 	return out, nil
 }
+
+func (p *ShardFileProvider) GetWorkflowRuns(ctx context.Context, input durable.GetWorkflowRunsInput) (durable.GetWorkflowRunsResult, error) {
+	provider, err := p.providerForRef(input.ID, "")
+	if err != nil {
+		return durable.GetWorkflowRunsResult{}, err
+	}
+	return provider.GetWorkflowRuns(ctx, input)
+}
 func (p *ShardFileProvider) ListSignals(ctx context.Context) ([]durable.SignalRecord, error) {
 	var out []durable.SignalRecord
 	for _, provider := range p.providers {
@@ -673,8 +685,8 @@ type failedSession struct{ err error }
 func (f failedSession) ShardID() int      { return 0 }
 func (f failedSession) OwnerID() string   { return "" }
 func (f failedSession) LeaseEpoch() int64 { return 0 }
-func (f failedSession) CreateInstance(context.Context, durable.CreateInstanceInput) (durable.InstanceRef, error) {
-	return durable.InstanceRef{}, f.err
+func (f failedSession) CreateInstance(context.Context, durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
+	return durable.StartWorkflowResult{}, f.err
 }
 func (f failedSession) CreateChildInstance(context.Context, durable.CreateChildInstanceInput) (durable.ChildHandleAny, error) {
 	return durable.ChildHandleAny{}, f.err

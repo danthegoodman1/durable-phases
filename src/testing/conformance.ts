@@ -100,7 +100,7 @@ export function describeDurabilityProviderConformance(
             now: T0,
             conflictPolicy: "use_existing",
           }),
-        ).resolves.toEqual(ref)
+        ).resolves.toEqual({ ...ref, created: false })
         await expect(provider.loadInstance(ref)).resolves.toMatchObject({
           workflowName: "conformance",
           workflowVersion: 1,
@@ -1002,7 +1002,7 @@ export function describeDurabilityProviderConformance(
             ...childCreateInput(ref, activation.activationId, "same-key", "ignored-child"),
             conflictPolicy: "use_existing",
           }),
-        ).resolves.toEqual(first)
+        ).resolves.toEqual({ ...first, created: false })
         await expect(
           provider.createChildInstance({
             ...childCreateInput(ref, activation.activationId, "same-key", "fail-child"),

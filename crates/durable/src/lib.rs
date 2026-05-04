@@ -4,11 +4,13 @@ pub use durable_macros::workflow;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::any::type_name;
+use std::cmp::Ordering as CompareOrdering;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -259,12 +261,47 @@ impl InstanceRef {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StartWorkflowResult {
+    #[serde(flatten)]
+    pub ref_: InstanceRef,
+    pub created: bool,
+}
+
+impl StartWorkflowResult {
+    pub fn new(workflow_id: impl Into<String>, run_id: impl Into<String>, created: bool) -> Self {
+        Self {
+            ref_: InstanceRef::new(workflow_id, run_id),
+            created,
+        }
+    }
+
+    pub fn instance_ref(&self) -> InstanceRef {
+        self.ref_.clone()
+    }
+}
+
+impl From<StartWorkflowResult> for InstanceRef {
+    fn from(value: StartWorkflowResult) -> Self {
+        value.ref_
+    }
+}
+
+impl Deref for StartWorkflowResult {
+    type Target = InstanceRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ref_
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ChildHandle<W: Workflow> {
     pub workflow_name: String,
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub created: bool,
     #[serde(skip)]
     pub workflow: PhantomData<fn() -> W>,
 }
@@ -276,6 +313,7 @@ impl<W: Workflow> Clone for ChildHandle<W> {
             workflow_version: self.workflow_version,
             workflow_id: self.workflow_id.clone(),
             run_id: self.run_id.clone(),
+            created: self.created,
             workflow: PhantomData,
         }
     }
@@ -289,6 +327,7 @@ impl<W: Workflow> fmt::Debug for ChildHandle<W> {
             .field("workflow_version", &self.workflow_version)
             .field("workflow_id", &self.workflow_id)
             .field("run_id", &self.run_id)
+            .field("created", &self.created)
             .finish()
     }
 }
@@ -299,6 +338,7 @@ impl<W: Workflow> PartialEq for ChildHandle<W> {
             && self.workflow_version == other.workflow_version
             && self.workflow_id == other.workflow_id
             && self.run_id == other.run_id
+            && self.created == other.created
     }
 }
 
@@ -336,7 +376,7 @@ pub struct ChildOptions {
     pub workflow_id: Option<String>,
     pub durability: ChildDurability,
     pub parent_close_policy: ParentClosePolicy,
-    pub conflict_policy: ConflictPolicy,
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -363,6 +403,15 @@ pub enum ConflictPolicy {
     UseExisting,
     Fail,
     TerminateExisting,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowIdReusePolicy {
+    FailedOnly,
+    #[default]
+    NotRunning,
+    Always,
 }
 
 #[derive(Clone)]
@@ -894,6 +943,7 @@ pub struct ChildRecord {
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub created: bool,
     pub status: ChildStatus,
     pub parent_close_policy: ParentClosePolicy,
     pub completed_at: Option<DateTime<Utc>>,
@@ -1004,17 +1054,30 @@ impl ShardEngine {
     pub fn create_instance(
         &mut self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         let state = &mut self.state;
+        if let Some(policy) = input.workflow_id_reuse_policy {
+            if let Some(existing) = latest_workflow_run(state, &input.workflow_id) {
+                if !should_create_workflow_run(policy, &existing.status) {
+                    return Ok(StartWorkflowResult::new(
+                        existing.workflow_id.clone(),
+                        existing.run_id.clone(),
+                        false,
+                    ));
+                }
+            }
+        }
+
         let key = instance_key(&input.workflow_id, &input.run_id);
         let conflict_policy = input.conflict_policy.unwrap_or(ConflictPolicy::Fail);
 
         if let Some(existing) = state.instances.get(&key) {
             match conflict_policy {
                 ConflictPolicy::UseExisting => {
-                    return Ok(InstanceRef::new(
+                    return Ok(StartWorkflowResult::new(
                         existing.workflow_id.clone(),
                         existing.run_id.clone(),
+                        false,
                     ))
                 }
                 ConflictPolicy::Fail => {
@@ -1050,7 +1113,11 @@ impl ShardEngine {
         replace_tasks_for_instance(state, &instance);
 
         save_engine(state)?;
-        Ok(InstanceRef::new(input.workflow_id, input.run_id))
+        Ok(StartWorkflowResult::new(
+            input.workflow_id,
+            input.run_id,
+            true,
+        ))
     }
 
     pub fn create_child_instance(
@@ -1066,6 +1133,16 @@ impl ShardEngine {
                 && record.key == input.key
         }) {
             return Ok(child_handle_value(existing));
+        }
+
+        if let Some(policy) = input.workflow_id_reuse_policy {
+            if let Some(existing) = latest_workflow_run(state, &input.workflow_id).cloned() {
+                if !should_create_workflow_run(policy, &existing.status) {
+                    let handle = write_child_record_for_instance(state, &input, &existing, false);
+                    save_engine(state)?;
+                    return Ok(handle);
+                }
+            }
         }
 
         let instance_key = instance_key(&input.workflow_id, &input.run_id);
@@ -1115,6 +1192,7 @@ impl ShardEngine {
             workflow_version: input.workflow_version,
             workflow_id: input.workflow_id,
             run_id: input.run_id,
+            created: true,
             status: ChildStatus::Started,
             parent_close_policy: input.parent_close_policy,
             completed_at: None,
@@ -1521,8 +1599,15 @@ impl ShardEngine {
 
         for start in &input.child_starts {
             let child_key = instance_key(&start.workflow_id, &start.run_id);
+            let reuses_latest = start.workflow_id_reuse_policy.is_some_and(|policy| {
+                latest_workflow_run(state, &start.workflow_id).is_some_and(|latest| {
+                    latest.run_id == start.run_id
+                        && !should_create_workflow_run(policy, &latest.status)
+                })
+            });
             if state.instances.contains_key(&child_key)
                 && start.conflict_policy != ConflictPolicy::TerminateExisting
+                && !reuses_latest
             {
                 return Ok(CommitCheckpointResult {
                     ok: false,
@@ -1634,6 +1719,31 @@ impl ShardEngine {
         for start in input.child_starts {
             let child_record_id = format!("child-{}", state.next_child_id);
             state.next_child_id += 1;
+            if let Some(policy) = start.workflow_id_reuse_policy {
+                if let Some(existing) = latest_workflow_run(state, &start.workflow_id).cloned() {
+                    if !should_create_workflow_run(policy, &existing.status) {
+                        state.children.push(ChildRecord {
+                            child_record_id,
+                            parent_workflow_id: input.workflow_id.clone(),
+                            parent_run_id: input.run_id.clone(),
+                            activation_id: input.activation_id.clone(),
+                            key: start.key,
+                            workflow_name: existing.workflow_name,
+                            workflow_version: existing.workflow_version,
+                            workflow_id: existing.workflow_id,
+                            run_id: existing.run_id,
+                            created: false,
+                            status: ChildStatus::Started,
+                            parent_close_policy: start.parent_close_policy,
+                            completed_at: None,
+                            output: None,
+                            error: None,
+                            delivered_by_sequence: None,
+                        });
+                        continue;
+                    }
+                }
+            }
             let child_key = instance_key(&start.workflow_id, &start.run_id);
             if start.conflict_policy == ConflictPolicy::TerminateExisting {
                 delete_instance_records(state, &start.workflow_id, &start.run_id);
@@ -1673,6 +1783,7 @@ impl ShardEngine {
                 workflow_version: start.workflow_version,
                 workflow_id: start.workflow_id,
                 run_id: start.run_id,
+                created: start.created,
                 status: ChildStatus::Started,
                 parent_close_policy: start.parent_close_policy,
                 completed_at: None,
@@ -2243,8 +2354,8 @@ enum EngineOutput {
     ClaimTasks(ClaimShardTasksResult),
     ClaimShardAndTasks(Option<(ShardLease, ClaimShardTasksResult)>),
     InstanceCreated {
-        ref_: InstanceRef,
-        instance: PersistedInstance,
+        result: StartWorkflowResult,
+        instance: Option<PersistedInstance>,
     },
     ChildCreated {
         handle: ChildHandleValue,
@@ -2291,11 +2402,15 @@ impl EngineOperation {
                 Ok(EngineOutput::ClaimShardAndTasks(Some((lease, tasks))))
             }
             EngineOperation::CreateInstance(input) => {
-                let ref_ = engine.create_instance(input)?;
+                let result = engine.create_instance(input)?;
+                let ref_ = result.instance_ref();
                 let instance = engine
                     .load_instance(&ref_)?
                     .ok_or_else(|| WorkflowError::new("created instance missing from shard"))?;
-                Ok(EngineOutput::InstanceCreated { ref_, instance })
+                Ok(EngineOutput::InstanceCreated {
+                    result,
+                    instance: Some(instance),
+                })
             }
             EngineOperation::CreateChildInstance(input) => {
                 let handle = engine.create_child_instance(input)?;
@@ -3403,7 +3518,7 @@ impl DurabilityProvider for SqliteDurabilityProvider {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         let output =
             <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input.clone())
                 .await?;
@@ -3430,6 +3545,13 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
         <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+    }
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::get_workflow_runs(&self.inner, input).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
@@ -4068,7 +4190,7 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         self.provider_for_shard(input.partition_shard)?
             .create_instance(input)
             .await
@@ -4100,6 +4222,15 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
         let provider = self.provider_for_ref(&ref_.workflow_id, &ref_.run_id)?;
         <SqliteDurabilityProvider as DurabilityProvider>::load_instance(&provider, ref_, options)
+            .await
+    }
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        self.provider_for_ref(&input.id, "")?
+            .get_workflow_runs(input)
             .await
     }
 
@@ -4855,7 +4986,7 @@ impl DurabilityProvider for PostgresDurabilityProvider {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         let output =
             <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input.clone())
                 .await?;
@@ -4900,6 +5031,13 @@ impl DurabilityProvider for PostgresDurabilityProvider {
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
         <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+    }
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::get_workflow_runs(&self.inner, input).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
@@ -5552,20 +5690,22 @@ impl DurabilityProvider for ShardRouter {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         let shard_id = input.partition_shard;
         let output = self
             .execute(shard_id, EngineOperation::CreateInstance(input))
             .await?;
         let EngineOutput::InstanceCreated {
-            ref_: output,
+            result: output,
             instance,
         } = output
         else {
             unreachable!("create instance operation returned wrong output");
         };
-        self.directory_insert(&output, shard_id)?;
-        self.cache_insert(instance)?;
+        self.directory_insert(&output.instance_ref(), shard_id)?;
+        if let Some(instance) = instance {
+            self.cache_insert(instance)?;
+        }
         Ok(output)
     }
 
@@ -5583,7 +5723,6 @@ impl DurabilityProvider for ShardRouter {
                 "local child workflow starts must be shard-affine",
             ));
         }
-        let child_ref = InstanceRef::new(input.workflow_id.clone(), input.run_id.clone());
         let output = self
             .execute(parent_shard, EngineOperation::CreateChildInstance(input))
             .await?;
@@ -5594,6 +5733,7 @@ impl DurabilityProvider for ShardRouter {
         else {
             unreachable!("create child operation returned wrong output");
         };
+        let child_ref = InstanceRef::new(output.workflow_id.clone(), output.run_id.clone());
         self.directory_insert(&child_ref, parent_shard)?;
         self.cache_insert(instance)?;
         Ok(output)
@@ -5605,6 +5745,14 @@ impl DurabilityProvider for ShardRouter {
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
         self.load_instance_internal(ref_, options).await
+    }
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        let store = self.snapshot_store().await?;
+        workflow_runs_from_store(&store, input)
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
@@ -5855,7 +6003,7 @@ impl DurabilityProvider for NullDurabilityProvider {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError> {
+    ) -> Result<StartWorkflowResult, WorkflowError> {
         <ShardRouter as DurabilityProvider>::create_instance(&self.inner, input).await
     }
 
@@ -5872,6 +6020,13 @@ impl DurabilityProvider for NullDurabilityProvider {
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError> {
         <ShardRouter as DurabilityProvider>::load_instance(&self.inner, ref_, options).await
+    }
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::get_workflow_runs(&self.inner, input).await
     }
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
@@ -6668,6 +6823,7 @@ pub struct CreateInstanceInput {
     pub now: DateTime<Utc>,
     pub parent: Option<ParentLink>,
     pub conflict_policy: Option<ConflictPolicy>,
+    pub workflow_id_reuse_policy: Option<WorkflowIdReusePolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6689,6 +6845,7 @@ pub struct CreateChildInstanceInput {
     pub key: String,
     pub parent_close_policy: ParentClosePolicy,
     pub conflict_policy: ConflictPolicy,
+    pub workflow_id_reuse_policy: Option<WorkflowIdReusePolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -6697,6 +6854,7 @@ pub struct ChildHandleValue {
     pub workflow_version: u32,
     pub workflow_id: String,
     pub run_id: String,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6838,6 +6996,8 @@ pub struct CheckpointChildStart {
     pub waits: Vec<DurableWait>,
     pub parent_close_policy: ParentClosePolicy,
     pub conflict_policy: ConflictPolicy,
+    pub workflow_id_reuse_policy: Option<WorkflowIdReusePolicy>,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6955,6 +7115,29 @@ pub struct AppendSignalInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadInstanceOptions {
     pub include_effects: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetWorkflowRunsInput {
+    pub id: String,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub direction: Option<WorkflowRunDirection>,
+    pub include_effects: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GetWorkflowRunsResult {
+    pub runs: Vec<PersistedInstance>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7110,7 +7293,7 @@ pub trait DurabilityProvider: Send + Sync {
     async fn create_instance(
         &self,
         input: CreateInstanceInput,
-    ) -> Result<InstanceRef, WorkflowError>;
+    ) -> Result<StartWorkflowResult, WorkflowError>;
 
     async fn create_child_instance(
         &self,
@@ -7122,6 +7305,11 @@ pub trait DurabilityProvider: Send + Sync {
         ref_: &InstanceRef,
         options: LoadInstanceOptions,
     ) -> Result<Option<PersistedInstance>, WorkflowError>;
+
+    async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError>;
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError>;
 
@@ -7279,7 +7467,7 @@ impl DurableRuntime {
         &self,
         input: W::Input,
         options: StartOptions,
-    ) -> Result<InstanceRef, WorkflowError>
+    ) -> Result<StartWorkflowResult, WorkflowError>
     where
         W: Workflow,
     {
@@ -7291,7 +7479,7 @@ impl DurableRuntime {
         let workflow_id = options
             .workflow_id
             .unwrap_or_else(|| format!("{}-{}", W::NAME, Uuid::new_v4()));
-        let run_id = options.run_id.unwrap_or_else(|| "run-1".to_string());
+        let run_id = Uuid::new_v4().to_string();
         let waits = workflow.materialize_waits(&start.common, &start.phase, now)?;
 
         self.provider
@@ -7310,9 +7498,17 @@ impl DurableRuntime {
                 waits,
                 now,
                 parent: None,
-                conflict_policy: options.conflict_policy,
+                conflict_policy: Some(ConflictPolicy::Fail),
+                workflow_id_reuse_policy: Some(options.workflow_id_reuse_policy),
             })
             .await
+    }
+
+    pub async fn get_workflow_runs(
+        &self,
+        input: GetWorkflowRunsInput,
+    ) -> Result<GetWorkflowRunsResult, WorkflowError> {
+        self.provider.get_workflow_runs(input).await
     }
 
     pub async fn signal<T>(
@@ -7723,6 +7919,7 @@ impl DurableRuntime {
             commit_effects: HashMap::new(),
             commit_child_starts: HashMap::new(),
             commit_child_key_by_ref: HashMap::new(),
+            commit_child_key_by_workflow_id: HashMap::new(),
             clock: self.clock.clone(),
             worker_id: self.options.worker_id.clone(),
             shard_count: self.options.shard_count,
@@ -7876,8 +8073,7 @@ impl DurableRuntime {
 #[derive(Clone, Debug, Default)]
 pub struct StartOptions {
     pub workflow_id: Option<String>,
-    pub run_id: Option<String>,
-    pub conflict_policy: Option<ConflictPolicy>,
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -7980,6 +8176,7 @@ pub struct DurableContext {
     commit_effects: HashMap<String, CheckpointEffectMutation>,
     commit_child_starts: HashMap<String, CheckpointChildStart>,
     commit_child_key_by_ref: HashMap<String, String>,
+    commit_child_key_by_workflow_id: HashMap<String, String>,
     clock: Clock,
     worker_id: String,
     shard_count: u32,
@@ -8169,43 +8366,74 @@ impl DurableContext {
                 self.partition_shard,
             )
         });
-        let run_id = "run-1".to_string();
-        let partition_shard = workflow_partition_shard(&workflow_id, &run_id, self.shard_count);
-        let waits = adapter.materialize_waits(&start.common, &start.phase, now)?;
-
-        if options.durability == ChildDurability::Commit {
-            if let Some(existing) = self.commit_child_starts.get(key).cloned() {
-                if options.conflict_policy == ConflictPolicy::Fail {
-                    return Err(WorkflowError::new(format!(
-                        "child workflow already exists for activation key: {}/{}/{}/{}",
-                        self.workflow_id, self.run_id, self.activation_id, key
-                    )));
-                }
-                if options.conflict_policy != ConflictPolicy::TerminateExisting {
+        let workflow_id_reuse_policy = options.workflow_id_reuse_policy;
+        if workflow_id_reuse_policy != WorkflowIdReusePolicy::Always {
+            if let Some(existing_key) = self
+                .commit_child_key_by_workflow_id
+                .get(&workflow_id)
+                .cloned()
+            {
+                if let Some(existing) = self.commit_child_starts.get(&existing_key).cloned() {
                     return Ok(ChildHandle {
                         workflow_name: existing.workflow_name,
                         workflow_version: existing.workflow_version,
                         workflow_id: existing.workflow_id,
                         run_id: existing.run_id,
+                        created: false,
                         workflow: PhantomData,
                     });
                 }
-                self.commit_child_starts.remove(key);
-                self.commit_child_key_by_ref
-                    .remove(&child_ref_key(&existing.workflow_id, &existing.run_id));
+            }
+        }
+        let latest_run = if workflow_id_reuse_policy == WorkflowIdReusePolicy::Always {
+            None
+        } else {
+            self.provider
+                .get_workflow_runs(GetWorkflowRunsInput {
+                    id: workflow_id.clone(),
+                    cursor: None,
+                    limit: Some(1),
+                    direction: Some(WorkflowRunDirection::Desc),
+                    include_effects: Some(false),
+                })
+                .await?
+                .runs
+                .into_iter()
+                .next()
+        };
+        let should_create = latest_run.as_ref().is_none_or(|latest| {
+            should_create_workflow_run(workflow_id_reuse_policy, &latest.status)
+        });
+        let run_id = if should_create {
+            Uuid::new_v4().to_string()
+        } else {
+            latest_run
+                .as_ref()
+                .map(|latest| latest.run_id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        };
+        let created = should_create;
+        let partition_shard = workflow_partition_shard(&workflow_id, &run_id, self.shard_count);
+        let waits = adapter.materialize_waits(&start.common, &start.phase, now)?;
+
+        if options.durability == ChildDurability::Commit {
+            if let Some(existing) = self.commit_child_starts.get(key).cloned() {
+                return Ok(ChildHandle {
+                    workflow_name: existing.workflow_name,
+                    workflow_version: existing.workflow_version,
+                    workflow_id: existing.workflow_id,
+                    run_id: existing.run_id,
+                    created: existing.created,
+                    workflow: PhantomData,
+                });
             }
 
             let ref_key = child_ref_key(&workflow_id, &run_id);
-            if let Some(existing_key) = self.commit_child_key_by_ref.get(&ref_key).cloned() {
-                if options.conflict_policy == ConflictPolicy::TerminateExisting {
-                    self.commit_child_starts.remove(&existing_key);
-                    self.commit_child_key_by_ref.remove(&ref_key);
-                } else {
-                    return Err(WorkflowError::new(format!(
-                        "child workflow instance already exists in this activation: {}/{}",
-                        workflow_id, run_id
-                    )));
-                }
+            if self.commit_child_key_by_ref.contains_key(&ref_key) {
+                return Err(WorkflowError::new(format!(
+                    "child workflow instance already exists in this activation: {}/{}",
+                    workflow_id, run_id
+                )));
             }
 
             self.commit_child_starts.insert(
@@ -8221,16 +8449,21 @@ impl DurableContext {
                     phase: start.phase,
                     waits,
                     parent_close_policy: options.parent_close_policy,
-                    conflict_policy: options.conflict_policy,
+                    conflict_policy: ConflictPolicy::Fail,
+                    workflow_id_reuse_policy: Some(workflow_id_reuse_policy),
+                    created,
                 },
             );
             self.commit_child_key_by_ref
                 .insert(ref_key, key.to_string());
+            self.commit_child_key_by_workflow_id
+                .insert(workflow_id.clone(), key.to_string());
             return Ok(ChildHandle {
                 workflow_name: W::NAME.to_string(),
                 workflow_version: W::VERSION,
                 workflow_id,
                 run_id,
+                created,
                 workflow: PhantomData,
             });
         }
@@ -8254,7 +8487,8 @@ impl DurableContext {
                 lease_now: now,
                 key: key.to_string(),
                 parent_close_policy: options.parent_close_policy,
-                conflict_policy: options.conflict_policy,
+                conflict_policy: ConflictPolicy::Fail,
+                workflow_id_reuse_policy: Some(workflow_id_reuse_policy),
             })
             .await?;
 
@@ -8263,6 +8497,7 @@ impl DurableContext {
             workflow_version: handle.workflow_version,
             workflow_id: handle.workflow_id,
             run_id: handle.run_id,
+            created: handle.created,
             workflow: PhantomData,
         })
     }
@@ -8306,6 +8541,16 @@ impl DurableContext {
     {
         let ref_key = child_ref_key(&handle.workflow_id, &handle.run_id);
         if let Some(key) = self.commit_child_key_by_ref.remove(&ref_key) {
+            if let Some(start) = self.commit_child_starts.get(&key) {
+                if self
+                    .commit_child_key_by_workflow_id
+                    .get(&start.workflow_id)
+                    .is_some_and(|existing_key| existing_key == &key)
+                {
+                    self.commit_child_key_by_workflow_id
+                        .remove(&start.workflow_id);
+                }
+            }
             self.commit_child_starts.remove(&key);
             return Ok(());
         }
@@ -8449,16 +8694,142 @@ fn instance_key(workflow_id: &str, run_id: &str) -> String {
     format!("{workflow_id}:{run_id}")
 }
 
+fn should_create_workflow_run(policy: WorkflowIdReusePolicy, status: &PersistedStatus) -> bool {
+    match policy {
+        WorkflowIdReusePolicy::FailedOnly => {
+            matches!(status, PersistedStatus::Failed | PersistedStatus::Canceled)
+        }
+        WorkflowIdReusePolicy::NotRunning => !matches!(status, PersistedStatus::Running),
+        WorkflowIdReusePolicy::Always => true,
+    }
+}
+
+fn compare_workflow_runs(left: &PersistedInstance, right: &PersistedInstance) -> CompareOrdering {
+    left.created_at
+        .cmp(&right.created_at)
+        .then_with(|| left.run_id.cmp(&right.run_id))
+}
+
+fn workflow_run_position(instance: &PersistedInstance) -> (i64, String) {
+    (
+        instance
+            .created_at
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| instance.created_at.timestamp_micros() * 1_000),
+        instance.run_id.clone(),
+    )
+}
+
+fn latest_workflow_run<'a>(state: &'a Store, workflow_id: &str) -> Option<&'a PersistedInstance> {
+    state
+        .instances
+        .values()
+        .filter(|instance| instance.workflow_id == workflow_id)
+        .max_by(|left, right| compare_workflow_runs(left, right))
+}
+
+fn encode_workflow_runs_cursor(
+    instance: &PersistedInstance,
+    direction: WorkflowRunDirection,
+) -> String {
+    let direction = match direction {
+        WorkflowRunDirection::Asc => "asc",
+        WorkflowRunDirection::Desc => "desc",
+    };
+    let (created_at, run_id) = workflow_run_position(instance);
+    format!("v1|{direction}|{created_at}|{run_id}")
+}
+
+fn decode_workflow_runs_cursor(
+    cursor: Option<String>,
+    direction: WorkflowRunDirection,
+) -> Result<Option<(i64, String)>, WorkflowError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let parts = cursor.splitn(4, '|').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "v1" {
+        return Err(WorkflowError::new("invalid workflow runs cursor"));
+    }
+    let expected = match direction {
+        WorkflowRunDirection::Asc => "asc",
+        WorkflowRunDirection::Desc => "desc",
+    };
+    if parts[1] != expected {
+        return Err(WorkflowError::new(
+            "workflow runs cursor was created for a different direction",
+        ));
+    }
+    let created_at = parts[2]
+        .parse::<i64>()
+        .map_err(|_| WorkflowError::new("invalid workflow runs cursor"))?;
+    Ok(Some((created_at, parts[3].to_string())))
+}
+
+fn clone_instance_for_workflow_run(
+    instance: &PersistedInstance,
+    include_effects: bool,
+) -> PersistedInstance {
+    let mut instance = instance.clone();
+    if !include_effects {
+        instance.effects.clear();
+    }
+    instance
+}
+
+fn workflow_runs_from_store(
+    state: &Store,
+    input: GetWorkflowRunsInput,
+) -> Result<GetWorkflowRunsResult, WorkflowError> {
+    let limit = input.limit.unwrap_or(100);
+    if limit == 0 {
+        return Err(WorkflowError::new("limit must be a positive integer"));
+    }
+    let direction = input.direction.unwrap_or_default();
+    let cursor = decode_workflow_runs_cursor(input.cursor, direction)?;
+    let mut runs = state
+        .instances
+        .values()
+        .filter(|instance| instance.workflow_id == input.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    runs.sort_by(compare_workflow_runs);
+    if direction == WorkflowRunDirection::Desc {
+        runs.reverse();
+    }
+    if let Some((cursor_created_at, cursor_run_id)) = cursor {
+        runs.retain(|run| {
+            let position = workflow_run_position(run);
+            match direction {
+                WorkflowRunDirection::Asc => position > (cursor_created_at, cursor_run_id.clone()),
+                WorkflowRunDirection::Desc => position < (cursor_created_at, cursor_run_id.clone()),
+            }
+        });
+    }
+    let has_more = runs.len() > limit;
+    let page = runs.into_iter().take(limit).collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        page.last()
+            .map(|instance| encode_workflow_runs_cursor(instance, direction))
+    } else {
+        None
+    };
+    Ok(GetWorkflowRunsResult {
+        runs: page
+            .iter()
+            .map(|instance| {
+                clone_instance_for_workflow_run(instance, input.include_effects.unwrap_or(false))
+            })
+            .collect(),
+        cursor: next_cursor,
+    })
+}
+
 pub fn workflow_partition_shard(workflow_id: &str, run_id: &str, shard_count: u32) -> u32 {
     assert!(shard_count > 0, "shard_count must be positive");
     let mut hash = 0x811c9dc5u32;
-    for byte in workflow_id
-        .as_bytes()
-        .iter()
-        .copied()
-        .chain(std::iter::once(0))
-        .chain(run_id.as_bytes().iter().copied())
-    {
+    let _ = run_id;
+    for byte in workflow_id.as_bytes().iter().copied() {
         hash ^= u32::from(byte);
         hash = hash.wrapping_mul(0x01000193);
     }
@@ -8471,6 +8842,42 @@ fn child_handle_value(record: &ChildRecord) -> ChildHandleValue {
         workflow_version: record.workflow_version,
         workflow_id: record.workflow_id.clone(),
         run_id: record.run_id.clone(),
+        created: record.created,
+    }
+}
+
+fn write_child_record_for_instance(
+    state: &mut Store,
+    input: &CreateChildInstanceInput,
+    instance: &PersistedInstance,
+    created: bool,
+) -> ChildHandleValue {
+    let child_record_id = format!("child-{}", state.next_child_id);
+    state.next_child_id += 1;
+    state.children.push(ChildRecord {
+        child_record_id,
+        parent_workflow_id: input.parent_workflow_id.clone(),
+        parent_run_id: input.parent_run_id.clone(),
+        activation_id: input.activation_id.clone(),
+        key: input.key.clone(),
+        workflow_name: instance.workflow_name.clone(),
+        workflow_version: instance.workflow_version,
+        workflow_id: instance.workflow_id.clone(),
+        run_id: instance.run_id.clone(),
+        created,
+        status: ChildStatus::Started,
+        parent_close_policy: input.parent_close_policy.clone(),
+        completed_at: None,
+        output: None,
+        error: None,
+        delivered_by_sequence: None,
+    });
+    ChildHandleValue {
+        workflow_name: instance.workflow_name.clone(),
+        workflow_version: instance.workflow_version,
+        workflow_id: instance.workflow_id.clone(),
+        run_id: instance.run_id.clone(),
+        created,
     }
 }
 
@@ -9023,9 +9430,11 @@ pub mod testing {
                     now,
                     parent: None,
                     conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: None,
                 })
                 .await
                 .expect("create instance failed")
+                .into()
         }
 
         fn run_wait(ready_at: DateTime<Utc>) -> DurableWait {

@@ -5,7 +5,6 @@ import type {
   ClaimedActivation,
   ClaimedActivationWithInstance,
   ClaimShardTasksResult,
-  ConflictPolicy,
   CheckpointChildStart,
   CheckpointEffectMutation,
   CommitCheckpointResult,
@@ -13,6 +12,8 @@ import type {
   DurabilityProvider,
   DurableWait,
   EffectRecord,
+  GetWorkflowRunsInput,
+  GetWorkflowRunsResult,
   PersistedInstance,
   SignalRecord,
   ShardDurabilitySession,
@@ -44,6 +45,7 @@ import type {
   Schema,
   SignalWait,
   StartCommand,
+  StartWorkflowResult,
   TransitionCommand,
   WaitDefinition,
 } from "./workflow.js"
@@ -153,6 +155,7 @@ type ActivationEffectLedger = {
 type ActivationChildLedger = {
   byKey: Map<string, CheckpointChildStart>
   keyByRef: Map<string, string>
+  keyByWorkflowId: Map<string, string>
 }
 
 type ActivationHeartbeatControl = {
@@ -304,14 +307,14 @@ export class DurableRuntime {
   async start<W extends AnyWorkflow>(
     workflow: W,
     input: InputOf<W>,
-    options: { workflowId?: string; runId?: string; conflictPolicy?: ConflictPolicy } = {},
-  ): Promise<InstanceRef> {
+    options: { workflowId?: string; workflowIdReusePolicy?: "failed_only" | "not_running" | "always" } = {},
+  ): Promise<StartWorkflowResult> {
     this.registerWorkflows([workflow])
     const parsedInput = workflow.input.parse(input)
     const startCommand = workflow.initial(parsedInput)
     const now = this.now()
     const workflowId = options.workflowId ?? `${workflow.name}-${randomUUID()}`
-    const runId = options.runId ?? "run-1"
+    const runId = randomUUID()
     const partitionShard = workflowPartitionShard(workflowId, runId, this.shardCount)
     const instance = this.initialInstance(workflow, workflowId, runId, partitionShard, startCommand, now)
     const session = this.shardSessionForShard(partitionShard)
@@ -326,7 +329,7 @@ export class DurableRuntime {
       phase: instance.phase!,
       waits: instance.waits,
       now,
-      conflictPolicy: options.conflictPolicy,
+      workflowIdReusePolicy: options.workflowIdReusePolicy ?? "not_running",
     })
     this.log("info", "workflow.start", {
       workflowName: workflow.name,
@@ -336,6 +339,10 @@ export class DurableRuntime {
     })
     this.count("durable.workflow.start", { workflowName: workflow.name, workerId: this.workerId })
     return ref
+  }
+
+  async getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.shardSessionForWorkflowId(input.id).getWorkflowRuns(input)
   }
 
   async signal<W extends AnyWorkflow>(
@@ -1216,6 +1223,7 @@ export class DurableRuntime {
     return {
       byKey: new Map(),
       keyByRef: new Map(),
+      keyByWorkflowId: new Map(),
     }
   }
 
@@ -1712,11 +1720,31 @@ export class DurableRuntime {
               this.shardCount,
               instance.partitionShard,
             )
+          const workflowIdReusePolicy = options.workflowIdReusePolicy ?? "not_running"
+          const pendingWorkflowKey = workflowIdReusePolicy === "always"
+            ? undefined
+            : childLedger.keyByWorkflowId.get(childWorkflowId)
+          if (pendingWorkflowKey) {
+            const pending = childLedger.byKey.get(pendingWorkflowKey)
+            if (pending) {
+              return childHandleFromStart<W>(pending)
+            }
+          }
+          const latestChildRun = workflowIdReusePolicy === "always"
+            ? undefined
+            : (await session.getWorkflowRuns({
+                id: childWorkflowId,
+                direction: "desc",
+                limit: 1,
+              })).runs[0]
+          const reuseLatestChildRun = latestChildRun &&
+            !shouldCreateWorkflowRunForStatus(workflowIdReusePolicy, latestChildRun.status)
+          const childRunId = reuseLatestChildRun ? latestChildRun.runId : randomUUID()
           const childInstance = this.initialInstance(
             childWorkflow,
             childWorkflowId,
-            "run-1",
-            workflowPartitionShard(childWorkflowId, "run-1", this.shardCount),
+            childRunId,
+            workflowPartitionShard(childWorkflowId, childRunId, this.shardCount),
             startCommand,
             now,
           )
@@ -1725,36 +1753,22 @@ export class DurableRuntime {
             workflowVersion: childWorkflow.version,
             workflowId: childInstance.workflowId,
             runId: childInstance.runId,
+            created: !reuseLatestChildRun,
           } as ChildHandle<W>
-          const conflictPolicy = options.conflictPolicy ?? "use_existing"
           const parentClosePolicy = options.parentClosePolicy ?? "cancel"
 
           if (childDurability(options) === "checkpoint") {
             const existingForKey = childLedger.byKey.get(key)
             if (existingForKey) {
-              if (conflictPolicy === "fail") {
-                throw new Error(
-                  `Child workflow already exists for activation key: ${instance.workflowId}/${instance.runId}/${currentActivationId}/${key}`,
-                )
-              }
-              if (conflictPolicy !== "terminate_existing") {
-                return childHandleFromStart<W>(existingForKey)
-              }
-              childLedger.byKey.delete(key)
-              childLedger.keyByRef.delete(childRefKey(existingForKey.workflowId, existingForKey.runId))
+              return childHandleFromStart<W>(existingForKey)
             }
 
             const existingRefKey = childRefKey(childInstance.workflowId, childInstance.runId)
             const existingRefKeyOwner = childLedger.keyByRef.get(existingRefKey)
             if (existingRefKeyOwner && existingRefKeyOwner !== key) {
-              if (conflictPolicy === "terminate_existing") {
-                childLedger.byKey.delete(existingRefKeyOwner)
-                childLedger.keyByRef.delete(existingRefKey)
-              } else {
-                throw new Error(
-                  `Child workflow instance already exists in this activation: ${childInstance.workflowId}/${childInstance.runId}`,
-                )
-              }
+              throw new Error(
+                `Child workflow instance already exists in this activation: ${childInstance.workflowId}/${childInstance.runId}`,
+              )
             }
 
             childLedger.byKey.set(key, {
@@ -1772,9 +1786,11 @@ export class DurableRuntime {
               phase: childInstance.phase!,
               waits: childInstance.waits,
               parentClosePolicy,
-              conflictPolicy,
+              conflictPolicy: "fail",
+              workflowIdReusePolicy,
             })
             childLedger.keyByRef.set(existingRefKey, key)
+            childLedger.keyByWorkflowId.set(childInstance.workflowId, key)
 
             this.log("info", "runtime.child.start", {
               workerId: this.workerId,
@@ -1818,7 +1834,8 @@ export class DurableRuntime {
             leaseNow: this.now(),
             key,
             parentClosePolicy,
-            conflictPolicy,
+            conflictPolicy: "fail",
+            workflowIdReusePolicy,
           })
 
           this.log("info", "runtime.child.start", {
@@ -1845,6 +1862,10 @@ export class DurableRuntime {
           const bufferedKey = childLedger.keyByRef.get(childRefKey(handle.workflowId, handle.runId))
           if (bufferedKey) {
             childLedger.keyByRef.delete(childRefKey(handle.workflowId, handle.runId))
+            const buffered = childLedger.byKey.get(bufferedKey)
+            if (buffered && childLedger.keyByWorkflowId.get(buffered.workflowId) === bufferedKey) {
+              childLedger.keyByWorkflowId.delete(buffered.workflowId)
+            }
             childLedger.byKey.delete(bufferedKey)
             this.log("info", "runtime.child.cancel", {
               workerId: this.workerId,
@@ -2468,6 +2489,10 @@ export class DurableRuntime {
     return this.shardSessionForShard(workflowPartitionShard(ref.workflowId, ref.runId, this.shardCount))
   }
 
+  private shardSessionForWorkflowId(workflowId: string): ShardDurabilitySession {
+    return this.shardSessionForShard(workflowPartitionShard(workflowId, "", this.shardCount))
+  }
+
   private shardSessionForShard(shardId: number): ShardDurabilitySession {
     return this.provider.openShard({ shardId })
   }
@@ -2661,7 +2686,21 @@ function childHandleFromStart<W extends AnyWorkflow>(start: CheckpointChildStart
     workflowVersion: start.workflowVersion,
     workflowId: start.workflowId,
     runId: start.runId,
+    created: false,
   } as ChildHandle<W>
+}
+
+function shouldCreateWorkflowRunForStatus(
+  policy: "failed_only" | "not_running" | "always",
+  status: PersistedInstance["status"],
+): boolean {
+  if (policy === "always") {
+    return true
+  }
+  if (policy === "not_running") {
+    return status !== "running"
+  }
+  return status === "failed" || status === "canceled"
 }
 
 function requiresActivationHeartbeat(claim: ClaimedActivationWithInstance): boolean {

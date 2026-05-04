@@ -69,6 +69,62 @@ func (w testWorkflow) Migrate(context.Context, int, durable.MigrationArgs) (*dur
 	return nil, nil
 }
 
+func forceTerminal(t *testing.T, ctx context.Context, provider durable.DurabilityProvider, ref durable.InstanceRef, next durable.InstanceStatus, now time.Time) {
+	t.Helper()
+	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance == nil {
+		t.Fatalf("missing instance: %#v", ref)
+	}
+	shardID := durable.WorkflowPartitionShard(ref.WorkflowID, ref.RunID, 1)
+	lease, err := provider.ClaimShard(ctx, durable.ClaimDispatchShardInput{ShardID: shardID, OwnerID: "worker-a", Now: now, Lease: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease == nil {
+		t.Fatalf("failed to claim shard %d", shardID)
+	}
+	session := provider.OpenShard(durable.OpenShardInput{ShardID: shardID, OwnerID: "worker-a", LeaseEpoch: lease.LeaseEpoch})
+	claims, err := session.ClaimTasks(ctx, durable.ClaimShardTasksInput{
+		Workflows: map[string]int{instance.WorkflowName: instance.WorkflowVersion},
+		Now:       now,
+		Lease:     time.Second,
+		Limit:     100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationID := ""
+	for _, claim := range claims.Claims {
+		if claim.Activation.WorkflowID == ref.WorkflowID && claim.Activation.RunID == ref.RunID {
+			activationID = claim.Activation.ActivationID
+			break
+		}
+	}
+	if activationID == "" {
+		t.Fatalf("no activation claim for %#v", ref)
+	}
+	result, err := provider.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+		WorkflowID:       ref.WorkflowID,
+		RunID:            ref.RunID,
+		ExpectedSequence: 0,
+		ActivationID:     activationID,
+		WorkerID:         "worker-a",
+		WorkflowVersion:  1,
+		Next:             next,
+		Waits:            []durable.DurableWait{},
+		Now:              now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK {
+		t.Fatalf("terminal commit failed: %#v", result)
+	}
+}
+
 func TestRuntimeSignalFlowAndQuery(t *testing.T) {
 	ctx := context.Background()
 	clock := &manualClock{now: t0}
@@ -95,7 +151,7 @@ func TestRuntimeSignalFlowAndQuery(t *testing.T) {
 	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
 		t.Fatalf("drain signal = %#v, %v", result, err)
 	}
-	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +164,121 @@ func TestRuntimeSignalFlowAndQuery(t *testing.T) {
 	}
 	if query.(map[string]any)["status"] != "completed" {
 		t.Fatalf("query = %#v", query)
+	}
+}
+
+func TestWorkflowIDReusePoliciesAndRunPagination(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{WorkerID: "worker-a", ShardCount: 1, Clock: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := testWorkflow{}
+	workflowID := "series-policy"
+
+	first, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created || first.RunID == "run-1" {
+		t.Fatalf("first start = %#v", first)
+	}
+
+	clock.Advance(time.Millisecond)
+	duplicate, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.Created || duplicate.RunID != first.RunID {
+		t.Fatalf("duplicate start = %#v, want %s", duplicate, first.RunID)
+	}
+
+	clock.Advance(time.Millisecond)
+	always, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !always.Created || always.RunID == first.RunID {
+		t.Fatalf("always start = %#v", always)
+	}
+	forceTerminal(t, ctx, provider, always.InstanceRef, durable.InstanceStatus{Status: "completed", Output: map[string]any{"ok": true}}, clock.Now())
+
+	clock.Advance(time.Millisecond)
+	afterCompleted, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterCompleted.Created {
+		t.Fatalf("not_running did not create after completed")
+	}
+	forceTerminal(t, ctx, provider, afterCompleted.InstanceRef, durable.InstanceStatus{Status: "completed", Output: map[string]any{"ok": true}}, clock.Now())
+
+	clock.Advance(time.Millisecond)
+	failedOnlyAfterCompleted, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyFailedOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedOnlyAfterCompleted.Created || failedOnlyAfterCompleted.RunID != afterCompleted.RunID {
+		t.Fatalf("failed_only after completed = %#v", failedOnlyAfterCompleted)
+	}
+
+	clock.Advance(time.Millisecond)
+	failed, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forceTerminal(t, ctx, provider, failed.InstanceRef, durable.InstanceStatus{Status: "failed", Error: durable.SerializedError{Message: "failed"}}, clock.Now())
+
+	clock.Advance(time.Millisecond)
+	afterFailed, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyFailedOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterFailed.Created {
+		t.Fatalf("failed_only did not create after failed")
+	}
+
+	clock.Advance(time.Millisecond)
+	canceled, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyAlways})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forceTerminal(t, ctx, provider, canceled.InstanceRef, durable.InstanceStatus{Status: "canceled", Reason: "canceled"}, clock.Now())
+
+	clock.Advance(time.Millisecond)
+	afterCanceled, err := runtime.Start(ctx, workflow, map[string]any{}, durable.StartOptions{WorkflowID: workflowID, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyFailedOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterCanceled.Created {
+		t.Fatalf("failed_only did not create after canceled")
+	}
+
+	ascHead, err := runtime.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: workflowID, Direction: durable.WorkflowRunDirectionAsc, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ascHead.Runs) != 2 || ascHead.Runs[0].RunID != first.RunID || ascHead.Runs[1].RunID != always.RunID || ascHead.Cursor == "" {
+		t.Fatalf("asc head = %#v", ascHead)
+	}
+	ascNext, err := runtime.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: workflowID, Direction: durable.WorkflowRunDirectionAsc, Cursor: ascHead.Cursor, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ascNext.Runs) == 0 || ascNext.Runs[0].RunID != afterCompleted.RunID {
+		t.Fatalf("asc next = %#v", ascNext)
+	}
+	descTail, err := runtime.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: workflowID, Direction: durable.WorkflowRunDirectionDesc, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(descTail.Runs) != 1 || descTail.Runs[0].RunID != afterCanceled.RunID {
+		t.Fatalf("desc tail = %#v", descTail)
+	}
+	if _, err := runtime.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: workflowID, Direction: durable.WorkflowRunDirectionDesc, Cursor: ascHead.Cursor, Limit: 1}); err == nil {
+		t.Fatalf("direction-mismatched cursor succeeded")
 	}
 }
 
@@ -210,7 +381,7 @@ func TestSQLiteShardFileProviderRestartsFromJournals(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		refs = append(refs, ref)
+		refs = append(refs, ref.InstanceRef)
 	}
 	if err := provider.Close(ctx); err != nil {
 		t.Fatal(err)
@@ -257,7 +428,7 @@ func TestPostgresProviderRestartsFromJournalWhenConfigured(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.Close(ctx)
-	instance, err := restarted.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	instance, err := restarted.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +482,7 @@ func TestRuntimeTimerWaitFiresAfterClockAdvances(t *testing.T) {
 	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
 		t.Fatalf("due drain = %#v, %v", result, err)
 	}
-	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +555,7 @@ func TestRuntimeActivitiesCheckpointAndEagerMemoizeResults(t *testing.T) {
 			if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
 				t.Fatalf("drain = %#v, %v", result, err)
 			}
-			instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{IncludeEffects: true})
+			instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{IncludeEffects: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -480,7 +651,7 @@ func TestRuntimeChildWorkflowCompletionIsDeliveredToParent(t *testing.T) {
 			t.Fatalf("drain %d = %#v, %v", i, result, err)
 		}
 	}
-	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +710,7 @@ func TestRuntimeMigrationTaskUpgradesSnapshotVersion(t *testing.T) {
 	if result, err := runtimeV2.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
 		t.Fatalf("migration drain = %#v, %v", result, err)
 	}
-	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
+	instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -240,7 +240,7 @@ func main() {
 		if err != nil {
 			fatal(err)
 		}
-		refs = append(refs, ref)
+		refs = append(refs, ref.InstanceRef)
 		if opts.mode == "signal" || opts.mode == "mixed" {
 			if _, err := runtime.Signal(ctx, workflow, ref, "finish", map[string]any{"index": float64(i)}); err != nil {
 				fatal(err)

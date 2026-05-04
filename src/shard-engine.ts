@@ -27,6 +27,8 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  GetWorkflowRunsInput,
+  GetWorkflowRunsResult,
   HeartbeatActivationInput,
   HeartbeatActivationsInput,
   HeartbeatDispatchShardInput,
@@ -43,9 +45,10 @@ import type {
   ShardDurabilitySession,
   ShardLease,
   SignalRecord,
+  WorkflowIdReusePolicy,
 } from "./interface.js"
 import { workflowPartitionShard } from "./interface.js"
-import type { ChildHandle, InstanceRef, InstanceStatus, JsonValue, SerializedError } from "./workflow.js"
+import type { ChildHandle, InstanceRef, InstanceStatus, JsonValue, SerializedError, StartWorkflowResult } from "./workflow.js"
 import { toJson } from "./workflow.js"
 
 type RefKey = string
@@ -264,7 +267,14 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     return new ShardMemorySession(this, input)
   }
 
-  async createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  async createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
+    if (input.workflowIdReusePolicy) {
+      const latest = this.latestWorkflowRun(input.workflowId)
+      if (latest && !shouldCreateWorkflowRun(input.workflowIdReusePolicy, latest.status)) {
+        return { workflowId: latest.workflowId, runId: latest.runId, created: false }
+      }
+    }
+
     const key = refKey(input)
     const existing = this.instances.get(key)
     if (existing) {
@@ -272,7 +282,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
         throw new Error(`Workflow instance already exists: ${input.workflowId}/${input.runId}`)
       }
       if (input.conflictPolicy !== "terminate_existing") {
-        return { workflowId: input.workflowId, runId: input.runId }
+        return { workflowId: input.workflowId, runId: input.runId, created: false }
       }
       this.deleteInstanceRecords(input.workflowId, input.runId)
     }
@@ -294,7 +304,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     }
     this.instances.set(key, instance)
     this.replaceTasksForInstance(instance)
-    return { workflowId: input.workflowId, runId: input.runId }
+    return { workflowId: input.workflowId, runId: input.runId, created: true }
   }
 
   async createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
@@ -327,17 +337,11 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     if (conflict) {
       throw new Error(conflict.error.message)
     }
-    this.writeChildStart(input, input.now, {
+    return this.writeChildStart(input, input.now, {
       workflowId: input.parentWorkflowId,
       runId: input.parentRunId,
       activationId: input.activationId,
     })
-    return {
-      workflowName: input.workflowName,
-      workflowVersion: input.workflowVersion,
-      workflowId: input.workflowId,
-      runId: input.runId,
-    }
   }
 
   async cancelChild(input: CancelChildInput): Promise<void> {
@@ -389,6 +393,27 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       )
     }
     return copy
+  }
+
+  async getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    const limit = input.limit ?? 100
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new Error("limit must be a positive integer")
+    }
+    const direction = input.direction ?? "asc"
+    const cursor = decodeWorkflowRunsCursor(input.cursor, direction)
+    const sorted = this.workflowRuns(input.id)
+    const ordered = direction === "asc" ? sorted : [...sorted].reverse()
+    const afterCursor = cursor
+      ? ordered.filter((run) => compareWorkflowRunPosition(run, cursor) * (direction === "asc" ? 1 : -1) > 0)
+      : ordered
+    const page = afterCursor.slice(0, limit)
+    const runs = page.map((run) => this.cloneInstanceForRead(run, input))
+    const next = afterCursor.length > limit ? page.at(-1) : undefined
+    return {
+      runs,
+      ...(next ? { cursor: encodeWorkflowRunsCursor(next, direction) } : {}),
+    }
   }
 
   listInstances(): PersistedInstance[] {
@@ -1289,6 +1314,26 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     return this.unsafeNoClone ? value : clone(value)
   }
 
+  private cloneInstanceForRead(instance: PersistedInstance, options: LoadInstanceOptions = {}): PersistedInstance {
+    const copy = this.clone(instance)
+    if (options.includeEffects) {
+      copy.effects = [...this.effectsByActivation.values()].flat().filter((effect) =>
+        effect.activationId.startsWith(`${instance.workflowId}/${instance.runId}/`),
+      )
+    }
+    return copy
+  }
+
+  private workflowRuns(workflowId: string): PersistedInstance[] {
+    return [...this.instances.values()]
+      .filter((instance) => instance.workflowId === workflowId)
+      .sort(compareWorkflowRunsAsc)
+  }
+
+  private latestWorkflowRun(workflowId: string): PersistedInstance | undefined {
+    return this.workflowRuns(workflowId).at(-1)
+  }
+
   private validateChildStarts(input: {
     workflowId: string
     runId: string
@@ -1303,7 +1348,11 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       }
       seenKeys.add(start.key)
       const childRefKey = refKey(start)
-      if (seenRefs.has(childRefKey) && start.conflictPolicy !== "terminate_existing") {
+      if (
+        seenRefs.has(childRefKey) &&
+        start.conflictPolicy !== "terminate_existing" &&
+        (!start.workflowIdReusePolicy || start.workflowIdReusePolicy === "always")
+      ) {
         return childStartCommitConflict("duplicate_child_start_instance", start)
       }
       seenRefs.set(childRefKey, start)
@@ -1317,7 +1366,11 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
         return childStartCommitConflict("existing_child_activation_key", start)
       }
       const existingInstance = this.instances.get(childRefKey)
-      if (existingInstance && start.conflictPolicy !== "terminate_existing") {
+      if (
+        existingInstance &&
+        start.conflictPolicy !== "terminate_existing" &&
+        (!start.workflowIdReusePolicy || shouldCreateWorkflowRun(start.workflowIdReusePolicy, existingInstance.status))
+      ) {
         return childStartCommitConflict("existing_child_instance", start)
       }
     }
@@ -1328,7 +1381,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     start: CheckpointChildStart,
     now: string,
     parent: { workflowId: string; runId: string; activationId: string },
-  ): void {
+  ): ChildHandle {
     for (const child of [...this.children.values()]) {
       if (
         child.parentWorkflowId === parent.workflowId &&
@@ -1342,6 +1395,11 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     }
     if (this.instances.has(refKey(start)) && start.conflictPolicy === "terminate_existing") {
       this.deleteInstanceRecords(start.workflowId, start.runId)
+    }
+    const workflowIdReusePolicy = start.workflowIdReusePolicy
+    const latest = workflowIdReusePolicy ? this.latestWorkflowRun(start.workflowId) : undefined
+    if (latest && workflowIdReusePolicy && !shouldCreateWorkflowRun(workflowIdReusePolicy, latest.status)) {
+      return this.writeChildRecordForInstance(start, latest, parent, false)
     }
 
     const childRecordId = `child-${++this.childCounter}`
@@ -1379,6 +1437,42 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
       parentClosePolicy: start.parentClosePolicy ?? "cancel",
     })
     this.replaceTasksForInstance(childInstance)
+    return {
+      workflowName: start.workflowName,
+      workflowVersion: start.workflowVersion,
+      workflowId: start.workflowId,
+      runId: start.runId,
+      created: true,
+    }
+  }
+
+  private writeChildRecordForInstance(
+    start: Pick<CheckpointChildStart, "key" | "workflowName" | "workflowVersion" | "parentClosePolicy">,
+    instance: PersistedInstance,
+    parent: { workflowId: string; runId: string; activationId: string },
+    created: boolean,
+  ): ChildHandle {
+    const childRecordId = `child-${++this.childCounter}`
+    this.children.set(childRecordId, {
+      childRecordId,
+      parentWorkflowId: parent.workflowId,
+      parentRunId: parent.runId,
+      activationId: parent.activationId,
+      key: start.key,
+      workflowName: instance.workflowName,
+      workflowVersion: instance.workflowVersion,
+      workflowId: instance.workflowId,
+      runId: instance.runId,
+      status: "started",
+      parentClosePolicy: start.parentClosePolicy ?? "cancel",
+    })
+    return {
+      workflowName: instance.workflowName,
+      workflowVersion: instance.workflowVersion,
+      workflowId: instance.workflowId,
+      runId: instance.runId,
+      created,
+    }
   }
 
   private updateParentChildRecord(previous: PersistedInstance, input: CommitActivationInput): void {
@@ -1719,7 +1813,7 @@ class ShardMemorySession implements ShardDurabilitySession {
     this.leaseEpoch = input.leaseEpoch
   }
 
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     if (input.partitionShard !== this.shardId) {
       throw new Error(`Shard session ${this.shardId} cannot write shard ${input.partitionShard}`)
     }
@@ -1736,6 +1830,10 @@ class ShardMemorySession implements ShardDurabilitySession {
 
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null> {
     return this.provider.loadInstance(ref, options)
+  }
+
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.provider.getWorkflowRuns(input)
   }
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
@@ -1926,6 +2024,7 @@ function childHandle(record: ChildRecord): ChildHandle {
     workflowVersion: record.workflowVersion,
     workflowId: record.workflowId,
     runId: record.runId,
+    created: false,
   }
 }
 
@@ -1945,6 +2044,66 @@ function compareTasks(left: MemoryTask, right: MemoryTask): number {
 
 function refKey(ref: { workflowId: string; runId: string }): RefKey {
   return `${ref.workflowId}\0${ref.runId}`
+}
+
+function shouldCreateWorkflowRun(
+  policy: WorkflowIdReusePolicy,
+  latestStatus: PersistedInstance["status"],
+): boolean {
+  if (policy === "always") {
+    return true
+  }
+  if (policy === "not_running") {
+    return latestStatus !== "running"
+  }
+  return latestStatus === "failed" || latestStatus === "canceled"
+}
+
+function compareWorkflowRunsAsc(left: Pick<PersistedInstance, "createdAt" | "runId">, right: Pick<PersistedInstance, "createdAt" | "runId">): number {
+  return sortKey(left.createdAt, left.runId).localeCompare(sortKey(right.createdAt, right.runId))
+}
+
+function compareWorkflowRunPosition(
+  run: Pick<PersistedInstance, "createdAt" | "runId">,
+  cursor: Pick<PersistedInstance, "createdAt" | "runId">,
+): number {
+  return compareWorkflowRunsAsc(run, cursor)
+}
+
+function encodeWorkflowRunsCursor(
+  run: Pick<PersistedInstance, "createdAt" | "runId">,
+  direction: "asc" | "desc",
+): string {
+  return Buffer.from(JSON.stringify({ direction, createdAt: run.createdAt, runId: run.runId }), "utf8")
+    .toString("base64url")
+}
+
+function decodeWorkflowRunsCursor(
+  cursor: string | undefined,
+  direction: "asc" | "desc",
+): Pick<PersistedInstance, "createdAt" | "runId"> | undefined {
+  if (!cursor) {
+    return undefined
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"))
+  } catch {
+    throw new Error("Invalid workflow runs cursor")
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !("direction" in value) ||
+    !("createdAt" in value) ||
+    !("runId" in value) ||
+    value.direction !== direction ||
+    typeof value.createdAt !== "string" ||
+    typeof value.runId !== "string"
+  ) {
+    throw new Error("Invalid workflow runs cursor")
+  }
+  return { createdAt: value.createdAt, runId: value.runId }
 }
 
 function addSetValue<K>(map: Map<K, Set<string>>, key: K, value: string): void {

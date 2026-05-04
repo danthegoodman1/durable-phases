@@ -25,6 +25,8 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  GetWorkflowRunsInput,
+  GetWorkflowRunsResult,
   HeartbeatActivationInput,
   HeartbeatActivationsInput,
   HeartbeatDispatchShardInput,
@@ -43,6 +45,7 @@ import type {
   ChildRecord,
 } from "./interface.js"
 import type { ChildHandle, InstanceRef } from "./workflow.js"
+import type { StartWorkflowResult } from "./workflow.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import { countDurable, logDurable } from "./observability.js"
 import {
@@ -224,7 +227,7 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
     return new SqliteAppendShardSession(this, input)
   }
 
-  async createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  async createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     return this.mutate({ op: "createInstance", input }, () => this.store.engine.createInstance(input))
   }
 
@@ -247,6 +250,11 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
   async loadInstance(ref: InstanceRef, options: LoadInstanceOptions = {}): Promise<PersistedInstance | null> {
     await this.catchUp()
     return this.store.engine.loadInstance(ref, options)
+  }
+
+  async getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    await this.catchUp()
+    return this.store.engine.getWorkflowRuns(input)
   }
 
   async listInstances(options: LoadInstanceOptions = {}): Promise<PersistedInstance[]> {
@@ -760,7 +768,7 @@ class SqliteAppendShardSession implements ShardDurabilitySession {
     this.leaseEpoch = input.leaseEpoch
   }
 
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     if (input.partitionShard !== this.shardId) {
       throw new Error(`Shard session ${this.shardId} cannot write shard ${input.partitionShard}`)
     }
@@ -777,6 +785,10 @@ class SqliteAppendShardSession implements ShardDurabilitySession {
 
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null> {
     return this.provider.loadInstance(ref, options)
+  }
+
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.provider.getWorkflowRuns(input)
   }
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {

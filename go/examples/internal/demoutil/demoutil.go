@@ -104,7 +104,8 @@ func CleanupStore(name string) error {
 	return os.MkdirAll(filepath.Dir(storePath), 0o755)
 }
 
-func Committed(ctx context.Context, provider durable.DurabilityProvider, ref durable.InstanceRef) (any, error) {
+func Committed(ctx context.Context, provider durable.DurabilityProvider, run durable.WorkflowRunRef) (any, error) {
+	ref := run.InstanceReference()
 	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
 	if err != nil {
 		return nil, err

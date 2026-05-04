@@ -4,14 +4,15 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use durable::{
     complete, start, workflow, ActivityDurability, ActivityOptions, AppendSignalInput,
     CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput, ClaimShardTasksInput,
-    ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider, DurableRuntime,
-    DurableWait, EffectReservation, FailEffectInput, FailEffectResult, HeartbeatEffectInput,
-    InstanceRef, InstanceStatusValue, LoadInstanceOptions, NullDurabilityProvider, OpenShardInput,
-    ParentClosePolicy, PersistedInstance, PersistedStatus, PhaseSnapshot,
-    PostgresDurabilityProvider, PostgresDurabilityProviderOptions, ReserveEffectInput,
-    RunWorkerOptions, RuntimeOptions, SerializedError, SignalRecord, SqliteDurabilityOptions,
-    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation,
-    WorkflowError,
+    CommitCheckpointInput, ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider,
+    DurableRuntime, DurableWait, EffectReservation, FailEffectInput, FailEffectResult,
+    GetWorkflowRunsInput, HeartbeatEffectInput, InstanceRef, InstanceStatusValue,
+    LoadInstanceOptions, NullDurabilityProvider, OpenShardInput, ParentClosePolicy,
+    PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
+    PostgresDurabilityProviderOptions, ReserveEffectInput, RunWorkerOptions, RuntimeOptions,
+    SerializedError, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
+    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
+    WorkflowIdReusePolicy, WorkflowRunDirection,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -119,12 +120,262 @@ async fn load_runtime_instance(runtime: &DurableRuntime, ref_: &InstanceRef) -> 
         .unwrap()
 }
 
+async fn force_terminal<P>(
+    provider: &P,
+    ref_: &InstanceRef,
+    next: InstanceStatusValue,
+    now: DateTime<Utc>,
+) where
+    P: DurabilityProvider,
+{
+    let result = provider
+        .commit_checkpoint(CommitCheckpointInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            expected_sequence: 0,
+            activation_id: format!("force-terminal/{}", ref_.run_id),
+            workflow_version: 1,
+            next,
+            waits: Vec::new(),
+            now,
+            consume_signal_id: None,
+            consume_child_record_id: None,
+            effects: Vec::new(),
+            child_starts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(result.ok, "terminal commit failed: {result:?}");
+}
+
 async fn runtime_signals(runtime: &DurableRuntime) -> Vec<SignalRecord> {
     runtime.provider().list_signals().await.unwrap()
 }
 
 async fn runtime_children(runtime: &DurableRuntime) -> Vec<ChildRecord> {
     runtime.provider().list_children().await.unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn workflow_id_reuse_policies_and_run_pagination_work() {
+    let provider = NullDurabilityProvider::new();
+    let clock = ManualClock::new();
+    let runtime = DurableRuntime::with_clock(provider.clone(), {
+        let clock = clock.clone();
+        move || clock.now()
+    });
+    let workflow_id = "series-policy".to_string();
+
+    let first = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(first.created);
+    assert_ne!(first.run_id, "run-1");
+
+    clock.advance(Duration::milliseconds(1));
+    let duplicate = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!duplicate.created);
+    assert_eq!(duplicate.run_id, first.run_id);
+
+    clock.advance(Duration::milliseconds(1));
+    let always = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::Always,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(always.created);
+    assert_ne!(always.run_id, first.run_id);
+    force_terminal(
+        &provider,
+        &always,
+        InstanceStatusValue::Completed {
+            output: serde_json::json!({ "ok": true }),
+        },
+        clock.now(),
+    )
+    .await;
+
+    clock.advance(Duration::milliseconds(1));
+    let after_completed = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(after_completed.created);
+    force_terminal(
+        &provider,
+        &after_completed,
+        InstanceStatusValue::Completed {
+            output: serde_json::json!({ "ok": true }),
+        },
+        clock.now(),
+    )
+    .await;
+
+    clock.advance(Duration::milliseconds(1));
+    let failed_only_after_completed = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::FailedOnly,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!failed_only_after_completed.created);
+    assert_eq!(failed_only_after_completed.run_id, after_completed.run_id);
+
+    clock.advance(Duration::milliseconds(1));
+    let failed = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::Always,
+            },
+        )
+        .await
+        .unwrap();
+    force_terminal(
+        &provider,
+        &failed,
+        InstanceStatusValue::Failed {
+            error: SerializedError {
+                name: None,
+                message: "failed".to_string(),
+            },
+        },
+        clock.now(),
+    )
+    .await;
+
+    clock.advance(Duration::milliseconds(1));
+    let after_failed = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::FailedOnly,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(after_failed.created);
+
+    clock.advance(Duration::milliseconds(1));
+    let canceled = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::Always,
+            },
+        )
+        .await
+        .unwrap();
+    force_terminal(
+        &provider,
+        &canceled,
+        InstanceStatusValue::Canceled {
+            reason: "canceled".to_string(),
+        },
+        clock.now(),
+    )
+    .await;
+
+    clock.advance(Duration::milliseconds(1));
+    let after_canceled = runtime
+        .start::<CommitLocalChildWorkflow>(
+            CommitLocalChildInput {},
+            StartOptions {
+                workflow_id: Some(workflow_id.clone()),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::FailedOnly,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(after_canceled.created);
+
+    let asc_head = runtime
+        .get_workflow_runs(GetWorkflowRunsInput {
+            id: workflow_id.clone(),
+            cursor: None,
+            limit: Some(2),
+            direction: Some(WorkflowRunDirection::Asc),
+            include_effects: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(asc_head.runs.len(), 2);
+    assert_eq!(asc_head.runs[0].run_id, first.run_id);
+    assert_eq!(asc_head.runs[1].run_id, always.run_id);
+    assert!(asc_head.cursor.is_some());
+
+    let asc_next = runtime
+        .get_workflow_runs(GetWorkflowRunsInput {
+            id: workflow_id.clone(),
+            cursor: asc_head.cursor.clone(),
+            limit: Some(10),
+            direction: Some(WorkflowRunDirection::Asc),
+            include_effects: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        asc_next.runs.first().unwrap().run_id,
+        after_completed.run_id
+    );
+
+    let desc_tail = runtime
+        .get_workflow_runs(GetWorkflowRunsInput {
+            id: workflow_id.clone(),
+            cursor: None,
+            limit: Some(1),
+            direction: Some(WorkflowRunDirection::Desc),
+            include_effects: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(desc_tail.runs.len(), 1);
+    assert_eq!(desc_tail.runs[0].run_id, after_canceled.run_id);
+
+    let wrong_direction = runtime
+        .get_workflow_runs(GetWorkflowRunsInput {
+            id: workflow_id,
+            cursor: asc_head.cursor,
+            limit: Some(1),
+            direction: Some(WorkflowRunDirection::Desc),
+            include_effects: Some(false),
+        })
+        .await;
+    assert!(wrong_direction.is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -621,6 +872,7 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
             now,
             parent: None,
             conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
         })
         .await
         .unwrap();
@@ -961,6 +1213,7 @@ async fn shard_actors_claim_independent_shards_without_global_execution_store() 
                 now,
                 parent: None,
                 conflict_policy: Some(ConflictPolicy::Fail),
+                workflow_id_reuse_policy: None,
             })
             .await
             .unwrap();
@@ -1049,6 +1302,7 @@ async fn shard_directory_routes_signals_to_custom_partition_shard() {
             now,
             parent: None,
             conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
         })
         .await
         .unwrap();
@@ -1435,6 +1689,7 @@ where
             now,
             parent: None,
             conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
         })
         .await
         .unwrap();
@@ -1493,6 +1748,8 @@ fn checkpoint_child_start(
         }],
         parent_close_policy,
         conflict_policy: ConflictPolicy::Fail,
+        workflow_id_reuse_policy: None,
+        created: true,
     }
 }
 

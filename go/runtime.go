@@ -7,6 +7,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type RuntimeOptions struct {
@@ -28,9 +30,8 @@ type RuntimeOptions struct {
 }
 
 type StartOptions struct {
-	WorkflowID     string
-	RunID          string
-	ConflictPolicy ConflictPolicy
+	WorkflowID            string
+	WorkflowIDReusePolicy WorkflowIDReusePolicy
 }
 
 type DrainOptions struct {
@@ -134,38 +135,40 @@ func (r *Runtime) Register(workflows ...Workflow) {
 	}
 }
 
-func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, options StartOptions) (InstanceRef, error) {
+func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, options StartOptions) (StartWorkflowResult, error) {
 	r.Register(workflow)
 	start, err := workflow.Initial(ctx, input)
 	if err != nil {
-		return InstanceRef{}, err
+		return StartWorkflowResult{}, err
 	}
 	now := r.now()
 	workflowID := options.WorkflowID
 	if workflowID == "" {
 		workflowID = fmt.Sprintf("%s-%d", workflow.Name(), now.UnixNano())
 	}
-	runID := options.RunID
-	if runID == "" {
-		runID = "run-1"
+	runID := uuid.NewString()
+	reusePolicy := options.WorkflowIDReusePolicy
+	if reusePolicy == "" {
+		reusePolicy = WorkflowIDReusePolicyNotRunning
 	}
 	partitionShard := WorkflowPartitionShard(workflowID, runID, r.options.ShardCount)
 	waits, err := workflow.MaterializeWaits(ctx, start.Common, start.Phase, now)
 	if err != nil {
-		return InstanceRef{}, err
+		return StartWorkflowResult{}, err
 	}
 	session := r.provider.OpenShard(OpenShardInput{ShardID: partitionShard})
 	ref, err := session.CreateInstance(ctx, CreateInstanceInput{
-		WorkflowName:    workflow.Name(),
-		WorkflowVersion: workflow.Version(),
-		WorkflowID:      workflowID,
-		RunID:           runID,
-		PartitionShard:  partitionShard,
-		Common:          start.Common,
-		Phase:           start.Phase,
-		Waits:           waits,
-		Now:             now,
-		ConflictPolicy:  options.ConflictPolicy,
+		WorkflowName:          workflow.Name(),
+		WorkflowVersion:       workflow.Version(),
+		WorkflowID:            workflowID,
+		RunID:                 runID,
+		PartitionShard:        partitionShard,
+		Common:                start.Common,
+		Phase:                 start.Phase,
+		Waits:                 waits,
+		Now:                   now,
+		ConflictPolicy:        ConflictFail,
+		WorkflowIDReusePolicy: reusePolicy,
 	})
 	if err == nil {
 		r.log("info", "workflow.start", map[string]any{"workflowName": workflow.Name(), "workerId": r.options.WorkerID})
@@ -174,8 +177,9 @@ func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, opti
 	return ref, err
 }
 
-func (r *Runtime) Signal(ctx context.Context, workflow Workflow, ref InstanceRef, typ string, payload JSON) (SignalRecord, error) {
+func (r *Runtime) Signal(ctx context.Context, workflow Workflow, run WorkflowRunRef, typ string, payload JSON) (SignalRecord, error) {
 	r.Register(workflow)
+	ref := run.InstanceReference()
 	session := r.provider.OpenShard(OpenShardInput{ShardID: WorkflowPartitionShard(ref.WorkflowID, ref.RunID, r.options.ShardCount)})
 	signal, err := session.AppendSignal(ctx, AppendSignalInput{
 		WorkflowID: ref.WorkflowID,
@@ -191,8 +195,9 @@ func (r *Runtime) Signal(ctx context.Context, workflow Workflow, ref InstanceRef
 	return signal, err
 }
 
-func (r *Runtime) Query(ctx context.Context, workflow Workflow, ref InstanceRef, name string) (JSON, error) {
+func (r *Runtime) Query(ctx context.Context, workflow Workflow, run WorkflowRunRef, name string) (JSON, error) {
 	r.Register(workflow)
+	ref := run.InstanceReference()
 	instance, err := r.provider.LoadInstance(ctx, ref, LoadInstanceOptions{})
 	if err != nil {
 		return nil, err
@@ -201,6 +206,10 @@ func (r *Runtime) Query(ctx context.Context, workflow Workflow, ref InstanceRef,
 		return nil, fmt.Errorf("unknown workflow instance: %s/%s", ref.WorkflowID, ref.RunID)
 	}
 	return workflow.Query(ctx, name, QueryContext{Sequence: instance.Sequence, Snapshot: snapshotFromInstance(*instance)})
+}
+
+func (r *Runtime) GetWorkflowRuns(ctx context.Context, input GetWorkflowRunsInput) (GetWorkflowRunsResult, error) {
+	return r.provider.GetWorkflowRuns(ctx, input)
 }
 
 func (r *Runtime) Drain(ctx context.Context, options DrainOptions) (DrainResult, error) {
@@ -409,6 +418,7 @@ func (r *Runtime) prepareActivationCommit(ctx context.Context, claim runtimeClai
 		commitEffects:   map[string]CheckpointEffectMutation{},
 		commitChildren:  map[string]CheckpointChildStart{},
 		commitChildRefs: map[string]string{},
+		commitChildWorkflows: map[string]string{},
 	}
 	var transition Transition
 	if activation.Kind == "run" {
@@ -699,6 +709,7 @@ type Context struct {
 	commitEffects   map[string]CheckpointEffectMutation
 	commitChildren  map[string]CheckpointChildStart
 	commitChildRefs map[string]string
+	commitChildWorkflows map[string]string
 }
 
 func (c *Context) Now() time.Time {
@@ -819,14 +830,36 @@ func (c *Context) ChildStart(ctx context.Context, key string, workflow Workflow,
 	if workflowID == "" {
 		workflowID = defaultChildWorkflowID(c.workflowID, c.runID, c.sequence, key, c.shardCount, c.partitionShard)
 	}
-	runID := "run-1"
+	reusePolicy := options.WorkflowIDReusePolicy
+	if reusePolicy == "" {
+		reusePolicy = WorkflowIDReusePolicyNotRunning
+	}
+	if reusePolicy != WorkflowIDReusePolicyAlways {
+		if existingKey, ok := c.commitChildWorkflows[workflowID]; ok {
+			if existing, ok := c.commitChildren[existingKey]; ok {
+				return ChildHandleAny{WorkflowName: existing.WorkflowName, WorkflowVersion: existing.WorkflowVersion, WorkflowID: existing.WorkflowID, RunID: existing.RunID, Created: false}, nil
+			}
+		}
+	}
+	var latest *PersistedInstance
+	if reusePolicy != WorkflowIDReusePolicyAlways {
+		runs, err := c.provider.GetWorkflowRuns(ctx, GetWorkflowRunsInput{ID: workflowID, Direction: WorkflowRunDirectionDesc, Limit: 1})
+		if err != nil {
+			return ChildHandleAny{}, err
+		}
+		if len(runs.Runs) > 0 {
+			latest = &runs.Runs[0]
+		}
+	}
+	created := latest == nil || ShouldCreateWorkflowRun(reusePolicy, latest.Status)
+	runID := uuid.NewString()
+	if !created {
+		runID = latest.RunID
+	}
 	partitionShard := WorkflowPartitionShard(workflowID, runID, c.shardCount)
 	waits, err := workflow.MaterializeWaits(ctx, start.Common, start.Phase, now)
 	if err != nil {
 		return ChildHandleAny{}, err
-	}
-	if options.ConflictPolicy == "" {
-		options.ConflictPolicy = ConflictUseExisting
 	}
 	if options.ParentClosePolicy == "" {
 		options.ParentClosePolicy = ParentCloseCancel
@@ -837,25 +870,23 @@ func (c *Context) ChildStart(ctx context.Context, key string, workflow Workflow,
 	if options.Durability == ActivityCheckpoint {
 		start := CheckpointChildStart{
 			Key: key, WorkflowName: workflow.Name(), WorkflowVersion: workflow.Version(), WorkflowID: workflowID, RunID: runID, PartitionShard: partitionShard,
-			Common: start.Common, Phase: start.Phase, Waits: waits, ParentClosePolicy: options.ParentClosePolicy, ConflictPolicy: options.ConflictPolicy,
+			Common: start.Common, Phase: start.Phase, Waits: waits, ParentClosePolicy: options.ParentClosePolicy, ConflictPolicy: ConflictFail, WorkflowIDReusePolicy: reusePolicy, Created: created,
 		}
 		refKey := workflowID + "\x00" + runID
-		if existingKey, ok := c.commitChildRefs[refKey]; ok && options.ConflictPolicy != ConflictTerminateExisting {
-			if options.ConflictPolicy == ConflictFail {
-				return ChildHandleAny{}, fmt.Errorf("child workflow instance already exists in this activation: %s/%s", workflowID, runID)
-			}
+		if existingKey, ok := c.commitChildRefs[refKey]; ok {
 			if existing, ok := c.commitChildren[existingKey]; ok {
-				return ChildHandleAny{WorkflowName: existing.WorkflowName, WorkflowVersion: existing.WorkflowVersion, WorkflowID: existing.WorkflowID, RunID: existing.RunID}, nil
+				return ChildHandleAny{WorkflowName: existing.WorkflowName, WorkflowVersion: existing.WorkflowVersion, WorkflowID: existing.WorkflowID, RunID: existing.RunID, Created: existing.Created}, nil
 			}
 		}
 		c.commitChildren[key] = start
 		c.commitChildRefs[refKey] = key
-		return ChildHandleAny{WorkflowName: workflow.Name(), WorkflowVersion: workflow.Version(), WorkflowID: workflowID, RunID: runID}, nil
+		c.commitChildWorkflows[workflowID] = key
+		return ChildHandleAny{WorkflowName: workflow.Name(), WorkflowVersion: workflow.Version(), WorkflowID: workflowID, RunID: runID, Created: created}, nil
 	}
 	return c.provider.CreateChildInstance(ctx, CreateChildInstanceInput{
 		CreateInstanceInput: CreateInstanceInput{
 			WorkflowName: workflow.Name(), WorkflowVersion: workflow.Version(), WorkflowID: workflowID, RunID: runID, PartitionShard: partitionShard,
-			Common: start.Common, Phase: start.Phase, Waits: waits, Now: now, ConflictPolicy: options.ConflictPolicy,
+			Common: start.Common, Phase: start.Phase, Waits: waits, Now: now, ConflictPolicy: ConflictFail, WorkflowIDReusePolicy: reusePolicy,
 		},
 		ParentWorkflowID: c.workflowID, ParentRunID: c.runID, ActivationID: c.activationID, WorkerID: c.workerID, LeaseNow: now, Key: key, ParentClosePolicy: options.ParentClosePolicy,
 	})
@@ -870,13 +901,16 @@ func ChildStart[I any, O any](ctx context.Context, dctx *Context, key string, wo
 	if err != nil {
 		return ChildHandle[O]{}, err
 	}
-	return ChildHandle[O]{WorkflowName: raw.WorkflowName, WorkflowVersion: raw.WorkflowVersion, WorkflowID: raw.WorkflowID, RunID: raw.RunID}, nil
+	return ChildHandle[O]{WorkflowName: raw.WorkflowName, WorkflowVersion: raw.WorkflowVersion, WorkflowID: raw.WorkflowID, RunID: raw.RunID, Created: raw.Created}, nil
 }
 
 func (c *Context) ChildCancel(ctx context.Context, handle ChildHandleAny) error {
 	refKey := handle.WorkflowID + "\x00" + handle.RunID
 	if key, ok := c.commitChildRefs[refKey]; ok {
 		delete(c.commitChildRefs, refKey)
+		if start, ok := c.commitChildren[key]; ok && c.commitChildWorkflows[start.WorkflowID] == key {
+			delete(c.commitChildWorkflows, start.WorkflowID)
+		}
 		delete(c.commitChildren, key)
 		return nil
 	}

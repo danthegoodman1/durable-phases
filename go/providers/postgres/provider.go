@@ -321,12 +321,12 @@ func (p *Provider) ClaimShard(ctx context.Context, input durable.ClaimDispatchSh
 func (p *Provider) OpenShard(input durable.OpenShardInput) durable.ShardDurabilitySession {
 	return &session{provider: p, inner: p.engine.OpenShard(input)}
 }
-func (p *Provider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (p *Provider) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	operation, err := shardengine.NewJournalOperation("createInstance", input)
 	if err != nil {
-		return durable.InstanceRef{}, err
+		return durable.StartWorkflowResult{}, err
 	}
-	return mutate(p, ctx, input.PartitionShard, operation, func() (durable.InstanceRef, error) {
+	return mutate(p, ctx, input.PartitionShard, operation, func() (durable.StartWorkflowResult, error) {
 		return p.engine.CreateInstance(ctx, input)
 	}, nil)
 }
@@ -495,6 +495,9 @@ func (p *Provider) RecordActivationFailures(ctx context.Context, inputs []durabl
 func (p *Provider) ListInstances(ctx context.Context, options durable.LoadInstanceOptions) ([]durable.PersistedInstance, error) {
 	return p.engine.ListInstances(ctx, options)
 }
+func (p *Provider) GetWorkflowRuns(ctx context.Context, input durable.GetWorkflowRunsInput) (durable.GetWorkflowRunsResult, error) {
+	return p.engine.GetWorkflowRuns(ctx, input)
+}
 func (p *Provider) ListSignals(ctx context.Context) ([]durable.SignalRecord, error) {
 	return p.engine.ListSignals(ctx)
 }
@@ -522,7 +525,7 @@ type session struct {
 func (s *session) ShardID() int      { return s.inner.ShardID() }
 func (s *session) OwnerID() string   { return s.inner.OwnerID() }
 func (s *session) LeaseEpoch() int64 { return s.inner.LeaseEpoch() }
-func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	return s.provider.CreateInstance(ctx, input)
 }
 func (s *session) CreateChildInstance(ctx context.Context, input durable.CreateChildInstanceInput) (durable.ChildHandleAny, error) {

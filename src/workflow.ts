@@ -41,9 +41,14 @@ export type InstanceRef = {
   runId: string
 }
 
+export type StartWorkflowResult = InstanceRef & {
+  created: boolean
+}
+
 export type ChildHandle<W = AnyWorkflow> = InstanceRef & {
   workflowName: string
   workflowVersion: number
+  created: boolean
   __workflow?: W
 }
 
@@ -107,7 +112,7 @@ export type ChildOptions = {
   workflowId?: string
   durability?: "checkpoint" | "eager"
   parentClosePolicy?: "cancel" | "abandon"
-  conflictPolicy?: "use_existing" | "fail" | "terminate_existing"
+  workflowIdReusePolicy?: "failed_only" | "not_running" | "always"
 }
 
 export type HandlerArgs<Event = unknown> = {

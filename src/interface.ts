@@ -8,6 +8,7 @@ import type {
   JsonValue,
   PhaseSnapshot,
   SerializedError,
+  StartWorkflowResult,
 } from "./workflow.js"
 
 export type DurableWait =
@@ -95,6 +96,20 @@ export type LoadInstanceOptions = {
   includeEffects?: boolean
 }
 
+export type WorkflowRunDirection = "asc" | "desc"
+
+export type GetWorkflowRunsInput = LoadInstanceOptions & {
+  id: string
+  cursor?: string
+  limit?: number
+  direction?: WorkflowRunDirection
+}
+
+export type GetWorkflowRunsResult = {
+  runs: PersistedInstance[]
+  cursor?: string
+}
+
 export type ChildRecord = {
   childRecordId: string
   parentWorkflowId: string
@@ -114,6 +129,7 @@ export type ChildRecord = {
 }
 
 export type ConflictPolicy = "fail" | "use_existing" | "terminate_existing"
+export type WorkflowIdReusePolicy = "failed_only" | "not_running" | "always"
 
 export type CreateInstanceInput = {
   workflowName: string
@@ -127,6 +143,7 @@ export type CreateInstanceInput = {
   now: string
   parent?: PersistedInstance["parent"]
   conflictPolicy?: ConflictPolicy
+  workflowIdReusePolicy?: WorkflowIdReusePolicy
 }
 
 export type CreateChildInstanceInput = CreateInstanceInput & {
@@ -467,6 +484,7 @@ export type CheckpointChildStart = {
   waits: DurableWait[]
   parentClosePolicy?: "cancel" | "abandon"
   conflictPolicy?: ConflictPolicy
+  workflowIdReusePolicy?: WorkflowIdReusePolicy
 }
 
 export type CommitActivationInput = CommitCheckpointInput
@@ -499,10 +517,11 @@ export type ShardDurabilitySession = {
   readonly shardId: number
   readonly ownerId?: string
   readonly leaseEpoch?: number
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef>
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult>
   createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
   cancelChild(input: CancelChildInput): Promise<void>
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult>
   heartbeat(input: { now: string; leaseMs: number }): Promise<void>
@@ -523,10 +542,11 @@ export type ShardDurabilitySession = {
 export type DurabilityProvider = {
   claimShard(input: ClaimDispatchShardInput): Promise<ShardLease | null>
   openShard(input: OpenShardInput): ShardDurabilitySession
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef>
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult>
   createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle>
   cancelChild(input: CancelChildInput): Promise<void>
   loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>
@@ -552,7 +572,8 @@ export function workflowPartitionShard(workflowId: string, runId: string, shardC
   }
 
   let hash = 0x811c9dc5
-  const key = `${workflowId}\0${runId}`
+  void runId
+  const key = workflowId
   for (let index = 0; index < key.length; index += 1) {
     hash ^= key.charCodeAt(index)
     hash = Math.imul(hash, 0x01000193)

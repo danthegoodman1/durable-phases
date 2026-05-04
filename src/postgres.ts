@@ -23,6 +23,8 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  GetWorkflowRunsInput,
+  GetWorkflowRunsResult,
   HeartbeatActivationInput,
   HeartbeatActivationsInput,
   HeartbeatDispatchShardInput,
@@ -39,7 +41,7 @@ import type {
   ShardLease,
   SignalRecord,
 } from "./interface.js"
-import type { ChildHandle, InstanceRef } from "./workflow.js"
+import type { ChildHandle, InstanceRef, StartWorkflowResult } from "./workflow.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import { countDurable, logDurable } from "./observability.js"
 import {
@@ -227,7 +229,7 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return new PostgresAppendShardSession(this, input)
   }
 
-  async createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  async createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     return this.mutateShard(
       input.partitionShard,
       { op: "createInstance", input },
@@ -267,6 +269,26 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return Promise.all(instances.map(async (instance) =>
       (await this.projectionForShard(instance.partitionShard).engine.loadInstance(instance, options)) ?? instance,
     ))
+  }
+
+  async getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    await this.catchUpAllShards()
+    const runs: PersistedInstance[] = []
+    for (const projection of this.projections.values()) {
+      runs.push(...(await projection.engine.getWorkflowRuns(input)).runs)
+    }
+    const direction = input.direction ?? "asc"
+    runs.sort((left, right) =>
+      `${left.createdAt}\0${left.runId}`.localeCompare(`${right.createdAt}\0${right.runId}`),
+    )
+    if (direction === "desc") {
+      runs.reverse()
+    }
+    const limit = input.limit ?? 100
+    return {
+      runs: runs.slice(0, limit),
+      ...(runs.length > limit ? { cursor: encodeProviderWorkflowRunsCursor(runs[limit - 1]!, direction) } : {}),
+    }
   }
 
   async listSignals(): Promise<SignalRecord[]> {
@@ -1268,7 +1290,7 @@ class PostgresAppendShardSession implements ShardDurabilitySession {
     this.leaseEpoch = input.leaseEpoch
   }
 
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     if (input.partitionShard !== this.shardId) {
       throw new Error(`Instance ${input.workflowId}/${input.runId} does not belong to shard ${this.shardId}`)
     }
@@ -1285,6 +1307,10 @@ class PostgresAppendShardSession implements ShardDurabilitySession {
 
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null> {
     return this.provider.readInstanceForShard(this.shardId, ref, options)
+  }
+
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.provider.getWorkflowRuns(input)
   }
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
@@ -1415,6 +1441,14 @@ function positiveInteger(value: number, name: string): number {
 
 function partitionSuffix(partition: number): string {
   return `p${String(partition).padStart(2, "0")}`
+}
+
+function encodeProviderWorkflowRunsCursor(
+  run: Pick<PersistedInstance, "createdAt" | "runId">,
+  direction: "asc" | "desc",
+): string {
+  return Buffer.from(JSON.stringify({ direction, createdAt: run.createdAt, runId: run.runId }), "utf8")
+    .toString("base64url")
 }
 
 function encodeJson(value: unknown): string {

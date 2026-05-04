@@ -64,7 +64,7 @@ func AssertProviderConformance(t *testing.T, factory Factory) {
 				Common: map[string]any{"value": "ignored"}, Phase: durable.PhaseSnapshot{Name: "boot", Data: map[string]any{}}, Waits: []durable.DurableWait{runWait(t0)}, Now: t0, ConflictPolicy: durable.ConflictUseExisting,
 			})
 			requireNoError(t, err)
-			requireEqual(t, ref, existing)
+			requireEqual(t, ref, existing.InstanceRef)
 			loaded := load(t, ctx, provider, ref, durable.LoadInstanceOptions{})
 			requireEqual(t, "running", loaded.Status)
 			requireEqual(t, int64(0), loaded.Sequence)
@@ -413,7 +413,7 @@ func createInstance(t *testing.T, ctx context.Context, provider durable.Durabili
 		Common: options.common, Phase: options.phase, Waits: options.waits, Now: t0, ConflictPolicy: durable.ConflictFail,
 	})
 	requireNoError(t, err)
-	return ref
+	return ref.InstanceRef
 }
 
 func runWait(readyAt time.Time) durable.DurableWait {

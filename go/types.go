@@ -54,6 +54,23 @@ type InstanceRef struct {
 	RunID      string `json:"runId"`
 }
 
+func (r InstanceRef) InstanceReference() InstanceRef {
+	return r
+}
+
+type WorkflowRunRef interface {
+	InstanceReference() InstanceRef
+}
+
+type StartWorkflowResult struct {
+	InstanceRef
+	Created bool `json:"created"`
+}
+
+func (r StartWorkflowResult) InstanceReference() InstanceRef {
+	return r.InstanceRef
+}
+
 type WorkflowContract[I any, O any] struct {
 	Name    string `json:"name"`
 	Version int    `json:"version"`
@@ -217,6 +234,7 @@ type ChildHandle[O any] struct {
 	WorkflowVersion int    `json:"workflowVersion"`
 	WorkflowID      string `json:"workflowId"`
 	RunID           string `json:"runId"`
+	Created         bool   `json:"created"`
 }
 
 type ChildHandleAny struct {
@@ -224,6 +242,7 @@ type ChildHandleAny struct {
 	WorkflowVersion int    `json:"workflowVersion"`
 	WorkflowID      string `json:"workflowId"`
 	RunID           string `json:"runId"`
+	Created         bool   `json:"created"`
 }
 
 func (h ChildHandle[O]) Any() ChildHandleAny {
@@ -232,6 +251,7 @@ func (h ChildHandle[O]) Any() ChildHandleAny {
 		WorkflowVersion: h.WorkflowVersion,
 		WorkflowID:      h.WorkflowID,
 		RunID:           h.RunID,
+		Created:         h.Created,
 	}
 }
 
@@ -251,6 +271,7 @@ type ChildRecord struct {
 	WorkflowVersion     int             `json:"workflowVersion"`
 	WorkflowID          string          `json:"workflowId"`
 	RunID               string          `json:"runId"`
+	Created             bool            `json:"created"`
 	Status              string          `json:"status"`
 	ParentClosePolicy   string          `json:"parentClosePolicy"`
 	CompletedAt         time.Time       `json:"completedAt,omitempty"`
@@ -265,6 +286,32 @@ const (
 	ConflictUseExisting       ConflictPolicy = "use_existing"
 	ConflictFail              ConflictPolicy = "fail"
 	ConflictTerminateExisting ConflictPolicy = "terminate_existing"
+)
+
+type WorkflowIDReusePolicy string
+
+const (
+	WorkflowIDReusePolicyFailedOnly WorkflowIDReusePolicy = "failed_only"
+	WorkflowIDReusePolicyNotRunning WorkflowIDReusePolicy = "not_running"
+	WorkflowIDReusePolicyAlways     WorkflowIDReusePolicy = "always"
+)
+
+func ShouldCreateWorkflowRun(policy WorkflowIDReusePolicy, status string) bool {
+	switch policy {
+	case WorkflowIDReusePolicyFailedOnly:
+		return status == "failed" || status == "canceled"
+	case WorkflowIDReusePolicyAlways:
+		return true
+	default:
+		return status != "running"
+	}
+}
+
+type WorkflowRunDirection string
+
+const (
+	WorkflowRunDirectionAsc  WorkflowRunDirection = "asc"
+	WorkflowRunDirectionDesc WorkflowRunDirection = "desc"
 )
 
 type ParentClosePolicy string
@@ -313,17 +360,17 @@ func (c ActivityContext) Heartbeat(ctx context.Context, details JSON) error {
 }
 
 type ChildOptions struct {
-	WorkflowID        string
-	Durability        ActivityDurability
-	ParentClosePolicy ParentClosePolicy
-	ConflictPolicy    ConflictPolicy
+	WorkflowID            string
+	Durability            ActivityDurability
+	ParentClosePolicy     ParentClosePolicy
+	WorkflowIDReusePolicy WorkflowIDReusePolicy
 }
 
 func DefaultChildOptions() ChildOptions {
 	return ChildOptions{
-		Durability:        ActivityCheckpoint,
-		ParentClosePolicy: ParentCloseCancel,
-		ConflictPolicy:    ConflictUseExisting,
+		Durability:            ActivityCheckpoint,
+		ParentClosePolicy:     ParentCloseCancel,
+		WorkflowIDReusePolicy: WorkflowIDReusePolicyNotRunning,
 	}
 }
 
@@ -367,17 +414,18 @@ type ReadyEvent struct {
 }
 
 type CreateInstanceInput struct {
-	WorkflowName    string          `json:"workflowName"`
-	WorkflowVersion int             `json:"workflowVersion"`
-	WorkflowID      string          `json:"workflowId"`
-	RunID           string          `json:"runId"`
-	PartitionShard  int             `json:"partitionShard"`
-	Common          JSON            `json:"common"`
-	Phase           PhaseSnapshot   `json:"phase"`
-	Waits           []DurableWait   `json:"waits"`
-	Now             time.Time       `json:"now"`
-	Parent          *InstanceParent `json:"parent,omitempty"`
-	ConflictPolicy  ConflictPolicy  `json:"conflictPolicy,omitempty"`
+	WorkflowName          string                `json:"workflowName"`
+	WorkflowVersion       int                   `json:"workflowVersion"`
+	WorkflowID            string                `json:"workflowId"`
+	RunID                 string                `json:"runId"`
+	PartitionShard        int                   `json:"partitionShard"`
+	Common                JSON                  `json:"common"`
+	Phase                 PhaseSnapshot         `json:"phase"`
+	Waits                 []DurableWait         `json:"waits"`
+	Now                   time.Time             `json:"now"`
+	Parent                *InstanceParent       `json:"parent,omitempty"`
+	ConflictPolicy        ConflictPolicy        `json:"conflictPolicy,omitempty"`
+	WorkflowIDReusePolicy WorkflowIDReusePolicy `json:"workflowIdReusePolicy,omitempty"`
 }
 
 type CreateChildInstanceInput struct {
@@ -593,17 +641,32 @@ type CheckpointEffectMutation struct {
 }
 
 type CheckpointChildStart struct {
-	Key               string            `json:"key"`
-	WorkflowName      string            `json:"workflowName"`
-	WorkflowVersion   int               `json:"workflowVersion"`
-	WorkflowID        string            `json:"workflowId"`
-	RunID             string            `json:"runId"`
-	PartitionShard    int               `json:"partitionShard"`
-	Common            JSON              `json:"common"`
-	Phase             PhaseSnapshot     `json:"phase"`
-	Waits             []DurableWait     `json:"waits"`
-	ParentClosePolicy ParentClosePolicy `json:"parentClosePolicy,omitempty"`
-	ConflictPolicy    ConflictPolicy    `json:"conflictPolicy,omitempty"`
+	Key                   string                `json:"key"`
+	WorkflowName          string                `json:"workflowName"`
+	WorkflowVersion       int                   `json:"workflowVersion"`
+	WorkflowID            string                `json:"workflowId"`
+	RunID                 string                `json:"runId"`
+	PartitionShard        int                   `json:"partitionShard"`
+	Common                JSON                  `json:"common"`
+	Phase                 PhaseSnapshot         `json:"phase"`
+	Waits                 []DurableWait         `json:"waits"`
+	ParentClosePolicy     ParentClosePolicy     `json:"parentClosePolicy,omitempty"`
+	ConflictPolicy        ConflictPolicy        `json:"conflictPolicy,omitempty"`
+	WorkflowIDReusePolicy WorkflowIDReusePolicy `json:"workflowIdReusePolicy,omitempty"`
+	Created               bool                  `json:"created"`
+}
+
+type GetWorkflowRunsInput struct {
+	ID             string               `json:"id"`
+	Cursor         string               `json:"cursor,omitempty"`
+	Limit          int                  `json:"limit,omitempty"`
+	Direction      WorkflowRunDirection `json:"direction,omitempty"`
+	IncludeEffects bool                 `json:"includeEffects,omitempty"`
+}
+
+type GetWorkflowRunsResult struct {
+	Runs   []PersistedInstance `json:"runs"`
+	Cursor string              `json:"cursor,omitempty"`
 }
 
 type CommitCheckpointInput struct {
@@ -648,7 +711,7 @@ type RecordActivationFailureInput struct {
 type DurabilityProvider interface {
 	ClaimShard(context.Context, ClaimDispatchShardInput) (*ShardLease, error)
 	OpenShard(OpenShardInput) ShardDurabilitySession
-	CreateInstance(context.Context, CreateInstanceInput) (InstanceRef, error)
+	CreateInstance(context.Context, CreateInstanceInput) (StartWorkflowResult, error)
 	CreateChildInstance(context.Context, CreateChildInstanceInput) (ChildHandleAny, error)
 	CancelChild(context.Context, CancelChildInput) error
 	LoadInstance(context.Context, InstanceRef, LoadInstanceOptions) (*PersistedInstance, error)
@@ -664,6 +727,7 @@ type DurabilityProvider interface {
 	CommitCheckpoint(context.Context, CommitCheckpointInput) (CommitCheckpointResult, error)
 	RecordActivationFailures(context.Context, []RecordActivationFailureInput) error
 	ListInstances(context.Context, LoadInstanceOptions) ([]PersistedInstance, error)
+	GetWorkflowRuns(context.Context, GetWorkflowRunsInput) (GetWorkflowRunsResult, error)
 	ListSignals(context.Context) ([]SignalRecord, error)
 	ListChildren(context.Context) ([]ChildRecord, error)
 	Close(context.Context) error
@@ -673,7 +737,7 @@ type ShardDurabilitySession interface {
 	ShardID() int
 	OwnerID() string
 	LeaseEpoch() int64
-	CreateInstance(context.Context, CreateInstanceInput) (InstanceRef, error)
+	CreateInstance(context.Context, CreateInstanceInput) (StartWorkflowResult, error)
 	CreateChildInstance(context.Context, CreateChildInstanceInput) (ChildHandleAny, error)
 	CancelChild(context.Context, CancelChildInput) error
 	ReadInstance(context.Context, InstanceRef, LoadInstanceOptions) (*PersistedInstance, error)
@@ -713,10 +777,9 @@ func WorkflowPartitionShard(workflowID, runID string, shardCount int) int {
 	if shardCount <= 0 {
 		panic("shardCount must be positive")
 	}
+	_ = runID
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(workflowID))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(runID))
 	return int(h.Sum32() % uint32(shardCount))
 }
 

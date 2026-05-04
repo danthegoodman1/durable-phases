@@ -87,7 +87,7 @@ async fn async_main() -> Result<(), WorkflowError> {
                     .await?
             }
             BenchMode::Signal => {
-                let ref_ = runtimes[0]
+                let started = runtimes[0]
                     .start::<SignalWorkflow>(
                         BenchInput { index },
                         StartOptions {
@@ -96,6 +96,7 @@ async fn async_main() -> Result<(), WorkflowError> {
                         },
                     )
                     .await?;
+                let ref_ = started.instance_ref();
                 runtimes[0]
                     .signal(
                         &ref_,
@@ -106,7 +107,7 @@ async fn async_main() -> Result<(), WorkflowError> {
                     )
                     .await?;
                 SIGNALS.fetch_add(1, Ordering::Relaxed);
-                ref_
+                started
             }
             BenchMode::Timer => {
                 runtimes[0]
@@ -134,7 +135,7 @@ async fn async_main() -> Result<(), WorkflowError> {
                     .await?
             }
             BenchMode::Mixed => {
-                let ref_ = runtimes[0]
+                let started = runtimes[0]
                     .start::<MixedParentWorkflow>(
                         BenchInput { index },
                         StartOptions {
@@ -143,6 +144,7 @@ async fn async_main() -> Result<(), WorkflowError> {
                         },
                     )
                     .await?;
+                let ref_ = started.instance_ref();
                 runtimes[0]
                     .signal(
                         &ref_,
@@ -153,11 +155,11 @@ async fn async_main() -> Result<(), WorkflowError> {
                     )
                     .await?;
                 SIGNALS.fetch_add(1, Ordering::Relaxed);
-                ref_
+                started
             }
         };
         WORKFLOW_STARTS.fetch_add(1, Ordering::Relaxed);
-        refs.push(ref_);
+        refs.push(ref_.instance_ref());
     }
     let setup_ms = setup_started_at.elapsed().as_secs_f64() * 1_000.0;
     let processing_started_at = Instant::now();

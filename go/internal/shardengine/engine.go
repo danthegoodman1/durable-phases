@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -216,22 +217,27 @@ func (p *Provider) OpenShard(input durable.OpenShardInput) durable.ShardDurabili
 	return &session{provider: p, shardID: input.ShardID, ownerID: input.OwnerID, leaseEpoch: input.LeaseEpoch}
 }
 
-func (p *Provider) CreateInstance(_ context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (p *Provider) CreateInstance(_ context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.createInstanceLocked(input)
 }
 
-func (p *Provider) createInstanceLocked(input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (p *Provider) createInstanceLocked(input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
+	if input.WorkflowIDReusePolicy != "" {
+		if latest, ok := p.latestWorkflowRunLocked(input.WorkflowID); ok && !durable.ShouldCreateWorkflowRun(input.WorkflowIDReusePolicy, latest.Status) {
+			return durable.StartWorkflowResult{InstanceRef: durable.InstanceRef{WorkflowID: latest.WorkflowID, RunID: latest.RunID}, Created: false}, nil
+		}
+	}
 	key := refKey(input.WorkflowID, input.RunID)
 	if _, ok := p.instances[key]; ok {
 		switch input.ConflictPolicy {
 		case durable.ConflictFail:
-			return durable.InstanceRef{}, fmt.Errorf("workflow instance already exists: %s/%s", input.WorkflowID, input.RunID)
+			return durable.StartWorkflowResult{}, fmt.Errorf("workflow instance already exists: %s/%s", input.WorkflowID, input.RunID)
 		case durable.ConflictTerminateExisting:
 			p.deleteInstanceRecordsLocked(input.WorkflowID, input.RunID)
 		default:
-			return durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID}, nil
+			return durable.StartWorkflowResult{InstanceRef: durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID}, Created: false}, nil
 		}
 	}
 	instance := durable.PersistedInstance{
@@ -251,7 +257,7 @@ func (p *Provider) createInstanceLocked(input durable.CreateInstanceInput) (dura
 	}
 	p.instances[key] = instance
 	p.replaceTasksForInstanceLocked(instance)
-	return durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID}, nil
+	return durable.StartWorkflowResult{InstanceRef: durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID}, Created: true}, nil
 }
 
 func (p *Provider) CreateChildInstance(_ context.Context, input durable.CreateChildInstanceInput) (durable.ChildHandleAny, error) {
@@ -277,8 +283,7 @@ func (p *Provider) CreateChildInstance(_ context.Context, input durable.CreateCh
 	if conflict := p.validateChildStartsLocked(input.ParentWorkflowID, input.ParentRunID, input.ActivationID, []durable.CheckpointChildStart{childStartFromCreate(input)}); conflict != nil {
 		return durable.ChildHandleAny{}, conflict.err
 	}
-	p.writeChildStartLocked(childStartFromCreate(input), input.Now, input.ParentWorkflowID, input.ParentRunID, input.ActivationID)
-	return durable.ChildHandleAny{WorkflowName: input.WorkflowName, WorkflowVersion: input.WorkflowVersion, WorkflowID: input.WorkflowID, RunID: input.RunID}, nil
+	return p.writeChildStartLocked(childStartFromCreate(input), input.Now, input.ParentWorkflowID, input.ParentRunID, input.ActivationID), nil
 }
 
 func (p *Provider) CancelChild(_ context.Context, input durable.CancelChildInput) error {
@@ -634,6 +639,74 @@ func (p *Provider) ListInstances(_ context.Context, options durable.LoadInstance
 		return refKey(out[i].WorkflowID, out[i].RunID) < refKey(out[j].WorkflowID, out[j].RunID)
 	})
 	return out, nil
+}
+
+func (p *Provider) GetWorkflowRuns(_ context.Context, input durable.GetWorkflowRunsInput) (durable.GetWorkflowRunsResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.getWorkflowRunsLocked(input)
+}
+
+func (p *Provider) getWorkflowRunsLocked(input durable.GetWorkflowRunsInput) (durable.GetWorkflowRunsResult, error) {
+	limit := input.Limit
+	if limit == 0 {
+		limit = 100
+	}
+	if limit < 0 {
+		return durable.GetWorkflowRunsResult{}, fmt.Errorf("limit must be a positive integer")
+	}
+	direction := input.Direction
+	if direction == "" {
+		direction = durable.WorkflowRunDirectionAsc
+	}
+	cursorCreatedAt, cursorRunID, hasCursor, err := decodeWorkflowRunsCursor(input.Cursor, direction)
+	if err != nil {
+		return durable.GetWorkflowRunsResult{}, err
+	}
+	runs := make([]durable.PersistedInstance, 0)
+	for _, instance := range p.instances {
+		if instance.WorkflowID == input.ID {
+			runs = append(runs, p.cloneInstanceForReadLocked(instance, input.IncludeEffects))
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool { return compareWorkflowRuns(runs[i], runs[j]) < 0 })
+	if direction == durable.WorkflowRunDirectionDesc {
+		for i, j := 0, len(runs)-1; i < j; i, j = i+1, j-1 {
+			runs[i], runs[j] = runs[j], runs[i]
+		}
+	}
+	if hasCursor {
+		filtered := runs[:0]
+		for _, run := range runs {
+			createdAt, runID := workflowRunPosition(run)
+			if direction == durable.WorkflowRunDirectionDesc {
+				if createdAt < cursorCreatedAt || (createdAt == cursorCreatedAt && runID < cursorRunID) {
+					filtered = append(filtered, run)
+				}
+			} else if createdAt > cursorCreatedAt || (createdAt == cursorCreatedAt && runID > cursorRunID) {
+				filtered = append(filtered, run)
+			}
+		}
+		runs = filtered
+	}
+	next := ""
+	if len(runs) > limit {
+		next = encodeWorkflowRunsCursor(runs[limit-1], direction)
+		runs = runs[:limit]
+	}
+	return durable.GetWorkflowRunsResult{Runs: runs, Cursor: next}, nil
+}
+
+func (p *Provider) cloneInstanceForReadLocked(instance durable.PersistedInstance, includeEffects bool) durable.PersistedInstance {
+	cp := clone(instance)
+	if includeEffects {
+		for activationID, effects := range p.effectsByActivation {
+			if strings.HasPrefix(activationID, instance.WorkflowID+"/"+instance.RunID+"/") {
+				cp.Effects = append(cp.Effects, clone(effects)...)
+			}
+		}
+	}
+	return cp
 }
 
 func (p *Provider) ListSignals(_ context.Context) ([]durable.SignalRecord, error) {
@@ -1211,14 +1284,25 @@ func (p *Provider) validateChildStartsLocked(workflowID, runID, activationID str
 				return &childStartConflict{reason: "existing_child_activation_key", err: fmt.Errorf("existing child activation key: %s", start.Key)}
 			}
 		}
-		if _, ok := p.instances[childRef]; ok && start.ConflictPolicy != durable.ConflictTerminateExisting {
+		reusesLatest := false
+		if start.WorkflowIDReusePolicy != "" {
+			if latest, ok := p.latestWorkflowRunLocked(start.WorkflowID); ok {
+				reusesLatest = latest.RunID == start.RunID && !durable.ShouldCreateWorkflowRun(start.WorkflowIDReusePolicy, latest.Status)
+			}
+		}
+		if _, ok := p.instances[childRef]; ok && start.ConflictPolicy != durable.ConflictTerminateExisting && !reusesLatest {
 			return &childStartConflict{reason: "existing_child_instance", err: fmt.Errorf("child workflow instance already exists: %s/%s", start.WorkflowID, start.RunID)}
 		}
 	}
 	return nil
 }
 
-func (p *Provider) writeChildStartLocked(start durable.CheckpointChildStart, now time.Time, parentWorkflowID, parentRunID, activationID string) {
+func (p *Provider) writeChildStartLocked(start durable.CheckpointChildStart, now time.Time, parentWorkflowID, parentRunID, activationID string) durable.ChildHandleAny {
+	if start.WorkflowIDReusePolicy != "" {
+		if latest, ok := p.latestWorkflowRunLocked(start.WorkflowID); ok && !durable.ShouldCreateWorkflowRun(start.WorkflowIDReusePolicy, latest.Status) {
+			return p.writeChildRecordForInstanceLocked(start, latest, parentWorkflowID, parentRunID, activationID, false)
+		}
+	}
 	if start.ConflictPolicy == durable.ConflictTerminateExisting {
 		var existingRefs []durable.InstanceRef
 		for _, child := range p.children {
@@ -1263,10 +1347,36 @@ func (p *Provider) writeChildStartLocked(start durable.CheckpointChildStart, now
 		WorkflowVersion:   start.WorkflowVersion,
 		WorkflowID:        start.WorkflowID,
 		RunID:             start.RunID,
+		Created:           true,
 		Status:            "started",
 		ParentClosePolicy: parentClose,
 	}
 	p.replaceTasksForInstanceLocked(childInstance)
+	return durable.ChildHandleAny{WorkflowName: start.WorkflowName, WorkflowVersion: start.WorkflowVersion, WorkflowID: start.WorkflowID, RunID: start.RunID, Created: true}
+}
+
+func (p *Provider) writeChildRecordForInstanceLocked(start durable.CheckpointChildStart, instance durable.PersistedInstance, parentWorkflowID, parentRunID, activationID string, created bool) durable.ChildHandleAny {
+	p.childCounter++
+	childRecordID := fmt.Sprintf("child-%d", p.childCounter)
+	parentClose := string(start.ParentClosePolicy)
+	if parentClose == "" {
+		parentClose = string(durable.ParentCloseCancel)
+	}
+	p.children[childRecordID] = durable.ChildRecord{
+		ChildRecordID:     childRecordID,
+		ParentWorkflowID:  parentWorkflowID,
+		ParentRunID:       parentRunID,
+		ActivationID:      activationID,
+		Key:               start.Key,
+		WorkflowName:      instance.WorkflowName,
+		WorkflowVersion:   instance.WorkflowVersion,
+		WorkflowID:        instance.WorkflowID,
+		RunID:             instance.RunID,
+		Created:           created,
+		Status:            "started",
+		ParentClosePolicy: parentClose,
+	}
+	return durable.ChildHandleAny{WorkflowName: instance.WorkflowName, WorkflowVersion: instance.WorkflowVersion, WorkflowID: instance.WorkflowID, RunID: instance.RunID, Created: created}
 }
 
 func (p *Provider) updateParentChildRecordLocked(previous durable.PersistedInstance, input durable.CommitCheckpointInput) {
@@ -1552,26 +1662,86 @@ func checkpointEffectsToRecords(workflowID, runID, activationID string, now time
 
 func childStartFromCreate(input durable.CreateChildInstanceInput) durable.CheckpointChildStart {
 	return durable.CheckpointChildStart{
-		Key:               input.Key,
-		WorkflowName:      input.WorkflowName,
-		WorkflowVersion:   input.WorkflowVersion,
-		WorkflowID:        input.WorkflowID,
-		RunID:             input.RunID,
-		PartitionShard:    input.PartitionShard,
-		Common:            input.Common,
-		Phase:             input.Phase,
-		Waits:             input.Waits,
-		ParentClosePolicy: input.ParentClosePolicy,
-		ConflictPolicy:    input.ConflictPolicy,
+		Key:                   input.Key,
+		WorkflowName:          input.WorkflowName,
+		WorkflowVersion:       input.WorkflowVersion,
+		WorkflowID:            input.WorkflowID,
+		RunID:                 input.RunID,
+		PartitionShard:        input.PartitionShard,
+		Common:                input.Common,
+		Phase:                 input.Phase,
+		Waits:                 input.Waits,
+		ParentClosePolicy:     input.ParentClosePolicy,
+		ConflictPolicy:        input.ConflictPolicy,
+		WorkflowIDReusePolicy: input.WorkflowIDReusePolicy,
+		Created:               true,
 	}
 }
 
 func childHandle(record durable.ChildRecord) durable.ChildHandleAny {
-	return durable.ChildHandleAny{WorkflowName: record.WorkflowName, WorkflowVersion: record.WorkflowVersion, WorkflowID: record.WorkflowID, RunID: record.RunID}
+	return durable.ChildHandleAny{WorkflowName: record.WorkflowName, WorkflowVersion: record.WorkflowVersion, WorkflowID: record.WorkflowID, RunID: record.RunID, Created: record.Created}
 }
 
 func refKey(workflowID, runID string) string {
 	return workflowID + "\x00" + runID
+}
+
+func (p *Provider) latestWorkflowRunLocked(workflowID string) (durable.PersistedInstance, bool) {
+	var latest durable.PersistedInstance
+	ok := false
+	for _, instance := range p.instances {
+		if instance.WorkflowID != workflowID {
+			continue
+		}
+		if !ok || compareWorkflowRuns(instance, latest) > 0 {
+			latest = instance
+			ok = true
+		}
+	}
+	return latest, ok
+}
+
+func compareWorkflowRuns(left, right durable.PersistedInstance) int {
+	if left.CreatedAt.Before(right.CreatedAt) {
+		return -1
+	}
+	if left.CreatedAt.After(right.CreatedAt) {
+		return 1
+	}
+	if left.RunID < right.RunID {
+		return -1
+	}
+	if left.RunID > right.RunID {
+		return 1
+	}
+	return 0
+}
+
+func workflowRunPosition(instance durable.PersistedInstance) (int64, string) {
+	return instance.CreatedAt.UnixNano(), instance.RunID
+}
+
+func encodeWorkflowRunsCursor(instance durable.PersistedInstance, direction durable.WorkflowRunDirection) string {
+	createdAt, runID := workflowRunPosition(instance)
+	return fmt.Sprintf("v1|%s|%d|%s", direction, createdAt, runID)
+}
+
+func decodeWorkflowRunsCursor(cursor string, direction durable.WorkflowRunDirection) (int64, string, bool, error) {
+	if cursor == "" {
+		return 0, "", false, nil
+	}
+	parts := strings.SplitN(cursor, "|", 4)
+	if len(parts) != 4 || parts[0] != "v1" {
+		return 0, "", false, fmt.Errorf("invalid workflow runs cursor")
+	}
+	if durable.WorkflowRunDirection(parts[1]) != direction {
+		return 0, "", false, fmt.Errorf("workflow runs cursor was created for a different direction")
+	}
+	createdAt, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return 0, "", false, fmt.Errorf("invalid workflow runs cursor")
+	}
+	return createdAt, parts[3], true, nil
 }
 
 func activationIDFromParts(workflowID, runID string, sequence int64, kind, eventID string) string {
@@ -1770,9 +1940,9 @@ func (s *session) ShardID() int      { return s.shardID }
 func (s *session) OwnerID() string   { return s.ownerID }
 func (s *session) LeaseEpoch() int64 { return s.leaseEpoch }
 
-func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.InstanceRef, error) {
+func (s *session) CreateInstance(ctx context.Context, input durable.CreateInstanceInput) (durable.StartWorkflowResult, error) {
 	if input.PartitionShard != s.shardID {
-		return durable.InstanceRef{}, fmt.Errorf("shard session %d cannot write shard %d", s.shardID, input.PartitionShard)
+		return durable.StartWorkflowResult{}, fmt.Errorf("shard session %d cannot write shard %d", s.shardID, input.PartitionShard)
 	}
 	return s.provider.CreateInstance(ctx, input)
 }

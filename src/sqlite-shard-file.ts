@@ -23,6 +23,8 @@ import type {
   EffectReservation,
   FailEffectInput,
   FailEffectResult,
+  GetWorkflowRunsInput,
+  GetWorkflowRunsResult,
   HeartbeatActivationsInput,
   HeartbeatActivationInput,
   HeartbeatDispatchShardInput,
@@ -40,7 +42,7 @@ import type {
   SignalRecord,
 } from "./interface.js"
 import { workflowPartitionShard } from "./interface.js"
-import type { ChildHandle, InstanceRef } from "./workflow.js"
+import type { ChildHandle, InstanceRef, StartWorkflowResult } from "./workflow.js"
 import type { DurableObservability } from "./observability.js"
 import {
   SqliteDurabilityProvider,
@@ -79,6 +81,10 @@ export class SqliteShardFileDurabilityProvider implements DurabilityProvider {
   async listInstances(options?: LoadInstanceOptions): Promise<PersistedInstance[]> {
     const groups = await Promise.all(this.providersForAllShards().map((provider) => provider.listInstances(options)))
     return groups.flat().sort(compareInstances)
+  }
+
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.providerForRef(input.id, "").getWorkflowRuns(input)
   }
 
   async listSignals(): Promise<SignalRecord[]> {
@@ -121,7 +127,7 @@ export class SqliteShardFileDurabilityProvider implements DurabilityProvider {
     return new SqliteShardFileSession(this, this.providerForShard(shardId).openShard(input))
   }
 
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     this.assertInputShard(input)
     return this.providerForRef(input.workflowId, input.runId).createInstance(input)
   }
@@ -361,7 +367,7 @@ class SqliteShardFileSession implements ShardDurabilitySession {
     return this.inner.leaseEpoch
   }
 
-  createInstance(input: CreateInstanceInput): Promise<InstanceRef> {
+  createInstance(input: CreateInstanceInput): Promise<StartWorkflowResult> {
     return this.provider.createInstance(input)
   }
 
@@ -375,6 +381,10 @@ class SqliteShardFileSession implements ShardDurabilitySession {
 
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null> {
     return this.inner.readInstance(ref, options)
+  }
+
+  getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
+    return this.inner.getWorkflowRuns(input)
   }
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
