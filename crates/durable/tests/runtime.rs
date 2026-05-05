@@ -3,16 +3,17 @@ mod examples;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use durable::{
     complete, go, start, workflow, ActivityDurability, ActivityOptions, AppendSignalInput,
-    CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput, ClaimShardTasksInput,
-    CommitCheckpointInput, ConflictPolicy, CreateInstanceInput, DrainOptions, DurabilityProvider,
-    DurableRuntime, DurableWait, EffectReservation, FailEffectInput, FailEffectResult,
-    GetWorkflowRunsInput, HeartbeatEffectInput, InstanceRef, InstanceStatusValue,
-    LoadInstanceOptions, NullDurabilityProvider, OpenShardInput, ParentClosePolicy,
-    PersistedInstance, PersistedStatus, PhaseSnapshot, PostgresDurabilityProvider,
-    PostgresDurabilityProviderOptions, ReserveEffectInput, RunShardStepOptions, RunWorkerOptions,
-    RuntimeOptions, SerializedError, SignalOptions, SignalRecord, SqliteDurabilityOptions,
-    SqliteDurabilityProvider, SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation,
-    WorkflowError, WorkflowIdReusePolicy, WorkflowRunDirection,
+    CancelChildInput, CheckpointChildStart, ChildOptions, ChildRecord, ClaimShardInput,
+    ClaimShardTasksInput, CommitCheckpointInput, ConflictPolicy, CreateChildInstanceInput,
+    CreateInstanceInput, DrainOptions, DurabilityProvider, DurableRuntime, DurableWait,
+    EffectReservation, FailEffectInput, FailEffectResult, GetWorkflowRunsInput,
+    HeartbeatEffectInput, InstanceRef, InstanceStatusValue, LoadInstanceOptions,
+    NullDurabilityProvider, OpenShardInput, ParentClosePolicy, PersistedInstance, PersistedStatus,
+    PhaseSnapshot, PostgresDurabilityProvider, PostgresDurabilityProviderOptions,
+    ReserveEffectInput, RunShardStepOptions, RunWorkerOptions, RuntimeOptions, SerializedError,
+    SignalOptions, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
+    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
+    WorkflowIdReusePolicy, WorkflowRunDirection,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Barrier;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static COMMIT_LOCAL_CHILD_SHOULD_THROW: AtomicBool = AtomicBool::new(false);
@@ -256,6 +258,16 @@ async fn load_runtime_instance(runtime: &DurableRuntime, ref_: &InstanceRef) -> 
         .await
         .unwrap()
         .unwrap()
+}
+
+fn mailbox_signal_wait(name: &str, signal_type: &str) -> DurableWait {
+    DurableWait::Signal {
+        name: name.to_string(),
+        r#type: signal_type.to_string(),
+        scope: durable::WaitScope::Phase,
+        delivery: durable::SignalDelivery::Mailbox,
+        after_signal_sequence: None,
+    }
 }
 
 async fn force_terminal<P>(
@@ -1370,6 +1382,831 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
     assert_eq!(signals.len(), 2);
     assert_eq!(signals[0].payload["index"], 1);
     assert_eq!(signals[1].payload["index"], 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sqlite_provider_catches_up_stale_instances_before_reads_writes_and_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let provider_a = SqliteDurabilityProvider::new_with_options(
+        &path,
+        SqliteDurabilityOptions {
+            snapshot_interval: 2,
+        },
+    )
+    .unwrap();
+    let provider_b = SqliteDurabilityProvider::new_with_options(
+        &path,
+        SqliteDurabilityOptions {
+            snapshot_interval: 2,
+        },
+    )
+    .unwrap();
+    let ref_ = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_sqlite_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-sqlite-catchup".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert!(provider_b.load_instance(&ref_).await.unwrap().is_some());
+    let duplicate_start = provider_b
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_sqlite_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            partition_shard: 0,
+            common: serde_json::json!({ "duplicate": true }),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::UseExisting),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert!(!duplicate_start.created);
+
+    let first = provider_a
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "a" }),
+            received_at: now,
+            idempotency_key: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+    let second = provider_a
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "second" }),
+            received_at: now + Duration::seconds(1),
+            idempotency_key: Some("request-2".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_b
+            .list_signals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|signal| signal.signal_id)
+            .collect::<Vec<_>>(),
+        vec![first.signal_id.clone(), second.signal_id.clone()]
+    );
+    let duplicate = provider_b
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "b" }),
+            received_at: now + Duration::seconds(2),
+            idempotency_key: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate.signal_id, first.signal_id);
+    assert_eq!(duplicate.payload["sender"], "a");
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let journal_entries: i64 = connection
+        .query_row("SELECT count(*) FROM shard_journal", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_entries, 3);
+    drop(connection);
+
+    let session_ref = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_sqlite_session_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-sqlite-session-catchup".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    let lease = provider_a
+        .claim_shard(ClaimShardInput {
+            shard_id: 0,
+            owner_id: "worker-a".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_session = provider_a.open_shard(OpenShardInput {
+        shard_id: 0,
+        owner_id: Some(lease.owner_id.clone()),
+        lease_epoch: Some(lease.lease_epoch),
+    });
+    let before_signal = stale_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: HashMap::from([("rust_sqlite_session_catchup".to_string(), 1)]),
+            shard_count: 1,
+            now,
+            lease_ms: 60_000,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert!(before_signal.claims.is_empty());
+    stale_session
+        .release_activation("missing-activation", "worker-a")
+        .await
+        .unwrap();
+
+    let third = provider_b
+        .append_signal(AppendSignalInput {
+            workflow_id: session_ref.workflow_id.clone(),
+            run_id: session_ref.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "third" }),
+            received_at: now + Duration::seconds(3),
+            idempotency_key: Some("request-3".to_string()),
+        })
+        .await
+        .unwrap();
+    let duplicate_from_session = stale_session
+        .append_signal_with_status(AppendSignalInput {
+            workflow_id: session_ref.workflow_id.clone(),
+            run_id: session_ref.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "session" }),
+            received_at: now + Duration::seconds(4),
+            idempotency_key: Some("request-3".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate_from_session.0.signal_id, third.signal_id);
+    assert!(!duplicate_from_session.1);
+    let claim = stale_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: HashMap::from([("rust_sqlite_session_catchup".to_string(), 1)]),
+            shard_count: 1,
+            now: now + Duration::seconds(4),
+            lease_ms: 60_000,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(claim.claims.len(), 1);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let journal_entries: i64 = connection
+        .query_row("SELECT count(*) FROM shard_journal", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_entries, 7);
+
+    let parent_ref = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_sqlite_child_parent".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-sqlite-child-parent".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: Vec::new(),
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    let child_input = CreateChildInstanceInput {
+        workflow_name: "rust_sqlite_child".to_string(),
+        workflow_version: 1,
+        workflow_id: "rust-sqlite-child".to_string(),
+        run_id: "run-1".to_string(),
+        partition_shard: 0,
+        common: serde_json::json!({}),
+        phase: PhaseSnapshot {
+            name: "waiting".to_string(),
+            data: serde_json::json!({}),
+        },
+        waits: Vec::new(),
+        now,
+        parent_workflow_id: parent_ref.workflow_id.clone(),
+        parent_run_id: parent_ref.run_id.clone(),
+        activation_id: "activation-child".to_string(),
+        worker_id: "worker-a".to_string(),
+        lease_now: now,
+        key: "child".to_string(),
+        parent_close_policy: ParentClosePolicy::Cancel,
+        conflict_policy: ConflictPolicy::Fail,
+        workflow_id_reuse_policy: None,
+    };
+    let child = provider_a
+        .create_child_instance(child_input.clone())
+        .await
+        .unwrap();
+    let duplicate_child = provider_b
+        .create_child_instance(child_input.clone())
+        .await
+        .unwrap();
+    assert_eq!(duplicate_child, child);
+    let cancel_child = CancelChildInput {
+        parent_workflow_id: parent_ref.workflow_id.clone(),
+        parent_run_id: parent_ref.run_id.clone(),
+        activation_id: "activation-child".to_string(),
+        worker_id: "worker-a".to_string(),
+        workflow_id: child.workflow_id.clone(),
+        run_id: child.run_id.clone(),
+        now,
+    };
+    provider_b.cancel_child(cancel_child.clone()).await.unwrap();
+    stale_session.cancel_child(cancel_child).await.unwrap();
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let journal_entries: i64 = connection
+        .query_row("SELECT count(*) FROM shard_journal", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_entries, 10);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_provider_catches_up_stale_instances_before_reads_writes_and_sessions_when_configured(
+) {
+    let Ok(connection_string) = std::env::var("DURABLE_POSTGRES_URL") else {
+        return;
+    };
+    let schema = format!(
+        "durable_rust_catchup_{}_{}",
+        std::process::id(),
+        Utc::now().timestamp_millis().abs()
+    );
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let provider_a = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(2),
+    })
+    .await
+    .unwrap();
+    let provider_b = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(2),
+    })
+    .await
+    .unwrap();
+
+    let ref_ = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-postgres-catchup".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert!(provider_b
+        .load_instance(
+            &ref_,
+            LoadInstanceOptions {
+                include_effects: true
+            },
+        )
+        .await
+        .unwrap()
+        .is_some());
+    let duplicate_start = provider_b
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            partition_shard: 0,
+            common: serde_json::json!({ "duplicate": true }),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::UseExisting),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    assert!(!duplicate_start.created);
+
+    let first = provider_a
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "a" }),
+            received_at: now,
+            idempotency_key: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+    let second = provider_a
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "second" }),
+            received_at: now + Duration::seconds(1),
+            idempotency_key: Some("request-2".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_b
+            .list_signals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|signal| signal.signal_id)
+            .collect::<Vec<_>>(),
+        vec![first.signal_id.clone(), second.signal_id.clone()]
+    );
+    let duplicate = provider_b
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "b" }),
+            received_at: now + Duration::seconds(2),
+            idempotency_key: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate.signal_id, first.signal_id);
+    assert_eq!(duplicate.payload["sender"], "a");
+
+    let (client, connection) = tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let journal_table = format!("\"{schema}\".\"shard_journal_p00\"");
+    let journal_entries: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {journal_table} WHERE shard_id = 0"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal_entries, 3);
+    let snapshot_table = format!("\"{schema}\".\"shard_snapshots_p00\"");
+    let snapshot_json: String = client
+        .query_one(
+            &format!("SELECT snapshot_json FROM {snapshot_table} WHERE shard_id = 0"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+    assert!(snapshot_value.get("store").is_some());
+    assert!(snapshot_value.get("applied_entries").is_some());
+
+    let old_snapshot_json = serde_json::json!({
+        "instances": {},
+        "signals": [],
+        "children": [],
+        "tasks": {},
+        "claimed_sequence_epochs": {},
+        "completed_activation_claims": [],
+        "shard_leases": {},
+        "next_signal_id": 1,
+        "next_effect_id": 1,
+        "next_child_id": 1
+    })
+    .to_string();
+    client
+        .execute(
+            &format!("UPDATE {snapshot_table} SET snapshot_json = $1 WHERE shard_id = 0"),
+            &[&old_snapshot_json],
+        )
+        .await
+        .unwrap();
+    let old_snapshot_reloaded =
+        PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+            connection_string: connection_string.clone(),
+            schema: Some(schema.clone()),
+            physical_partitions: 2,
+            snapshot_interval: Some(2),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        old_snapshot_reloaded
+            .list_signals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|signal| signal.signal_id)
+            .collect::<Vec<_>>(),
+        vec![first.signal_id.clone(), second.signal_id.clone()]
+    );
+
+    let session_ref = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_session_catchup".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-postgres-session-catchup".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    let lease = provider_a
+        .claim_shard(ClaimShardInput {
+            shard_id: 0,
+            owner_id: "worker-a".to_string(),
+            now,
+            lease_ms: 60_000,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_session = provider_a.open_shard(OpenShardInput {
+        shard_id: 0,
+        owner_id: Some(lease.owner_id.clone()),
+        lease_epoch: Some(lease.lease_epoch),
+    });
+    let before_signal = stale_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: HashMap::from([("rust_postgres_session_catchup".to_string(), 1)]),
+            shard_count: 1,
+            now,
+            lease_ms: 60_000,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert!(before_signal.claims.is_empty());
+    stale_session
+        .release_activation("missing-activation", "worker-a")
+        .await
+        .unwrap();
+
+    let third = provider_b
+        .append_signal(AppendSignalInput {
+            workflow_id: session_ref.workflow_id.clone(),
+            run_id: session_ref.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "third" }),
+            received_at: now + Duration::seconds(3),
+            idempotency_key: Some("request-3".to_string()),
+        })
+        .await
+        .unwrap();
+    let duplicate_from_session = stale_session
+        .append_signal_with_status(AppendSignalInput {
+            workflow_id: session_ref.workflow_id.clone(),
+            run_id: session_ref.run_id.clone(),
+            r#type: "finish".to_string(),
+            payload: serde_json::json!({ "sender": "session" }),
+            received_at: now + Duration::seconds(4),
+            idempotency_key: Some("request-3".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate_from_session.0.signal_id, third.signal_id);
+    assert!(!duplicate_from_session.1);
+    let claim = stale_session
+        .claim_tasks(ClaimShardTasksInput {
+            workflows: HashMap::from([("rust_postgres_session_catchup".to_string(), 1)]),
+            shard_count: 1,
+            now: now + Duration::seconds(4),
+            lease_ms: 60_000,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(claim.claims.len(), 1);
+
+    let journal_entries: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {journal_table} WHERE shard_id = 0"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal_entries, 7);
+
+    let parent_ref = provider_a
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_child_parent".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-postgres-child-parent".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: Vec::new(),
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    let child_input = CreateChildInstanceInput {
+        workflow_name: "rust_postgres_child".to_string(),
+        workflow_version: 1,
+        workflow_id: "rust-postgres-child".to_string(),
+        run_id: "run-1".to_string(),
+        partition_shard: 0,
+        common: serde_json::json!({}),
+        phase: PhaseSnapshot {
+            name: "waiting".to_string(),
+            data: serde_json::json!({}),
+        },
+        waits: Vec::new(),
+        now,
+        parent_workflow_id: parent_ref.workflow_id.clone(),
+        parent_run_id: parent_ref.run_id.clone(),
+        activation_id: "activation-child".to_string(),
+        worker_id: "worker-a".to_string(),
+        lease_now: now,
+        key: "child".to_string(),
+        parent_close_policy: ParentClosePolicy::Cancel,
+        conflict_policy: ConflictPolicy::Fail,
+        workflow_id_reuse_policy: None,
+    };
+    let child = provider_a
+        .create_child_instance(child_input.clone())
+        .await
+        .unwrap();
+    let duplicate_child = provider_b
+        .create_child_instance(child_input.clone())
+        .await
+        .unwrap();
+    assert_eq!(duplicate_child, child);
+    let cancel_child = CancelChildInput {
+        parent_workflow_id: parent_ref.workflow_id.clone(),
+        parent_run_id: parent_ref.run_id.clone(),
+        activation_id: "activation-child".to_string(),
+        worker_id: "worker-a".to_string(),
+        workflow_id: child.workflow_id.clone(),
+        run_id: child.run_id.clone(),
+        now,
+    };
+    provider_b.cancel_child(cancel_child.clone()).await.unwrap();
+    stale_session.cancel_child(cancel_child).await.unwrap();
+
+    let journal_entries: i64 = client
+        .query_one(
+            &format!("SELECT count(*) FROM {journal_table} WHERE shard_id = 0"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal_entries, 10);
+
+    client
+        .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_provider_serializes_concurrent_cross_shard_signal_ids_when_configured() {
+    let Ok(connection_string) = std::env::var("DURABLE_POSTGRES_URL") else {
+        return;
+    };
+    let schema = format!(
+        "durable_rust_cross_shard_ids_{}_{}",
+        std::process::id(),
+        Utc::now().timestamp_millis().abs()
+    );
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let bootstrap = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(100),
+    })
+    .await
+    .unwrap();
+    let ref_a = bootstrap
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_cross_shard_a".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-postgres-cross-shard-a".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 0,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+    let ref_b = bootstrap
+        .create_instance(CreateInstanceInput {
+            workflow_name: "rust_postgres_cross_shard_b".to_string(),
+            workflow_version: 1,
+            workflow_id: "rust-postgres-cross-shard-b".to_string(),
+            run_id: "run-1".to_string(),
+            partition_shard: 1,
+            common: serde_json::json!({}),
+            phase: PhaseSnapshot {
+                name: "waiting".to_string(),
+                data: serde_json::json!({}),
+            },
+            waits: vec![mailbox_signal_wait("finish", "finish")],
+            now,
+            parent: None,
+            conflict_policy: Some(ConflictPolicy::Fail),
+            workflow_id_reuse_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let provider_a = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(100),
+    })
+    .await
+    .unwrap();
+    let provider_b = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(100),
+    })
+    .await
+    .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let task_a = tokio::spawn({
+        let provider = provider_a.clone();
+        let ref_ = ref_a.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "sender": "a" }),
+                    received_at: now,
+                    idempotency_key: Some("cross-shard-a".to_string()),
+                })
+                .await
+        }
+    });
+    let task_b = tokio::spawn({
+        let provider = provider_b.clone();
+        let ref_ = ref_b.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            provider
+                .append_signal(AppendSignalInput {
+                    workflow_id: ref_.workflow_id.clone(),
+                    run_id: ref_.run_id.clone(),
+                    r#type: "finish".to_string(),
+                    payload: serde_json::json!({ "sender": "b" }),
+                    received_at: now + Duration::milliseconds(1),
+                    idempotency_key: Some("cross-shard-b".to_string()),
+                })
+                .await
+        }
+    });
+    let (signal_a, signal_b) = tokio::join!(task_a, task_b);
+    let signal_a = signal_a.unwrap().unwrap();
+    let signal_b = signal_b.unwrap().unwrap();
+    assert_ne!(signal_a.signal_id, signal_b.signal_id);
+
+    let reloaded = PostgresDurabilityProvider::create(PostgresDurabilityProviderOptions {
+        connection_string: connection_string.clone(),
+        schema: Some(schema.clone()),
+        physical_partitions: 2,
+        snapshot_interval: Some(100),
+    })
+    .await
+    .unwrap();
+    let signals = reloaded.list_signals().await.unwrap();
+    let reloaded_a = signals
+        .iter()
+        .find(|signal| signal.idempotency_key.as_deref() == Some("cross-shard-a"))
+        .unwrap();
+    let reloaded_b = signals
+        .iter()
+        .find(|signal| signal.idempotency_key.as_deref() == Some("cross-shard-b"))
+        .unwrap();
+    assert_eq!(reloaded_a.signal_id, signal_a.signal_id);
+    assert_eq!(reloaded_b.signal_id, signal_b.signal_id);
+
+    let (client, connection) = tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let journal_p00 = format!("\"{schema}\".\"shard_journal_p00\"");
+    let journal_p01 = format!("\"{schema}\".\"shard_journal_p01\"");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT global_entry_id FROM {journal_p00}
+                 UNION ALL
+                 SELECT global_entry_id FROM {journal_p01}
+                 ORDER BY global_entry_id"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let global_entry_ids = rows
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(global_entry_ids.len(), 4);
+    assert!(global_entry_ids
+        .windows(2)
+        .all(|window| window[0] < window[1]));
+
+    client
+        .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
