@@ -821,6 +821,186 @@ describe("durable workflow PoC", () => {
     })).rejects.toThrow("Invalid workflow runs cursor")
   })
 
+  it("startSendSignal atomically starts, signals existing runs, and preserves early signals", async () => {
+    const path = await storePath()
+    const clock = manualClock()
+    const DirectWorkflow = defineWorkflow({
+      name: "start_send_direct",
+      version: 1,
+      input: z.object({ label: z.string() }),
+      output: z.object({ label: z.string(), value: z.string() }),
+      common: z.object({ label: z.string() }),
+      initial(input) {
+        return start({ common: { label: input.label }, phase: "waiting", data: {} })
+      },
+      phases: {
+        waiting: phase({
+          on: {
+            finish: signal(z.object({ value: z.string() }), async ({ common, event }) =>
+              complete({ label: common.label, value: event.value }),
+            ),
+          },
+        }),
+      },
+    })
+    const LaterWorkflow = defineWorkflow({
+      name: "start_send_later",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ value: z.string() }),
+      initial() {
+        return start({ phase: "boot", data: {} })
+      },
+      phases: {
+        boot: phase({
+          run: async () => go("waiting", {}),
+        }),
+        waiting: phase({
+          on: {
+            finish: signal(z.object({ value: z.string() }), async ({ event }) =>
+              complete({ value: event.value }),
+            ),
+          },
+        }),
+      },
+    })
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, {
+      clock: clock.clock,
+      workflows: [DirectWorkflow, LaterWorkflow],
+    })
+
+    const started = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "first" },
+      "finish",
+      { value: "one" },
+      { workflowId: "start-send-runtime", runId: "request-1" },
+    )
+    expect(started).toMatchObject({
+      workflowId: "start-send-runtime",
+      runId: "request-1",
+      created: true,
+      signal: { runId: "request-1", payload: { value: "one" }, idempotencyKey: "request-1" },
+    })
+    const existing = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "ignored" },
+      "finish",
+      { value: "two" },
+      { workflowId: "start-send-runtime", idempotencyKey: "request-2" },
+    )
+    expect(existing).toMatchObject({
+      workflowId: "start-send-runtime",
+      runId: "request-1",
+      created: false,
+      signal: { runId: "request-1", payload: { value: "two" }, idempotencyKey: "request-2" },
+    })
+    await expect(provider.loadInstance(started)).resolves.toMatchObject({
+      common: { label: "first" },
+    })
+    await runtime.drain({ maxActivations: 1 })
+    await expect(provider.loadInstance(started)).resolves.toMatchObject({
+      status: "completed",
+      output: { label: "first", value: "one" },
+    })
+    clock.advance(1)
+    const retry = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "ignored" },
+      "finish",
+      { value: "ignored" },
+      { workflowId: "start-send-runtime", runId: "request-1" },
+    )
+    expect(retry.signal.signalId).toBe(started.signal.signalId)
+    clock.advance(1)
+    const secondRun = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "second-run" },
+      "finish",
+      { value: "three" },
+      { workflowId: "start-send-runtime", idempotencyKey: "request-3" },
+    )
+    expect(secondRun.created).toBe(true)
+    expect(secondRun.runId).not.toBe(started.runId)
+    const retryWhileNewRunIsActive = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "ignored" },
+      "finish",
+      { value: "ignored" },
+      { workflowId: "start-send-runtime", runId: "request-1" },
+    )
+    expect(retryWhileNewRunIsActive.signal.signalId).toBe(started.signal.signalId)
+    await runtime.drain({ maxActivations: 1 })
+
+    await expect(
+      runtime.startSendSignal(DirectWorkflow, { label: "bad" }, "finish", { value: "bad" }, {
+        runId: "missing-workflow-id",
+      }),
+    ).rejects.toThrow("runId requires workflowId")
+
+    const generated = await runtime.startSendSignal(
+      DirectWorkflow,
+      { label: "generated" },
+      "finish",
+      { value: "generated" },
+    )
+    expect(generated.workflowId).toContain("start_send_direct-")
+    expect(generated.signal.idempotencyKey).toBe(generated.runId)
+    await runtime.drain({ maxActivations: 1 })
+
+    const early = await runtime.startSendSignal(
+      LaterWorkflow,
+      {},
+      "finish",
+      { value: "early" },
+      { workflowId: "start-send-later", runId: "later-request" },
+    )
+    await runtime.drain({ maxActivations: 2 })
+    await expect(provider.loadInstance(early)).resolves.toMatchObject({
+      status: "completed",
+      output: { value: "early" },
+    })
+  })
+
+  it("startSendSignal rejects ambiguous TypeScript signal schemas before persistence", async () => {
+    const path = await storePath()
+    const AmbiguousWorkflow = defineWorkflow({
+      name: "ambiguous_start_send",
+      version: 1,
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      initial() {
+        return start({ phase: "one", data: {} })
+      },
+      phases: {
+        one: phase({
+          on: {
+            finish: signal(z.object({ value: z.string() }), async () => go("two", {})),
+          },
+        }),
+        two: phase({
+          on: {
+            finish: signal(z.object({ value: z.number() }), async () => complete({ ok: true })),
+          },
+        }),
+      },
+    })
+    const provider = testProvider(path)
+    const runtime = new DurableRuntime(provider, { workflows: [AmbiguousWorkflow] })
+    await expect(
+      runtime.startSendSignal(
+        AmbiguousWorkflow,
+        {},
+        "finish",
+        { value: "nope" },
+        { workflowId: "ambiguous-start-send", runId: "request-1" },
+      ),
+    ).rejects.toThrow("Ambiguous signal finish")
+    await expect(provider.getWorkflowRuns({ id: "ambiguous-start-send" })).resolves.toMatchObject({ runs: [] })
+    await expect(provider.listSignals()).resolves.toEqual([])
+  })
+
   it("emits runtime and provider observability without high-cardinality metric tags", async () => {
     const path = await storePath()
     const observed = observabilityCollector()

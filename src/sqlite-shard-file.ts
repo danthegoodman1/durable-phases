@@ -40,6 +40,8 @@ import type {
   ShardDurabilitySession,
   ShardLease,
   SignalRecord,
+  StartSendSignalInput,
+  StartSendSignalResult,
 } from "./interface.js"
 import { workflowPartitionShard } from "./interface.js"
 import type { ChildHandle, InstanceRef, StartWorkflowResult } from "./workflow.js"
@@ -148,6 +150,11 @@ export class SqliteShardFileDurabilityProvider implements DurabilityProvider {
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     return this.providerForRef(input.workflowId, input.runId).appendSignal(input)
+  }
+
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    this.assertInputShard(input)
+    return this.providerForRef(input.workflowId, input.runId).startSendSignal(input)
   }
 
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null> {
@@ -389,6 +396,10 @@ class SqliteShardFileSession implements ShardDurabilitySession {
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     return this.inner.appendSignal(input)
+  }
+
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    return this.provider.startSendSignal(input)
   }
 
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult> {

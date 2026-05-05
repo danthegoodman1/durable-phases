@@ -531,6 +531,25 @@ impl DurabilityProvider for SqliteDurabilityProvider {
         .await
     }
 
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        self.write_caught_up(|| async {
+            let (output, mutated) = self
+                .inner
+                .start_send_signal_with_status(input.clone())
+                .await?;
+            let operation = if mutated {
+                Some(JournalOperation::StartSendSignal(input))
+            } else {
+                None
+            };
+            Ok((output, operation))
+        })
+        .await
+    }
+
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
         self.write_caught_up(|| async {
             let should_append = cancel_child_would_mutate(&self.inner, &input).await?;
@@ -753,6 +772,27 @@ impl ShardDurabilitySession for SqliteShardSession {
                 let (output, created) = inner.append_signal_with_status(input.clone()).await?;
                 let operation = if created {
                     Some(JournalOperation::AppendSignal(input))
+                } else {
+                    None
+                };
+                Ok((output, operation))
+            })
+            .await
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        self.provider
+            .write_caught_up(|| async {
+                let (output, mutated) = self
+                    .provider
+                    .inner
+                    .start_send_signal_with_status(input.clone())
+                    .await?;
+                let operation = if mutated {
+                    Some(JournalOperation::StartSendSignal(input))
                 } else {
                     None
                 };
@@ -1236,6 +1276,15 @@ impl DurabilityProvider for SqliteShardFileDurabilityProvider {
             .await
     }
 
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        self.provider_for_shard(input.partition_shard)?
+            .start_send_signal(input)
+            .await
+    }
+
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
         self.provider_for_ref(&input.parent_workflow_id, &input.parent_run_id)?
             .cancel_child(input)
@@ -1445,6 +1494,13 @@ impl ShardDurabilitySession for FailedShardSession {
         &self,
         _input: AppendSignalInput,
     ) -> Result<SignalRecord, WorkflowError> {
+        Err(self.error.clone())
+    }
+
+    async fn start_send_signal(
+        &self,
+        _input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
         Err(self.error.clone())
     }
 

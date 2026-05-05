@@ -698,6 +698,330 @@ export function describeDurabilityProviderConformance(
       })
     })
 
+    it("atomically starts and signals, signals existing runs, and honors reuse policy", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const started = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "start-send",
+          runId: "run-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T0,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 1 },
+          signalReceivedAt: T0,
+          signalIdempotencyKey: "run-1",
+        })
+        expect(started).toMatchObject({
+          workflowId: "start-send",
+          runId: "run-1",
+          created: true,
+          signal: {
+            workflowId: "start-send",
+            runId: "run-1",
+            type: "finish",
+            payload: { index: 1 },
+            idempotencyKey: "run-1",
+          },
+        })
+        await expect(provider.loadInstance(started)).resolves.toMatchObject({
+          workflowId: "start-send",
+          runId: "run-1",
+          status: "running",
+          waits: [signalWait("finish")],
+        })
+
+        const duplicate = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "start-send",
+          runId: "run-1",
+          partitionShard: 0,
+          common: { ignored: true },
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T1,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 99 },
+          signalReceivedAt: T1,
+          signalIdempotencyKey: "run-1",
+        })
+        expect(duplicate).toEqual({ ...started, created: false })
+        await expect(provider.listSignals()).resolves.toHaveLength(1)
+
+        const existing = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "start-send",
+          runId: "run-candidate",
+          partitionShard: 0,
+          common: { ignored: true },
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T2,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 2 },
+          signalReceivedAt: T2,
+          signalIdempotencyKey: "run-candidate",
+        })
+        expect(existing).toMatchObject({
+          workflowId: "start-send",
+          runId: "run-1",
+          created: false,
+          signal: { runId: "run-1", payload: { index: 2 }, idempotencyKey: "run-candidate" },
+        })
+        await expect(provider.getWorkflowRuns({ id: "start-send" })).resolves.toMatchObject({
+          runs: [{ runId: "run-1" }],
+        })
+
+        const session = await ownShard(provider, "worker-a", T0)
+        const activation = requireSignalEventActivation(await claim(provider, "worker-a", T0))
+        await expect(
+          session.commitCheckpoint({
+            workflowId: "start-send",
+            runId: "run-1",
+            expectedSequence: 0,
+            activationId: activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { index: 1 } },
+            waits: [],
+            now: T2,
+            consumeSignalId: activation.event.consumeSignalId,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+
+        await expect(
+          provider.startSendSignal({
+            workflowName: "conformance",
+            workflowVersion: 1,
+            workflowId: "start-send",
+            runId: "run-failed-only-rejected",
+            partitionShard: 0,
+            common: {},
+            phase: { name: "waiting", data: {} },
+            waits: [signalWait("finish")],
+            now: T2,
+            workflowIdReusePolicy: "failed_only",
+            signalType: "finish",
+            signalPayload: { index: 3 },
+            signalReceivedAt: T2,
+            signalIdempotencyKey: "run-failed-only-rejected",
+          }),
+        ).rejects.toThrow()
+
+        const afterCompleted = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "start-send",
+          runId: "run-2",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T5,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 4 },
+          signalReceivedAt: T5,
+          signalIdempotencyKey: "run-2",
+        })
+        expect(afterCompleted).toMatchObject({
+          workflowId: "start-send",
+          runId: "run-2",
+          created: true,
+          signal: { runId: "run-2", payload: { index: 4 } },
+        })
+      })
+    })
+
+    it("deduplicates concurrent start-send-signal calls across provider instances and replay", async () => {
+      await withStore(factory, async (store) => {
+        const providerA = await store.createProvider()
+        const providerB = await store.createProvider()
+        const input = {
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "start-send-race",
+          runId: "request-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T0,
+          workflowIdReusePolicy: "not_running" as const,
+          signalType: "finish",
+          signalPayload: { sender: "first" },
+          signalReceivedAt: T0,
+          signalIdempotencyKey: "request-1",
+        }
+
+        const [left, right] = await Promise.all([
+          providerA.startSendSignal(input),
+          providerB.startSendSignal(input),
+        ])
+        expect([left.created, right.created].sort()).toEqual([false, true])
+        expect(left.signal).toEqual(right.signal)
+        await expect(providerA.getWorkflowRuns({ id: "start-send-race" })).resolves.toMatchObject({
+          runs: [{ runId: "request-1" }],
+        })
+        await expect(providerA.listSignals()).resolves.toEqual([left.signal])
+
+        const replayed = await store.createProvider()
+        await expect(replayed.getWorkflowRuns({ id: "start-send-race" })).resolves.toMatchObject({
+          runs: [{ runId: "request-1" }],
+        })
+        await expect(replayed.listSignals()).resolves.toEqual([left.signal])
+      })
+    })
+
+    it("uses explicit targetRunId to disambiguate running runs and terminal retries", async () => {
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        await provider.createInstance({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "targeted-start-send",
+          runId: "run-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T0,
+          conflictPolicy: "fail",
+        })
+        await provider.createInstance({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "targeted-start-send",
+          runId: "run-2",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T1,
+          conflictPolicy: "fail",
+          workflowIdReusePolicy: "always",
+        })
+
+        const targeted = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "targeted-start-send",
+          runId: "run-1",
+          targetRunId: "run-1",
+          partitionShard: 0,
+          common: { ignored: true },
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T2,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 1 },
+          signalReceivedAt: T2,
+          signalIdempotencyKey: "target-run-1",
+        })
+        expect(targeted).toMatchObject({
+          workflowId: "targeted-start-send",
+          runId: "run-1",
+          created: false,
+          signal: { runId: "run-1", idempotencyKey: "target-run-1" },
+        })
+
+        const implicit = await provider.startSendSignal({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "targeted-start-send",
+          runId: "run-candidate",
+          partitionShard: 0,
+          common: { ignored: true },
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T5,
+          workflowIdReusePolicy: "not_running",
+          signalType: "finish",
+          signalPayload: { index: 2 },
+          signalReceivedAt: T5,
+          signalIdempotencyKey: "implicit-latest",
+        })
+        expect(implicit).toMatchObject({
+          workflowId: "targeted-start-send",
+          runId: "run-2",
+          created: false,
+          signal: { runId: "run-2", idempotencyKey: "implicit-latest" },
+        })
+      })
+
+      await withStore(factory, async (store) => {
+        const provider = await store.createProvider()
+        const firstInput = {
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "terminal-targeted-start-send",
+          runId: "run-1",
+          targetRunId: "run-1",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T0,
+          workflowIdReusePolicy: "not_running" as const,
+          signalType: "finish",
+          signalPayload: { index: 3 },
+          signalReceivedAt: T0,
+          signalIdempotencyKey: "terminal-run-1",
+        }
+        const first = await provider.startSendSignal(firstInput)
+        const session = await ownShard(provider, "worker-a", T0)
+        const activation = requireSignalEventActivation(await claim(provider, "worker-a", T0))
+        await expect(
+          session.commitCheckpoint({
+            workflowId: "terminal-targeted-start-send",
+            runId: "run-1",
+            expectedSequence: 0,
+            activationId: activation.activationId,
+            workerId: "worker-a",
+            workflowVersion: 1,
+            next: { status: "completed", output: { index: 3 } },
+            waits: [],
+            now: T2,
+            consumeSignalId: activation.event.consumeSignalId,
+          }),
+        ).resolves.toEqual({ ok: true, sequence: 1 })
+        await provider.createInstance({
+          workflowName: "conformance",
+          workflowVersion: 1,
+          workflowId: "terminal-targeted-start-send",
+          runId: "run-2",
+          partitionShard: 0,
+          common: {},
+          phase: { name: "waiting", data: {} },
+          waits: [signalWait("finish")],
+          now: T5,
+          conflictPolicy: "fail",
+          workflowIdReusePolicy: "not_running",
+        })
+
+        await expect(provider.startSendSignal({ ...firstInput, now: T5, signalReceivedAt: T5 }))
+          .resolves.toMatchObject({ runId: "run-1", signal: { signalId: first.signal.signalId } })
+        await expect(
+          provider.startSendSignal({
+            ...firstInput,
+            now: T5,
+            signalReceivedAt: T5,
+            signalIdempotencyKey: "different-terminal-key",
+          }),
+        ).rejects.toThrow(/already closed/)
+      })
+    })
+
     it("future-only signal waits ignore already-present signals without consuming them", async () => {
       await withStore(factory, async (store) => {
         const provider = await store.createProvider()

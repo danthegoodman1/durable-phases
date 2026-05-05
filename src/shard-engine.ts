@@ -45,6 +45,8 @@ import type {
   ShardDurabilitySession,
   ShardLease,
   SignalRecord,
+  StartSendSignalInput,
+  StartSendSignalResult,
   WorkflowIdReusePolicy,
 } from "./interface.js"
 import { workflowPartitionShard } from "./interface.js"
@@ -307,6 +309,132 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     return { workflowId: input.workflowId, runId: input.runId, created: true }
   }
 
+  async startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    return (await this.startSendSignalWithStatus(input)).result
+  }
+
+  async startSendSignalWithStatus(
+    input: StartSendSignalInput,
+  ): Promise<{ result: StartSendSignalResult; mutated: boolean }> {
+    if (input.targetRunId && input.targetRunId !== input.runId) {
+      throw new Error("startSendSignal targetRunId must match runId")
+    }
+
+    const exact = this.instances.get(refKey(input))
+    const existingExactSignal = this.findSignalByIdempotencyKey({
+      workflowId: input.workflowId,
+      runId: input.runId,
+      type: input.signalType,
+      payload: input.signalPayload,
+      receivedAt: input.signalReceivedAt,
+      idempotencyKey: input.signalIdempotencyKey,
+    })
+    if (existingExactSignal) {
+      return {
+        result: {
+          workflowId: input.workflowId,
+          runId: input.runId,
+          created: false,
+          signal: existingExactSignal,
+        },
+        mutated: false,
+      }
+    }
+
+    if (input.targetRunId && exact) {
+      if (exact.status !== "running") {
+        throw new Error(`Workflow run already closed: ${exact.workflowId}/${exact.runId}`)
+      }
+      const appended = this.appendSignalToInstance(exact, {
+        workflowId: exact.workflowId,
+        runId: exact.runId,
+        type: input.signalType,
+        payload: input.signalPayload,
+        receivedAt: input.signalReceivedAt,
+        idempotencyKey: input.signalIdempotencyKey,
+      })
+      return {
+        result: {
+          workflowId: exact.workflowId,
+          runId: exact.runId,
+          created: false,
+          signal: appended.signal,
+        },
+        mutated: appended.created,
+      }
+    }
+
+    if (exact && exact.status !== "running") {
+      throw new Error(`Workflow run already closed: ${exact.workflowId}/${exact.runId}`)
+    }
+
+    const running = this.latestRunningWorkflowRun(input.workflowId)
+    if (running && !input.targetRunId) {
+      const appended = this.appendSignalToInstance(running, {
+        workflowId: running.workflowId,
+        runId: running.runId,
+        type: input.signalType,
+        payload: input.signalPayload,
+        receivedAt: input.signalReceivedAt,
+        idempotencyKey: input.signalIdempotencyKey,
+      })
+      return {
+        result: {
+          workflowId: running.workflowId,
+          runId: running.runId,
+          created: false,
+          signal: appended.signal,
+        },
+        mutated: appended.created,
+      }
+    }
+
+    if (running) {
+      throw new Error(`Workflow ID ${input.workflowId} already has running run ${running.runId}`)
+    }
+
+    const reusePolicy = input.workflowIdReusePolicy ?? "not_running"
+    const latest = this.latestWorkflowRun(input.workflowId)
+    if (latest && !shouldCreateWorkflowRun(reusePolicy, latest.status)) {
+      throw new Error(`Workflow ID reuse policy ${reusePolicy} prevents starting ${input.workflowId}`)
+    }
+
+    const instance: PersistedInstance = {
+      workflowName: input.workflowName,
+      workflowVersion: input.workflowVersion,
+      workflowId: input.workflowId,
+      runId: input.runId,
+      partitionShard: input.partitionShard,
+      sequence: 0,
+      status: "running",
+      common: this.clone(input.common),
+      phase: this.clone(input.phase),
+      waits: this.stampSignalWaits(input.waits),
+      createdAt: input.now,
+      updatedAt: input.now,
+      ...(input.parent ? { parent: this.clone(input.parent) } : {}),
+    }
+    this.instances.set(refKey(input), instance)
+    this.replaceTasksForInstance(instance)
+    const appended = this.appendSignalToInstance(instance, {
+      workflowId: input.workflowId,
+      runId: input.runId,
+      type: input.signalType,
+      payload: input.signalPayload,
+      receivedAt: input.signalReceivedAt,
+      idempotencyKey: input.signalIdempotencyKey,
+    })
+    return {
+      result: {
+        workflowId: input.workflowId,
+        runId: input.runId,
+        created: true,
+        signal: appended.signal,
+      },
+      mutated: true,
+    }
+  }
+
   async createChildInstance(input: CreateChildInstanceInput): Promise<ChildHandle> {
     if (!this.replaying) {
       this.assertShardOwnerForRef(input.workflowId, input.runId, input.workerId, input.leaseNow)
@@ -491,9 +619,16 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
 
   async appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     const instance = this.instances.get(refKey(input))
+    return this.appendSignalToInstance(instance, input).signal
+  }
+
+  private appendSignalToInstance(
+    instance: PersistedInstance | undefined,
+    input: AppendSignalInput,
+  ): { signal: SignalRecord; created: boolean } {
     const existing = this.findSignalByIdempotencyKey(input)
     if (existing) {
-      return existing
+      return { signal: existing, created: false }
     }
     const idempotencyKey = input.idempotencyKey || undefined
     const signal: SignalRecord = {
@@ -509,7 +644,7 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     if (instance?.status === "running") {
       this.refreshSignalTasksForInstance(instance)
     }
-    return this.clone(signal)
+    return { signal: this.clone(signal), created: true }
   }
 
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<ShardLease | null> {
@@ -1397,6 +1532,10 @@ export class ShardMemoryDurabilityProvider implements DurabilityProvider {
     return this.workflowRuns(workflowId).at(-1)
   }
 
+  private latestRunningWorkflowRun(workflowId: string): PersistedInstance | undefined {
+    return this.workflowRuns(workflowId).filter((instance) => instance.status === "running").at(-1)
+  }
+
   private validateChildStarts(input: {
     workflowId: string
     runId: string
@@ -1901,6 +2040,13 @@ class ShardMemorySession implements ShardDurabilitySession {
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     return this.provider.appendSignal(input)
+  }
+
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    if (input.partitionShard !== this.shardId) {
+      throw new Error(`Shard session ${this.shardId} cannot write shard ${input.partitionShard}`)
+    }
+    return this.provider.startSendSignal(input)
   }
 
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult> {

@@ -2,12 +2,15 @@ package durable_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	durable "github.com/danthegoodman1/durable-phases/go"
 	"github.com/danthegoodman1/durable-phases/go/internal/shardengine"
 	postgresprovider "github.com/danthegoodman1/durable-phases/go/providers/postgres"
 	sqliteprovider "github.com/danthegoodman1/durable-phases/go/providers/sqlite"
@@ -60,6 +63,65 @@ func TestSQLiteProviderConformance(t *testing.T) {
 			}
 		},
 	})
+}
+
+func TestSQLiteStartSendSignalJournalUsesCombinedOperation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "start-send-journal.sqlite")
+	provider, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := durable.StartSendSignalInput{
+		CreateInstanceInput: durable.CreateInstanceInput{
+			WorkflowName: "journal", WorkflowVersion: 1, WorkflowID: "journal-start-send", RunID: "run-1", PartitionShard: 0,
+			Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Now: time.Now().UTC(),
+			WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+		},
+		SignalType: "finish", SignalPayload: map[string]any{"ok": true}, SignalReceivedAt: time.Now().UTC(), SignalIdempotencyKey: "run-1",
+	}
+	started, err := provider.StartSendSignal(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started.Created {
+		t.Fatalf("startSendSignal did not create: %#v", started)
+	}
+	if err := provider.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var raw string
+	if err := db.QueryRowContext(ctx, `SELECT operation_json FROM shard_journal ORDER BY entry_id`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var operation struct {
+		Op string `json:"op"`
+	}
+	if err := json.Unmarshal([]byte(raw), &operation); err != nil {
+		t.Fatal(err)
+	}
+	if operation.Op != "startSendSignal" {
+		t.Fatalf("journal op = %q, want startSendSignal; raw=%s", operation.Op, raw)
+	}
+
+	replayed, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replayed.Close(ctx)
+	signals, err := replayed.ListSignals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || signals[0].SignalID != started.Signal.SignalID {
+		t.Fatalf("replayed signals = %#v, want %s", signals, started.Signal.SignalID)
+	}
 }
 
 func TestSQLiteShardFileProviderConformance(t *testing.T) {

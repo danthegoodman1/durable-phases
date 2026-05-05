@@ -71,6 +71,38 @@ func (w testWorkflow) Migrate(context.Context, int, durable.MigrationArgs) (*dur
 	return nil, nil
 }
 
+type directSignalWorkflow struct{}
+
+func (w directSignalWorkflow) Name() string { return "direct_signal_workflow" }
+func (w directSignalWorkflow) Version() int { return 1 }
+func (w directSignalWorkflow) Initial(_ context.Context, input durable.JSON) (durable.Start, error) {
+	label := "unset"
+	if raw, ok := input.(map[string]any); ok {
+		if value, ok := raw["label"].(string); ok {
+			label = value
+		}
+	}
+	return durable.Start{Common: map[string]any{"label": label}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}}, nil
+}
+func (w directSignalWorkflow) MaterializeWaits(context.Context, durable.JSON, durable.PhaseSnapshot, time.Time) ([]durable.DurableWait, error) {
+	return []durable.DurableWait{durable.SignalWait("finish", "finish", false)}, nil
+}
+func (w directSignalWorkflow) DispatchRun(context.Context, *durable.Context, durable.JSON, durable.PhaseSnapshot) (durable.Transition, error) {
+	return durable.Fail(durable.Errf("unexpected run")), nil
+}
+func (w directSignalWorkflow) DispatchEvent(_ context.Context, _ *durable.Context, common durable.JSON, _ durable.PhaseSnapshot, waitName string, event durable.ReadyEvent) (durable.Transition, error) {
+	if waitName != "finish" {
+		return durable.Fail(durable.Errf("unexpected wait %s", waitName)), nil
+	}
+	return durable.Complete(map[string]any{"label": common.(map[string]any)["label"], "payload": event.Payload}), nil
+}
+func (w directSignalWorkflow) Query(context.Context, string, durable.QueryContext) (durable.JSON, error) {
+	return nil, nil
+}
+func (w directSignalWorkflow) Migrate(context.Context, int, durable.MigrationArgs) (*durable.MigrationResult, error) {
+	return nil, nil
+}
+
 func forceTerminal(t *testing.T, ctx context.Context, provider durable.DurabilityProvider, ref durable.InstanceRef, next durable.InstanceStatus, now time.Time) {
 	t.Helper()
 	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
@@ -166,6 +198,126 @@ func TestRuntimeSignalFlowAndQuery(t *testing.T) {
 	}
 	if query.(map[string]any)["status"] != "completed" {
 		t.Fatalf("query = %#v", query)
+	}
+}
+
+func TestRuntimeStartSendSignal(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	provider := shardengine.New()
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{
+		WorkerID:   "worker-a",
+		ShardCount: 1,
+		Clock:      clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := directSignalWorkflow{}
+	started, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "first"}, "finish", map[string]any{"value": "one"}, durable.StartSendSignalOptions{
+		WorkflowID: "start-send-runtime",
+		RunID:      "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started.Created || started.Signal.IdempotencyKey != "request-1" {
+		t.Fatalf("started = %#v", started)
+	}
+	existing, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "ignored"}, "finish", map[string]any{"value": "two"}, durable.StartSendSignalOptions{
+		WorkflowID:     "start-send-runtime",
+		IdempotencyKey: "request-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing.Created || existing.RunID != started.RunID || existing.Signal.RunID != started.RunID || existing.Signal.IdempotencyKey != "request-2" {
+		t.Fatalf("existing = %#v", existing)
+	}
+	instance, err := provider.LoadInstance(ctx, started.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Common.(map[string]any)["label"] != "first" {
+		t.Fatalf("existing start replaced common: %#v", instance.Common)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
+		t.Fatalf("drain direct = %#v, %v", result, err)
+	}
+	instance, err = provider.LoadInstance(ctx, started.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Status != "completed" || instance.Output.(map[string]any)["label"] != "first" {
+		t.Fatalf("completed direct = %#v", instance)
+	}
+	clock.Advance(time.Millisecond)
+	retry, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "ignored"}, "finish", map[string]any{"value": "ignored"}, durable.StartSendSignalOptions{
+		WorkflowID: "start-send-runtime",
+		RunID:      "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Signal.SignalID != started.Signal.SignalID {
+		t.Fatalf("retry = %#v, want signal %s", retry, started.Signal.SignalID)
+	}
+	clock.Advance(time.Millisecond)
+	secondRun, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "second-run"}, "finish", map[string]any{"value": "three"}, durable.StartSendSignalOptions{
+		WorkflowID:     "start-send-runtime",
+		IdempotencyKey: "request-3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secondRun.Created || secondRun.RunID == started.RunID {
+		t.Fatalf("second run = %#v", secondRun)
+	}
+	retryWhileRunning, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "ignored"}, "finish", map[string]any{"value": "ignored"}, durable.StartSendSignalOptions{
+		WorkflowID: "start-send-runtime",
+		RunID:      "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryWhileRunning.Signal.SignalID != started.Signal.SignalID {
+		t.Fatalf("retry while running = %#v, want signal %s", retryWhileRunning, started.Signal.SignalID)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
+		t.Fatalf("drain second run = %#v, %v", result, err)
+	}
+	if _, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "bad"}, "finish", map[string]any{}, durable.StartSendSignalOptions{
+		RunID: "missing-workflow-id",
+	}); err == nil {
+		t.Fatalf("runId without workflowId succeeded")
+	}
+	generated, err := runtime.StartSendSignal(ctx, direct, map[string]any{"label": "generated"}, "finish", map[string]any{"value": "generated"}, durable.StartSendSignalOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.WorkflowID == "" || generated.RunID == "" || generated.Signal.IdempotencyKey != generated.RunID {
+		t.Fatalf("generated = %#v", generated)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 1}); err != nil || result.Activations != 1 {
+		t.Fatalf("drain generated = %#v, %v", result, err)
+	}
+
+	early, err := runtime.StartSendSignal(ctx, testWorkflow{name: "start_send_later"}, map[string]any{}, "finish", map[string]any{"value": "early"}, durable.StartSendSignalOptions{
+		WorkflowID: "start-send-later",
+		RunID:      "later-request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := runtime.Drain(ctx, durable.DrainOptions{MaxActivations: 2}); err != nil || result.Activations != 2 {
+		t.Fatalf("drain early = %#v, %v", result, err)
+	}
+	instance, err = provider.LoadInstance(ctx, early.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Status != "completed" || instance.Output.(map[string]any)["value"] != "early" {
+		t.Fatalf("early completed = %#v", instance)
 	}
 }
 

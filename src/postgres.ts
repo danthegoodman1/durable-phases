@@ -40,6 +40,8 @@ import type {
   ShardDurabilitySession,
   ShardLease,
   SignalRecord,
+  StartSendSignalInput,
+  StartSendSignalResult,
 } from "./interface.js"
 import type { ChildHandle, InstanceRef, StartWorkflowResult } from "./workflow.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
@@ -321,6 +323,10 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
     return this.appendSignalForShard(shardId, input)
   }
 
+  async startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    return this.startSendSignalForShard(input.partitionShard, input)
+  }
+
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null> {
     return this.claimShard(input)
   }
@@ -490,6 +496,23 @@ export class PostgresDurabilityProvider implements DurabilityProvider {
         const engine = this.projectionForShard(shardId).engine
         shouldAppend = !engine.findSignalByIdempotencyKey(input)
         return engine.appendSignal(input)
+      },
+      { shouldAppend: () => shouldAppend },
+    )
+  }
+
+  async startSendSignalForShard(
+    shardId: number,
+    input: StartSendSignalInput,
+  ): Promise<StartSendSignalResult> {
+    let shouldAppend = true
+    return this.mutateShard(
+      shardId,
+      { op: "startSendSignal", input },
+      async () => {
+        const output = await this.projectionForShard(shardId).engine.startSendSignalWithStatus(input)
+        shouldAppend = output.mutated
+        return output.result
       },
       { shouldAppend: () => shouldAppend },
     )
@@ -1321,6 +1344,13 @@ class PostgresAppendShardSession implements ShardDurabilitySession {
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     return this.provider.appendSignalForShard(this.shardId, input)
+  }
+
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    if (input.partitionShard !== this.shardId) {
+      throw new Error(`Instance ${input.workflowId}/${input.runId} does not belong to shard ${this.shardId}`)
+    }
+    return this.provider.startSendSignalForShard(this.shardId, input)
   }
 
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult> {

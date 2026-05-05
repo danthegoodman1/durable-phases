@@ -292,6 +292,202 @@ func AssertProviderConformance(t *testing.T, factory Factory) {
 		})
 	})
 
+	t.Run(factory.Name+"/start-send-signal", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			started, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send", RunID: "run-1", PartitionShard: 0,
+					Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t0,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(1)}, SignalReceivedAt: t0, SignalIdempotencyKey: "run-1",
+			})
+			requireNoError(t, err)
+			if !started.Created || started.WorkflowID != "start-send" || started.RunID != "run-1" || started.Signal.IdempotencyKey != "run-1" {
+				t.Fatalf("started = %#v", started)
+			}
+			duplicate, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send", RunID: "run-1", PartitionShard: 0,
+					Common: map[string]any{"ignored": true}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t1,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(99)}, SignalReceivedAt: t1, SignalIdempotencyKey: "run-1",
+			})
+			requireNoError(t, err)
+			if duplicate.Created || duplicate.Signal.SignalID != started.Signal.SignalID {
+				t.Fatalf("duplicate = %#v, want signal %s", duplicate, started.Signal.SignalID)
+			}
+			signals, err := provider.ListSignals(ctx)
+			requireNoError(t, err)
+			requireEqual(t, 1, len(signals))
+			existing, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send", RunID: "run-candidate", PartitionShard: 0,
+					Common: map[string]any{"ignored": true}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t2,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(2)}, SignalReceivedAt: t2, SignalIdempotencyKey: "run-candidate",
+			})
+			requireNoError(t, err)
+			if existing.Created || existing.RunID != "run-1" || existing.Signal.RunID != "run-1" || existing.Signal.IdempotencyKey != "run-candidate" {
+				t.Fatalf("existing = %#v", existing)
+			}
+			runs, err := provider.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: "start-send"})
+			requireNoError(t, err)
+			requireEqual(t, 1, len(runs.Runs))
+
+			session := ownShard(t, ctx, provider, "worker-a", t0, longLease)
+			claim := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t0, longLease, workflows), "signal")
+			committed, err := session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: "start-send", RunID: "run-1", ExpectedSequence: 0, ActivationID: claim.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.InstanceStatus{Status: "completed", Output: map[string]any{"index": float64(1)}}, Now: t2, ConsumeSignalID: claim.Activation.Event.ConsumeSignalID,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 1)
+			if _, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send", RunID: "run-rejected", PartitionShard: 0,
+					Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t2,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyFailedOnly,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(3)}, SignalReceivedAt: t2, SignalIdempotencyKey: "run-rejected",
+			}); err == nil {
+				t.Fatalf("failed_only start after completed succeeded")
+			}
+			afterCompleted, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send", RunID: "run-2", PartitionShard: 0,
+					Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t5,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(4)}, SignalReceivedAt: t5, SignalIdempotencyKey: "run-2",
+			})
+			requireNoError(t, err)
+			if !afterCompleted.Created || afterCompleted.RunID != "run-2" {
+				t.Fatalf("after completed = %#v", afterCompleted)
+			}
+		})
+	})
+
+	t.Run(factory.Name+"/start-send-signal-concurrency", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			providerA := store.New(t).Provider
+			providerB := store.New(t).Provider
+			input := durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "start-send-race", RunID: "request-1", PartitionShard: 0,
+					Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t0,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"sender": "first"}, SignalReceivedAt: t0, SignalIdempotencyKey: "request-1",
+			}
+			type result struct {
+				out durable.StartSendSignalResult
+				err error
+			}
+			ch := make(chan result, 2)
+			go func() { out, err := providerA.StartSendSignal(ctx, input); ch <- result{out: out, err: err} }()
+			go func() { out, err := providerB.StartSendSignal(ctx, input); ch <- result{out: out, err: err} }()
+			left, right := <-ch, <-ch
+			requireNoError(t, left.err)
+			requireNoError(t, right.err)
+			if left.out.Created == right.out.Created || left.out.Signal.SignalID != right.out.Signal.SignalID {
+				t.Fatalf("race results = %#v / %#v", left.out, right.out)
+			}
+			runs, err := providerA.GetWorkflowRuns(ctx, durable.GetWorkflowRunsInput{ID: "start-send-race"})
+			requireNoError(t, err)
+			requireEqual(t, 1, len(runs.Runs))
+			signals, err := providerA.ListSignals(ctx)
+			requireNoError(t, err)
+			requireEqual(t, 1, len(signals))
+			replayed := store.New(t).Provider
+			signals, err = replayed.ListSignals(ctx)
+			requireNoError(t, err)
+			requireEqual(t, 1, len(signals))
+		})
+	})
+
+	t.Run(factory.Name+"/start-send-signal-target-run-id", func(t *testing.T) {
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			_, err := provider.CreateInstance(ctx, durable.CreateInstanceInput{
+				WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "targeted-start-send", RunID: "run-1", PartitionShard: 0,
+				Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t0,
+				ConflictPolicy: durable.ConflictFail,
+			})
+			requireNoError(t, err)
+			_, err = provider.CreateInstance(ctx, durable.CreateInstanceInput{
+				WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "targeted-start-send", RunID: "run-2", PartitionShard: 0,
+				Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t1,
+				ConflictPolicy: durable.ConflictFail, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyAlways,
+			})
+			requireNoError(t, err)
+			targeted, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "targeted-start-send", RunID: "run-1", PartitionShard: 0,
+					Common: map[string]any{"ignored": true}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t2,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				TargetRunID: "run-1", SignalType: "finish", SignalPayload: map[string]any{"index": float64(1)}, SignalReceivedAt: t2, SignalIdempotencyKey: "target-run-1",
+			})
+			requireNoError(t, err)
+			if targeted.Created || targeted.RunID != "run-1" || targeted.Signal.RunID != "run-1" {
+				t.Fatalf("targeted = %#v", targeted)
+			}
+			implicit, err := provider.StartSendSignal(ctx, durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "targeted-start-send", RunID: "run-candidate", PartitionShard: 0,
+					Common: map[string]any{"ignored": true}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t5,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				SignalType: "finish", SignalPayload: map[string]any{"index": float64(2)}, SignalReceivedAt: t5, SignalIdempotencyKey: "implicit-latest",
+			})
+			requireNoError(t, err)
+			if implicit.Created || implicit.RunID != "run-2" || implicit.Signal.RunID != "run-2" {
+				t.Fatalf("implicit = %#v", implicit)
+			}
+		})
+
+		withStore(t, factory, func(ctx context.Context, store Store) {
+			provider := store.New(t).Provider
+			firstInput := durable.StartSendSignalInput{
+				CreateInstanceInput: durable.CreateInstanceInput{
+					WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "terminal-targeted-start-send", RunID: "run-1", PartitionShard: 0,
+					Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t0,
+					WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+				},
+				TargetRunID: "run-1", SignalType: "finish", SignalPayload: map[string]any{"index": float64(3)}, SignalReceivedAt: t0, SignalIdempotencyKey: "terminal-run-1",
+			}
+			first, err := provider.StartSendSignal(ctx, firstInput)
+			requireNoError(t, err)
+			session := ownShard(t, ctx, provider, "worker-a", t0, longLease)
+			claim := requireEventClaim(t, claimOne(t, ctx, session, "worker-a", t0, longLease, workflows), "signal")
+			committed, err := session.CommitCheckpoint(ctx, durable.CommitCheckpointInput{
+				WorkflowID: "terminal-targeted-start-send", RunID: "run-1", ExpectedSequence: 0, ActivationID: claim.Activation.ActivationID, WorkerID: "worker-a", WorkflowVersion: 1,
+				Next: durable.InstanceStatus{Status: "completed", Output: map[string]any{"index": float64(3)}}, Now: t2, ConsumeSignalID: claim.Activation.Event.ConsumeSignalID,
+			})
+			requireNoError(t, err)
+			requireCommitOK(t, committed, 1)
+			_, err = provider.CreateInstance(ctx, durable.CreateInstanceInput{
+				WorkflowName: "conformance", WorkflowVersion: 1, WorkflowID: "terminal-targeted-start-send", RunID: "run-2", PartitionShard: 0,
+				Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{signalWait("finish")}, Now: t5,
+				ConflictPolicy: durable.ConflictFail, WorkflowIDReusePolicy: durable.WorkflowIDReusePolicyNotRunning,
+			})
+			requireNoError(t, err)
+			retry, err := provider.StartSendSignal(ctx, firstInput)
+			requireNoError(t, err)
+			if retry.RunID != "run-1" || retry.Signal.SignalID != first.Signal.SignalID {
+				t.Fatalf("terminal retry = %#v, want signal %s", retry, first.Signal.SignalID)
+			}
+			firstInput.SignalIdempotencyKey = "different-terminal-key"
+			if _, err := provider.StartSendSignal(ctx, firstInput); err == nil {
+				t.Fatalf("non-idempotent terminal retry succeeded")
+			}
+		})
+	})
+
 	t.Run(factory.Name+"/future-only-signals", func(t *testing.T) {
 		withStore(t, factory, func(ctx context.Context, store Store) {
 			provider := store.New(t).Provider

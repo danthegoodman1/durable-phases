@@ -185,6 +185,18 @@ export type AppendSignalInput = {
   idempotencyKey?: string
 }
 
+export type StartSendSignalInput = CreateInstanceInput & {
+  targetRunId?: string
+  signalType: string
+  signalPayload: JsonValue
+  signalReceivedAt: string
+  signalIdempotencyKey: string
+}
+
+export type StartSendSignalResult = StartWorkflowResult & {
+  signal: SignalRecord
+}
+
 export type DispatchShardLease = {
   shardId: number
   ownerId: string
@@ -533,6 +545,7 @@ export type ShardDurabilitySession = {
   readInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
   getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult>
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult>
   heartbeat(input: { now: string; leaseMs: number }): Promise<void>
   release(): Promise<void>
@@ -558,6 +571,7 @@ export type DurabilityProvider = {
   loadInstance(ref: InstanceRef, options?: LoadInstanceOptions): Promise<PersistedInstance | null>
   getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult>
   appendSignal(input: AppendSignalInput): Promise<SignalRecord>
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult>
   listSignals(): SignalRecord[] | Promise<SignalRecord[]>
   claimDispatchShard(input: ClaimDispatchShardInput): Promise<DispatchShardLease | null>
   heartbeatDispatchShard(input: HeartbeatDispatchShardInput): Promise<void>

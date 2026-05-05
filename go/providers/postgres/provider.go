@@ -501,6 +501,48 @@ func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalI
 	committed = true
 	return out, nil
 }
+func (p *Provider) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	operation, err := shardengine.NewJournalOperation("startSendSignal", input)
+	if err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	shardID := input.PartitionShard
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return durable.StartSendSignalResult{}, fmt.Errorf("postgres provider is closed")
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := p.lockShardHead(ctx, tx, shardID); err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	if err := p.catchUpShardLocked(ctx, tx, shardID); err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	out, mutated, err := p.engine.StartSendSignalWithStatus(ctx, input)
+	if err != nil {
+		return out, err
+	}
+	if mutated {
+		if err := p.appendJournalTxLocked(ctx, tx, shardID, operation); err != nil {
+			return out, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, err
+	}
+	committed = true
+	return out, nil
+}
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	operation, err := shardengine.NewJournalOperation("claimReadyActivations", shardengine.ClaimReadyActivationsOperationInput{ShardIDs: shardIDs, Input: input})
 	if err != nil {
@@ -674,6 +716,9 @@ func (s *session) ReadInstance(ctx context.Context, ref durable.InstanceRef, opt
 }
 func (s *session) AppendSignal(ctx context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
 	return s.provider.AppendSignal(ctx, input)
+}
+func (s *session) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	return s.provider.StartSendSignal(ctx, input)
 }
 func (s *session) ClaimTasks(ctx context.Context, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	operation, err := shardengine.NewSessionJournalOperation("claimShardTasks", s.openInput(), input)

@@ -12,8 +12,8 @@ use durable::{
     PhaseSnapshot, PostgresDurabilityProvider, PostgresDurabilityProviderOptions,
     ReserveEffectInput, RunShardStepOptions, RunWorkerOptions, RuntimeOptions, SerializedError,
     SignalOptions, SignalRecord, SqliteDurabilityOptions, SqliteDurabilityProvider,
-    SqliteShardFileDurabilityProvider, StartOptions, WorkerCancellation, WorkflowError,
-    WorkflowIdReusePolicy, WorkflowRunDirection,
+    SqliteShardFileDurabilityProvider, StartOptions, StartSendSignalOptions, WorkerCancellation,
+    WorkflowError, WorkflowIdReusePolicy, WorkflowRunDirection,
 };
 use examples::migration::{FinishEvent, MigratingOrderV1, MigratingOrderV2, MigrationInput};
 use examples::parent_child::{
@@ -195,6 +195,58 @@ workflow! {
             on {
                 finish: signal<FutureSignalEvent>(delivery = future) async |event| {
                     complete!(FutureSignalOutput { value: event.value })
+                },
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectSignalInput {
+    label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectSignalOutput {
+    label: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectSignalCommon {
+    label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectSignalWaiting {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectSignalEvent {
+    value: String,
+}
+
+workflow! {
+    pub workflow DirectSignalWorkflow {
+        name: "direct_signal_workflow",
+        version: 1,
+        input: DirectSignalInput,
+        output: DirectSignalOutput,
+        common: DirectSignalCommon,
+
+        initial(input) {
+            start! {
+                common: DirectSignalCommon { label: input.label },
+                phase: waiting(DirectSignalWaiting {}),
+            }
+        }
+
+        phase waiting(_data: DirectSignalWaiting) {
+            on {
+                finish: signal<DirectSignalEvent> async |common, event| {
+                    complete!(DirectSignalOutput {
+                        label: common.label,
+                        value: event.value,
+                    })
                 },
             }
         }
@@ -897,6 +949,209 @@ async fn runtime_signal_with_options_deduplicates_idempotency_key() {
     assert_eq!(after_consumed.signal_id, first.signal_id);
     assert_eq!(after_consumed.consumed_by_sequence, Some(2));
     assert_eq!(runtime_signals(&runtime).await.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_start_send_signal_starts_signals_existing_and_preserves_early_signal() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+    runtime.register::<TestChildWorkflow>().unwrap();
+
+    let started = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "first".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "one".to_string(),
+            },
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-runtime".to_string()),
+                run_id: Some("request-1".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(started.created);
+    assert_eq!(started.signal.idempotency_key.as_deref(), Some("request-1"));
+
+    let existing = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "ignored".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "two".to_string(),
+            },
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-runtime".to_string()),
+                idempotency_key: Some("request-2".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!existing.created);
+    assert_eq!(existing.run_id, started.run_id);
+    assert_eq!(existing.signal.run_id, started.run_id);
+    assert_eq!(
+        existing.signal.idempotency_key.as_deref(),
+        Some("request-2")
+    );
+    let instance = load_runtime_instance(&runtime, &started.instance_ref()).await;
+    assert_eq!(instance.common.unwrap()["label"], "first");
+
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+    let completed = load_runtime_instance(&runtime, &started.instance_ref()).await;
+    assert_eq!(completed.status, PersistedStatus::Completed);
+    assert_eq!(completed.output.unwrap()["label"], "first");
+
+    clock.advance(Duration::milliseconds(1));
+    let retry = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "ignored".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "ignored".to_string(),
+            },
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-runtime".to_string()),
+                run_id: Some("request-1".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.signal.signal_id, started.signal.signal_id);
+
+    clock.advance(Duration::milliseconds(1));
+    let second_run = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "second-run".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "three".to_string(),
+            },
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-runtime".to_string()),
+                idempotency_key: Some("request-3".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(second_run.created);
+    assert_ne!(second_run.run_id, started.run_id);
+    let retry_while_running = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "ignored".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "ignored".to_string(),
+            },
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-runtime".to_string()),
+                run_id: Some("request-1".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_while_running.signal.signal_id,
+        started.signal.signal_id
+    );
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+
+    let missing_workflow_id = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "bad".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "bad".to_string(),
+            },
+            StartSendSignalOptions {
+                run_id: Some("missing-workflow-id".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await;
+    assert!(missing_workflow_id.is_err());
+
+    let generated = runtime
+        .start_send_signal::<DirectSignalWorkflow, _>(
+            DirectSignalInput {
+                label: "generated".to_string(),
+            },
+            "finish",
+            DirectSignalEvent {
+                value: "generated".to_string(),
+            },
+            StartSendSignalOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(generated.workflow_id.starts_with("direct_signal_workflow-"));
+    assert_eq!(
+        generated.signal.idempotency_key.as_deref(),
+        Some(generated.run_id.as_str())
+    );
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+
+    let early = runtime
+        .start_send_signal::<TestWorkflow, _>(
+            TestInput {
+                label: "Ada".to_string(),
+                items: vec!["a".to_string()],
+            },
+            "begin",
+            Empty {},
+            StartSendSignalOptions {
+                workflow_id: Some("start-send-later".to_string()),
+                run_id: Some("later-request".to_string()),
+                ..StartSendSignalOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(2),
+        })
+        .await
+        .unwrap();
+    let later = load_runtime_instance(&runtime, &early.instance_ref()).await;
+    assert_eq!(later.status, PersistedStatus::Running);
+    assert_eq!(later.phase.unwrap().name, "processing");
 }
 
 #[tokio::test(flavor = "current_thread")]

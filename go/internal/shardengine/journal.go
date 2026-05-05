@@ -105,6 +105,13 @@ func ApplyJournalOperation(ctx context.Context, engine *Provider, operation Jour
 			}
 			_, err = engine.AppendSignal(ctx, input)
 			return err
+		case "startSendSignal":
+			input, err := decodeJournalInput[durable.StartSendSignalInput](operation.Input)
+			if err != nil {
+				return err
+			}
+			_, err = engine.StartSendSignal(ctx, input)
+			return err
 		case "claimReadyActivations":
 			input, err := decodeJournalInput[ClaimReadyActivationsOperationInput](operation.Input)
 			if err != nil {
@@ -204,6 +211,10 @@ func OperationTime(operation JournalOperation) time.Time {
 	case "appendSignal":
 		if input, err := decodeJournalInput[durable.AppendSignalInput](operation.Input); err == nil {
 			return input.ReceivedAt
+		}
+	case "startSendSignal":
+		if input, err := decodeJournalInput[durable.StartSendSignalInput](operation.Input); err == nil {
+			return input.Now
 		}
 	case "claimReadyActivations":
 		if input, err := decodeJournalInput[ClaimReadyActivationsOperationInput](operation.Input); err == nil {

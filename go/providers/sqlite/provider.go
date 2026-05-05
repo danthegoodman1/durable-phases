@@ -142,6 +142,22 @@ func (p *Provider) reload(ctx context.Context) error {
 		if err := rows.Scan(&raw); err != nil {
 			return err
 		}
+		var envelope struct {
+			Op string `json:"op"`
+		}
+		if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+			return err
+		}
+		if envelope.Op != "" {
+			var operation shardengine.JournalOperation
+			if err := json.Unmarshal([]byte(raw), &operation); err != nil {
+				return err
+			}
+			if err := shardengine.ApplyJournalOperation(ctx, p.engine, operation); err != nil {
+				return err
+			}
+			continue
+		}
 		var snapshot shardengine.Snapshot
 		if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
 			return err
@@ -190,7 +206,37 @@ func (p *Provider) appendSnapshotJournal(ctx context.Context, execer sqliteExece
 		return err
 	}
 	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
-		_, err = execer.ExecContext(ctx, `
+		err = p.writeSnapshotRow(ctx, execer, entryID, string(raw), createdAt)
+	}
+	return err
+}
+
+func (p *Provider) appendOperationJournal(ctx context.Context, execer sqliteExecer, operation shardengine.JournalOperation) error {
+	raw, err := json.Marshal(operation)
+	if err != nil {
+		return err
+	}
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := execer.ExecContext(ctx, `INSERT INTO shard_journal (operation_json, created_at) VALUES (?, ?)`, string(raw), createdAt)
+	if err != nil {
+		return err
+	}
+	entryID, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
+		snapshot, err := json.Marshal(p.engine.Snapshot())
+		if err != nil {
+			return err
+		}
+		err = p.writeSnapshotRow(ctx, execer, entryID, string(snapshot), createdAt)
+	}
+	return err
+}
+
+func (p *Provider) writeSnapshotRow(ctx context.Context, execer sqliteExecer, entryID int64, raw string, createdAt string) error {
+	_, err := execer.ExecContext(ctx, `
 INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
 VALUES (1, ?, ?, ?)
 ON CONFLICT(snapshot_id) DO UPDATE SET
@@ -198,7 +244,6 @@ ON CONFLICT(snapshot_id) DO UPDATE SET
   snapshot_json = excluded.snapshot_json,
   created_at = excluded.created_at
 `, entryID, string(raw), createdAt)
-	}
 	return err
 }
 
@@ -265,6 +310,44 @@ func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalI
 	}
 	if created {
 		if err := p.appendSnapshotJournal(ctx, p.db); err != nil {
+			return out, err
+		}
+	}
+	if _, err := p.db.ExecContext(ctx, `COMMIT`); err != nil {
+		return out, err
+	}
+	committed = true
+	return out, nil
+}
+
+func (p *Provider) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	operation, err := shardengine.NewJournalOperation("startSendSignal", input)
+	if err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return durable.StartSendSignalResult{}, fmt.Errorf("sqlite provider is closed")
+	}
+	if _, err := p.db.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = p.db.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+	if err := p.reload(ctx); err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	out, mutated, err := p.engine.StartSendSignalWithStatus(ctx, input)
+	if err != nil {
+		return out, err
+	}
+	if mutated {
+		if err := p.appendOperationJournal(ctx, p.db, operation); err != nil {
 			return out, err
 		}
 	}
@@ -417,6 +500,9 @@ func (s *session) ReadInstance(ctx context.Context, ref durable.InstanceRef, opt
 func (s *session) AppendSignal(ctx context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
 	return s.provider.AppendSignal(ctx, input)
 }
+func (s *session) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	return s.provider.StartSendSignal(ctx, input)
+}
 func (s *session) ClaimTasks(ctx context.Context, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	out, err := s.inner.ClaimTasks(ctx, input)
 	if err != nil {
@@ -565,6 +651,13 @@ func (p *ShardFileProvider) AppendSignal(ctx context.Context, input durable.Appe
 		return durable.SignalRecord{}, err
 	}
 	return provider.AppendSignal(ctx, input)
+}
+func (p *ShardFileProvider) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	provider, err := p.providerForShard(input.PartitionShard)
+	if err != nil {
+		return durable.StartSendSignalResult{}, err
+	}
+	return provider.StartSendSignal(ctx, input)
 }
 func (p *ShardFileProvider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	var out durable.ClaimShardTasksResult
@@ -730,6 +823,9 @@ func (f failedSession) ReadInstance(context.Context, durable.InstanceRef, durabl
 }
 func (f failedSession) AppendSignal(context.Context, durable.AppendSignalInput) (durable.SignalRecord, error) {
 	return durable.SignalRecord{}, f.err
+}
+func (f failedSession) StartSendSignal(context.Context, durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	return durable.StartSendSignalResult{}, f.err
 }
 func (f failedSession) ClaimTasks(context.Context, durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	return durable.ClaimShardTasksResult{}, f.err

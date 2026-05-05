@@ -260,6 +260,117 @@ func (p *Provider) createInstanceLocked(input durable.CreateInstanceInput) (dura
 	return durable.StartWorkflowResult{InstanceRef: durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID}, Created: true}, nil
 }
 
+func (p *Provider) StartSendSignal(_ context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	result, _, err := p.StartSendSignalWithStatus(context.Background(), input)
+	return result, err
+}
+
+func (p *Provider) StartSendSignalWithStatus(_ context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if input.TargetRunID != "" && input.TargetRunID != input.RunID {
+		return durable.StartSendSignalResult{}, false, fmt.Errorf("startSendSignal targetRunId must match runId")
+	}
+	if signal, ok := p.findSignalByIdempotencyKeyLocked(durable.AppendSignalInput{
+		WorkflowID:     input.WorkflowID,
+		RunID:          input.RunID,
+		Type:           input.SignalType,
+		Payload:        input.SignalPayload,
+		ReceivedAt:     input.SignalReceivedAt,
+		IdempotencyKey: input.SignalIdempotencyKey,
+	}); ok {
+		return durable.StartSendSignalResult{
+			StartWorkflowResult: durable.StartWorkflowResult{
+				InstanceRef: durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID},
+				Created:     false,
+			},
+			Signal: signal,
+		}, false, nil
+	}
+	if exact, ok := p.instances[refKey(input.WorkflowID, input.RunID)]; ok && input.TargetRunID != "" {
+		if exact.Status != "running" {
+			return durable.StartSendSignalResult{}, false, fmt.Errorf("workflow run already closed: %s/%s", exact.WorkflowID, exact.RunID)
+		}
+		signal, created := p.appendSignalToInstanceLocked(exact, durable.AppendSignalInput{
+			WorkflowID:     exact.WorkflowID,
+			RunID:          exact.RunID,
+			Type:           input.SignalType,
+			Payload:        input.SignalPayload,
+			ReceivedAt:     input.SignalReceivedAt,
+			IdempotencyKey: input.SignalIdempotencyKey,
+		})
+		return durable.StartSendSignalResult{
+			StartWorkflowResult: durable.StartWorkflowResult{
+				InstanceRef: durable.InstanceRef{WorkflowID: exact.WorkflowID, RunID: exact.RunID},
+				Created:     false,
+			},
+			Signal: signal,
+		}, created, nil
+	}
+	if exact, ok := p.instances[refKey(input.WorkflowID, input.RunID)]; ok && exact.Status != "running" {
+		return durable.StartSendSignalResult{}, false, fmt.Errorf("workflow run already closed: %s/%s", exact.WorkflowID, exact.RunID)
+	}
+	if running, ok := p.latestRunningWorkflowRunLocked(input.WorkflowID); ok {
+		if input.TargetRunID != "" {
+			return durable.StartSendSignalResult{}, false, fmt.Errorf("workflow ID %s already has running run %s", input.WorkflowID, running.RunID)
+		}
+		signal, created := p.appendSignalToInstanceLocked(running, durable.AppendSignalInput{
+			WorkflowID:     running.WorkflowID,
+			RunID:          running.RunID,
+			Type:           input.SignalType,
+			Payload:        input.SignalPayload,
+			ReceivedAt:     input.SignalReceivedAt,
+			IdempotencyKey: input.SignalIdempotencyKey,
+		})
+		return durable.StartSendSignalResult{
+			StartWorkflowResult: durable.StartWorkflowResult{
+				InstanceRef: durable.InstanceRef{WorkflowID: running.WorkflowID, RunID: running.RunID},
+				Created:     false,
+			},
+			Signal: signal,
+		}, created, nil
+	}
+	reusePolicy := input.WorkflowIDReusePolicy
+	if reusePolicy == "" {
+		reusePolicy = durable.WorkflowIDReusePolicyNotRunning
+	}
+	if latest, ok := p.latestWorkflowRunLocked(input.WorkflowID); ok && !durable.ShouldCreateWorkflowRun(reusePolicy, latest.Status) {
+		return durable.StartSendSignalResult{}, false, fmt.Errorf("workflow ID reuse policy %s prevents starting %s", reusePolicy, input.WorkflowID)
+	}
+	instance := durable.PersistedInstance{
+		WorkflowName:    input.WorkflowName,
+		WorkflowVersion: input.WorkflowVersion,
+		WorkflowID:      input.WorkflowID,
+		RunID:           input.RunID,
+		PartitionShard:  input.PartitionShard,
+		Sequence:        0,
+		Status:          "running",
+		Common:          clone(input.Common),
+		Phase:           ptr(clone(input.Phase)),
+		Waits:           p.stampSignalWaitsLocked(input.Waits, nil),
+		CreatedAt:       input.Now,
+		UpdatedAt:       input.Now,
+		Parent:          clonePtr(input.Parent),
+	}
+	p.instances[refKey(input.WorkflowID, input.RunID)] = instance
+	p.replaceTasksForInstanceLocked(instance)
+	signal, _ := p.appendSignalToInstanceLocked(instance, durable.AppendSignalInput{
+		WorkflowID:     input.WorkflowID,
+		RunID:          input.RunID,
+		Type:           input.SignalType,
+		Payload:        input.SignalPayload,
+		ReceivedAt:     input.SignalReceivedAt,
+		IdempotencyKey: input.SignalIdempotencyKey,
+	})
+	return durable.StartSendSignalResult{
+		StartWorkflowResult: durable.StartWorkflowResult{
+			InstanceRef: durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID},
+			Created:     true,
+		},
+		Signal: signal,
+	}, true, nil
+}
+
 func (p *Provider) CreateChildInstance(_ context.Context, input durable.CreateChildInstanceInput) (durable.ChildHandleAny, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -367,17 +478,18 @@ func (p *Provider) AppendSignal(_ context.Context, input durable.AppendSignalInp
 func (p *Provider) AppendSignalWithStatus(_ context.Context, input durable.AppendSignalInput) (durable.SignalRecord, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.instances[refKey(input.WorkflowID, input.RunID)]; !ok {
+	instance, ok := p.instances[refKey(input.WorkflowID, input.RunID)]
+	if !ok {
 		return durable.SignalRecord{}, false, fmt.Errorf("cannot signal unknown workflow: %s/%s", input.WorkflowID, input.RunID)
 	}
+	signal, created := p.appendSignalToInstanceLocked(instance, input)
+	return signal, created, nil
+}
+
+func (p *Provider) appendSignalToInstanceLocked(instance durable.PersistedInstance, input durable.AppendSignalInput) (durable.SignalRecord, bool) {
 	if input.IdempotencyKey != "" {
-		for _, signal := range p.signals {
-			if signal.WorkflowID == input.WorkflowID &&
-				signal.RunID == input.RunID &&
-				signal.Type == input.Type &&
-				signal.IdempotencyKey == input.IdempotencyKey {
-				return clone(signal), false, nil
-			}
+		if signal, ok := p.findSignalByIdempotencyKeyLocked(input); ok {
+			return signal, false
 		}
 	}
 	p.signalCounter++
@@ -391,11 +503,10 @@ func (p *Provider) AppendSignalWithStatus(_ context.Context, input durable.Appen
 		IdempotencyKey: input.IdempotencyKey,
 	}
 	p.signals[signal.SignalID] = signal
-	instance := p.instances[refKey(input.WorkflowID, input.RunID)]
 	if instance.Status == "running" {
 		p.refreshSignalTasksForInstanceLocked(instance)
 	}
-	return clone(signal), true, nil
+	return clone(signal), true
 }
 
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
@@ -744,6 +855,13 @@ func (p *Provider) FindSignalByIdempotencyKey(_ context.Context, input durable.A
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.findSignalByIdempotencyKeyLocked(input)
+}
+
+func (p *Provider) findSignalByIdempotencyKeyLocked(input durable.AppendSignalInput) (durable.SignalRecord, bool) {
+	if input.IdempotencyKey == "" {
+		return durable.SignalRecord{}, false
+	}
 	for _, signal := range p.signals {
 		if signal.WorkflowID == input.WorkflowID &&
 			signal.RunID == input.RunID &&
@@ -1766,6 +1884,21 @@ func (p *Provider) latestWorkflowRunLocked(workflowID string) (durable.Persisted
 	return latest, ok
 }
 
+func (p *Provider) latestRunningWorkflowRunLocked(workflowID string) (durable.PersistedInstance, bool) {
+	var latest durable.PersistedInstance
+	ok := false
+	for _, instance := range p.instances {
+		if instance.WorkflowID != workflowID || instance.Status != "running" {
+			continue
+		}
+		if !ok || compareWorkflowRuns(instance, latest) > 0 {
+			latest = instance
+			ok = true
+		}
+	}
+	return latest, ok
+}
+
 func compareWorkflowRuns(left, right durable.PersistedInstance) int {
 	if left.CreatedAt.Before(right.CreatedAt) {
 		return -1
@@ -2049,6 +2182,12 @@ func (s *session) ReadInstance(ctx context.Context, ref durable.InstanceRef, opt
 }
 func (s *session) AppendSignal(ctx context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
 	return s.provider.AppendSignal(ctx, input)
+}
+func (s *session) StartSendSignal(ctx context.Context, input durable.StartSendSignalInput) (durable.StartSendSignalResult, error) {
+	if input.PartitionShard != s.shardID {
+		return durable.StartSendSignalResult{}, fmt.Errorf("shard session %d cannot write shard %d", s.shardID, input.PartitionShard)
+	}
+	return s.provider.StartSendSignal(ctx, input)
 }
 func (s *session) ClaimTasks(_ context.Context, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	s.provider.mu.Lock()

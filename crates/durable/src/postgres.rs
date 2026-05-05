@@ -619,6 +619,7 @@ impl PostgresDurabilityProvider {
             JournalOperation::ClaimShardAndTasks { claim, .. } => Ok(claim.shard_id),
             JournalOperation::CreateInstance(input) => Ok(input.partition_shard),
             JournalOperation::CreateChildInstance(input) => Ok(input.partition_shard),
+            JournalOperation::StartSendSignal(input) => Ok(input.partition_shard),
             JournalOperation::AppendSignal(input) => {
                 self.shard_for_ref(&input.workflow_id, &input.run_id).await
             }
@@ -879,6 +880,25 @@ impl DurabilityProvider for PostgresDurabilityProvider {
             let (output, created) = self.inner.append_signal_with_status(input.clone()).await?;
             let operation = if created {
                 Some(JournalOperation::AppendSignal(input))
+            } else {
+                None
+            };
+            Ok((output, operation))
+        })
+        .await
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        self.write_postgres_caught_up(JournalOperation::StartSendSignal(input.clone()), || async {
+            let (output, mutated) = self
+                .inner
+                .start_send_signal_with_status(input.clone())
+                .await?;
+            let operation = if mutated {
+                Some(JournalOperation::StartSendSignal(input))
             } else {
                 None
             };
@@ -1154,6 +1174,27 @@ impl ShardDurabilitySession for PostgresShardSession {
                 let (output, created) = inner.append_signal_with_status(input.clone()).await?;
                 let operation = if created {
                     Some(JournalOperation::AppendSignal(input))
+                } else {
+                    None
+                };
+                Ok((output, operation))
+            })
+            .await
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        self.provider
+            .write_postgres_caught_up(JournalOperation::StartSendSignal(input.clone()), || async {
+                let (output, mutated) = self
+                    .provider
+                    .inner
+                    .start_send_signal_with_status(input.clone())
+                    .await?;
+                let operation = if mutated {
+                    Some(JournalOperation::StartSendSignal(input))
                 } else {
                     None
                 };

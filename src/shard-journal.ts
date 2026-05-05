@@ -17,6 +17,7 @@ import type {
   ReleaseActivationsInput,
   ReleaseDispatchShardInput,
   ReserveEffectInput,
+  StartSendSignalInput,
 } from "./interface.js"
 import type { ShardMemoryDurabilityProvider } from "./shard-engine.js"
 
@@ -25,6 +26,7 @@ export type JournalOperation =
   | { op: "createChildInstance"; input: CreateChildInstanceInput }
   | { op: "cancelChild"; input: CancelChildInput }
   | { op: "appendSignal"; input: AppendSignalInput }
+  | { op: "startSendSignal"; input: StartSendSignalInput }
   | { op: "claimReadyActivations"; input: ClaimReadyActivationsInput }
   | { op: "claimShardTasks"; session: OpenShardInput; input: ClaimShardTasksInput }
   | { op: "heartbeatActivations"; input: HeartbeatActivationsInput }
@@ -99,6 +101,9 @@ async function applyJournalOperationInner(
       return
     case "appendSignal":
       await engine.appendSignal(operation.input)
+      return
+    case "startSendSignal":
+      await engine.startSendSignal(operation.input)
       return
     case "claimReadyActivations":
       await engine.claimReadyActivations(operation.input)

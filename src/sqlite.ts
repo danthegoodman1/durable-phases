@@ -43,6 +43,8 @@ import type {
   ShardLease,
   SignalRecord,
   ChildRecord,
+  StartSendSignalInput,
+  StartSendSignalResult,
 } from "./interface.js"
 import type { ChildHandle, InstanceRef } from "./workflow.js"
 import type { StartWorkflowResult } from "./workflow.js"
@@ -302,6 +304,19 @@ export class SqliteDurabilityProvider implements DurabilityProvider {
       () => {
         shouldAppend = !this.store.engine.findSignalByIdempotencyKey(input)
         return this.store.engine.appendSignal(input)
+      },
+      { shouldAppend: () => shouldAppend },
+    )
+  }
+
+  async startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    let shouldAppend = true
+    return this.mutate(
+      { op: "startSendSignal", input },
+      async () => {
+        const output = await this.store.engine.startSendSignalWithStatus(input)
+        shouldAppend = output.mutated
+        return output.result
       },
       { shouldAppend: () => shouldAppend },
     )
@@ -801,6 +816,13 @@ class SqliteAppendShardSession implements ShardDurabilitySession {
 
   appendSignal(input: AppendSignalInput): Promise<SignalRecord> {
     return this.provider.appendSignal(input)
+  }
+
+  startSendSignal(input: StartSendSignalInput): Promise<StartSendSignalResult> {
+    if (input.partitionShard !== this.shardId) {
+      throw new Error(`Shard session ${this.shardId} cannot write shard ${input.partitionShard}`)
+    }
+    return this.provider.startSendSignal(input)
   }
 
   claimTasks(input: ClaimShardTasksInput): Promise<ClaimShardTasksResult> {

@@ -34,6 +34,13 @@ type StartOptions struct {
 	WorkflowIDReusePolicy WorkflowIDReusePolicy
 }
 
+type StartSendSignalOptions struct {
+	WorkflowID            string
+	RunID                 string
+	WorkflowIDReusePolicy WorkflowIDReusePolicy
+	IdempotencyKey        string
+}
+
 type DrainOptions struct {
 	MaxActivations            int
 	MaxConcurrentActivations  int
@@ -191,6 +198,74 @@ func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, opti
 		r.count("durable.workflow.start", map[string]any{"workflowName": workflow.Name(), "workerId": r.options.WorkerID})
 	}
 	return ref, err
+}
+
+func (r *Runtime) StartSendSignal(ctx context.Context, workflow Workflow, input JSON, typ string, payload JSON, options StartSendSignalOptions) (StartSendSignalResult, error) {
+	if options.RunID != "" && options.WorkflowID == "" {
+		return StartSendSignalResult{}, fmt.Errorf("startSendSignal runId requires workflowId")
+	}
+	r.Register(workflow)
+	start, err := workflow.Initial(ctx, input)
+	if err != nil {
+		return StartSendSignalResult{}, err
+	}
+	now := r.now()
+	workflowID := options.WorkflowID
+	if workflowID == "" {
+		workflowID = fmt.Sprintf("%s-%d", workflow.Name(), now.UnixNano())
+	}
+	runID := options.RunID
+	if runID == "" {
+		runID = uuid.NewString()
+	}
+	idempotencyKey := options.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = runID
+	}
+	reusePolicy := options.WorkflowIDReusePolicy
+	if reusePolicy == "" {
+		reusePolicy = WorkflowIDReusePolicyNotRunning
+	}
+	partitionShard := WorkflowPartitionShard(workflowID, runID, r.options.ShardCount)
+	waits, err := workflow.MaterializeWaits(ctx, start.Common, start.Phase, now)
+	if err != nil {
+		return StartSendSignalResult{}, err
+	}
+	session := r.provider.OpenShard(OpenShardInput{ShardID: partitionShard})
+	result, err := session.StartSendSignal(ctx, StartSendSignalInput{
+		CreateInstanceInput: CreateInstanceInput{
+			WorkflowName:          workflow.Name(),
+			WorkflowVersion:       workflow.Version(),
+			WorkflowID:            workflowID,
+			RunID:                 runID,
+			PartitionShard:        partitionShard,
+			Common:                start.Common,
+			Phase:                 start.Phase,
+			Waits:                 waits,
+			Now:                   now,
+			ConflictPolicy:        ConflictFail,
+			WorkflowIDReusePolicy: reusePolicy,
+		},
+		TargetRunID:          options.RunID,
+		SignalType:           typ,
+		SignalPayload:        payload,
+		SignalReceivedAt:     now,
+		SignalIdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		r.log("warn", "workflow.start_send_signal", map[string]any{"workflowName": workflow.Name(), "type": typ, "status": "failed", "workerId": r.options.WorkerID})
+		r.count("durable.workflow.start_send_signal", map[string]any{"workflowName": workflow.Name(), "status": "failed", "workerId": r.options.WorkerID})
+		return result, err
+	}
+	status := "deduped"
+	if result.Created {
+		status = "started"
+	} else if result.Signal.ReceivedAt.Equal(now) {
+		status = "signaled_existing"
+	}
+	r.log("info", "workflow.start_send_signal", map[string]any{"workflowName": workflow.Name(), "type": typ, "status": status, "workerId": r.options.WorkerID})
+	r.count("durable.workflow.start_send_signal", map[string]any{"workflowName": workflow.Name(), "status": status, "workerId": r.options.WorkerID})
+	return result, nil
 }
 
 type SignalOptions struct {

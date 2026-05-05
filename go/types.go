@@ -476,6 +476,20 @@ type AppendSignalInput struct {
 	IdempotencyKey string    `json:"idempotencyKey,omitempty"`
 }
 
+type StartSendSignalInput struct {
+	CreateInstanceInput
+	TargetRunID          string    `json:"targetRunId,omitempty"`
+	SignalType           string    `json:"signalType"`
+	SignalPayload        JSON      `json:"signalPayload"`
+	SignalReceivedAt     time.Time `json:"signalReceivedAt"`
+	SignalIdempotencyKey string    `json:"signalIdempotencyKey"`
+}
+
+type StartSendSignalResult struct {
+	StartWorkflowResult
+	Signal SignalRecord `json:"signal"`
+}
+
 type DispatchShardLease struct {
 	ShardID    int       `json:"shardId"`
 	OwnerID    string    `json:"ownerId"`
@@ -735,6 +749,7 @@ type DurabilityProvider interface {
 	CancelChild(context.Context, CancelChildInput) error
 	LoadInstance(context.Context, InstanceRef, LoadInstanceOptions) (*PersistedInstance, error)
 	AppendSignal(context.Context, AppendSignalInput) (SignalRecord, error)
+	StartSendSignal(context.Context, StartSendSignalInput) (StartSendSignalResult, error)
 	ClaimReadyActivations(context.Context, []int, ClaimShardTasksInput) (ClaimShardTasksResult, error)
 	HeartbeatActivations(context.Context, []string, string, time.Time, time.Duration) error
 	ReleaseActivations(context.Context, []string, string) error
@@ -761,6 +776,7 @@ type ShardDurabilitySession interface {
 	CancelChild(context.Context, CancelChildInput) error
 	ReadInstance(context.Context, InstanceRef, LoadInstanceOptions) (*PersistedInstance, error)
 	AppendSignal(context.Context, AppendSignalInput) (SignalRecord, error)
+	StartSendSignal(context.Context, StartSendSignalInput) (StartSendSignalResult, error)
 	ClaimTasks(context.Context, ClaimShardTasksInput) (ClaimShardTasksResult, error)
 	Heartbeat(context.Context, time.Time, time.Duration) error
 	Release(context.Context) error

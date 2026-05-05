@@ -1,16 +1,191 @@
 # Durable Phases
 
-Durable Phases is a TypeScript, Rust, and Go runtime for phase-based durable
-execution. It turns workflow phases, durable waits, signals, timers, child
-workflows, and activities into checkpointed state backed by a
-`DurabilityProvider`.
+Durable Phases is a small workflow runtime for code that needs to survive
+process crashes, restarts, timers, signals, and long waits without turning into
+infrastructure soup.
 
-The runtime ships with production-shaped SQLite and Postgres providers. The
-provider boundary is now shard-native: the runtime owns a dispatch shard, opens
-a shard session, claims shard-local tasks, executes activations, and commits
-append-friendly state mutations back to that same shard. Normal checkpoint-local
-work is fenced by shard ownership; eager heartbeat/timeout activities still keep
-their own durable attempt fencing.
+You write workflows as named phases. Each phase has explicit state, waits for
+things like signals or timers, and commits a checkpoint when it moves forward.
+That checkpoint is just durable data backed by a provider, so you can inspect it,
+query it, migrate it, and resume it without replaying the workflow's entire
+life.
+
+The project includes TypeScript, Rust, and Go runtimes, with SQLite and Postgres
+providers shaped for production use. Under the hood, providers are shard-native:
+workers claim shards, run ready activations, and append fenced mutations back to
+the same shard. Most users can start with the phase model first and care about
+the shard boundary later, when they need custom runners or scale-out behavior.
+
+## A tiny workflow
+
+This is a trimmed, annotated version of
+[`src/demos/immediate-and-signal.ts`](src/demos/immediate-and-signal.ts). It
+starts a workflow, immediately moves into a waiting phase, accepts an external
+signal, records an activity at the checkpoint boundary, and completes.
+
+```ts
+import { z } from "zod"
+import { cancel, complete, defineWorkflow, go, phase, query, signal, start, timer } from "../durable.js"
+
+const ApprovalWorkflow = defineWorkflow({
+  name: "approval",
+  version: 1,
+
+  // Zod schemas make workflow input/output and persisted state explicit.
+  input: z.object({ name: z.string() }),
+  output: z.object({ message: z.string(), approvedAt: z.string() }),
+
+  // `common` is workflow-wide durable state. Each phase also has its own
+  // typed `data`, so long-lived state is visible and migration-friendly.
+  common: z.object({ name: z.string() }),
+
+  initial(input) {
+    // Starting a workflow writes the initial snapshot:
+    // common state, current phase, phase data, and any durable waits.
+    return start({
+      common: { name: input.name },
+      phase: "boot",
+      data: {
+        approvalTimeoutAt: new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString(),
+      },
+    })
+  },
+
+  queries: {
+    // Queries read the persisted snapshot. They do not replay workflow code
+    // from the beginning to rebuild local variables.
+    status: query(
+      z.object({ sequence: z.number(), status: z.string(), phase: z.string().optional() }),
+      ({ sequence, snapshot }) => ({
+        sequence,
+        status: snapshot.status,
+        phase: snapshot.status === "running" ? snapshot.phase.name : undefined,
+      }),
+    ),
+  },
+
+  phases: {
+    boot: phase({
+      state: z.object({ approvalTimeoutAt: z.string() }),
+      // `run` phases execute when they become ready. Returning `go(...)`
+      // commits a checkpoint and moves to another named phase.
+      run: async ({ ctx, data }) => {
+        return go("waiting_for_approval", {
+          enteredAt: ctx.now(),
+          approvalTimeoutAt: data.approvalTimeoutAt,
+        })
+      },
+    }),
+
+    waiting_for_approval: phase({
+      state: z.object({
+        enteredAt: z.string(),
+        approvalTimeoutAt: z.string(),
+      }),
+      on: {
+        // A signal is a durable wait. If the process exits here, the provider
+        // still knows this workflow is waiting for `approved`.
+        approved: signal(z.object({ message: z.string() }), async ({ event }) => {
+          return go("acknowledge", { message: event.message })
+        }),
+
+        // Signals can also drive terminal outcomes directly.
+        canceled: signal(z.object({ reason: z.string().optional() }), async ({ event }) => {
+          return cancel(event.reason ?? "approval canceled")
+        }),
+
+        // A timer is another durable wait on the same phase. Whichever event
+        // is claimed first wins the checkpoint.
+        approval_timeout: timer(
+          ({ data }) => data.approvalTimeoutAt,
+          async () => cancel("approval timed out"),
+        ),
+      },
+    }),
+
+    acknowledge: phase({
+      state: z.object({ message: z.string() }),
+      run: async ({ ctx, common, data }) => {
+        // Local activities are memoized at the checkpoint boundary, so a retry
+        // after the activity commits does not duplicate this side effect.
+        await ctx.activity("record_approval", () => ({
+          name: common.name,
+          message: data.message,
+          recordedAt: ctx.now(),
+        }))
+
+        // Completing writes a terminal snapshot with typed output.
+        return complete({
+          message: `${common.name}: ${data.message}`,
+          approvedAt: ctx.now(),
+        })
+      },
+    }),
+  },
+})
+```
+
+Use it:
+
+```ts
+const ref = await runtime.start(ApprovalWorkflow, { name: "Ada" }, { workflowId: "approval-demo" })
+await runtime.drain()
+
+await runtime.signal(ApprovalWorkflow, ref, "approved", { message: "ship it" })
+await runtime.drain()
+
+console.log(await runtime.query(ApprovalWorkflow, ref, "status"))
+```
+
+Or atomically start-or-signal by `workflowId`:
+
+```ts
+await runtime.startSendSignal(
+  ApprovalWorkflow,
+  { name: "Ada" },
+  "approved",
+  { message: "ship it" },
+  // Use idempotencyKey for request dedupe when targeting the active run by workflowId.
+  { workflowId: "approval-demo", idempotencyKey: "approve-request-1" },
+)
+```
+
+## How it differs from Temporal-style workflow engines
+
+Temporal and similar systems are built around event history: when work wakes up,
+the engine replays the workflow code to rebuild deterministic in-memory state.
+Durable Phases takes a more direct route. It stores the state you care about as
+a snapshot:
+
+```text
+{ common state, current phase, phase data, waits, child records, effect records }
+```
+
+When something is ready, the runtime loads that snapshot, runs one phase
+handler, and commits the next snapshot. Provider replay is still there for crash
+recovery, but it rebuilds storage projections from journal entries and snapshots;
+it does not run your workflow from the beginning just to remember where it was.
+It is closer to checkpointing a database WAL. Temporal-style replay is more like
+only having the WAL: powerful, but every recovery starts from history.
+
+That is the main benefit of the phase model: workflows can run for a very long
+time without getting heavier every time they wake up. A workflow can loop
+through phases for days, months, or years, and the next activation still starts
+from the current snapshot instead of replaying its whole lifetime.
+
+The tradeoff is that this is a different style of programming. You name the
+important states of the workflow, keep their data explicit, and let phase
+boundaries become the durable checkpoints. Signals, timers, activities, and
+children are attached to those phases as concrete waits and effects.
+
+Durable Phases is also meant to be embedded. SQLite and Postgres providers live
+in your app; there is no required workflow service to run. If you do have your
+own scheduler or queue, custom runners can kick shards directly while leases and
+checkpoint fencing protect correctness.
+
+So the goal is not to be a smaller Temporal Cloud. It is for apps that want
+durable execution with inspectable state, cheap long-lived workflows, and
+explicit phase transitions.
 
 ## Quickstart
 

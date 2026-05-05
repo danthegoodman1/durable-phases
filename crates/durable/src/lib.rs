@@ -1314,18 +1314,6 @@ impl ShardEngine {
             )));
         };
 
-        let idempotency_key = idempotency_key.filter(|key| !key.is_empty());
-        if let Some(idempotency_key) = &idempotency_key {
-            if let Some(signal) = state.signals.iter().find(|signal| {
-                signal.workflow_id == workflow_id
-                    && signal.run_id == run_id
-                    && signal.r#type == r#type
-                    && signal.idempotency_key.as_deref() == Some(idempotency_key.as_str())
-            }) {
-                return Ok((signal.clone(), false));
-            }
-        }
-
         if instance.status != PersistedStatus::Running {
             return Err(WorkflowError::new(format!(
                 "cannot signal non-running workflow: {}/{}",
@@ -1333,23 +1321,179 @@ impl ShardEngine {
             )));
         }
 
-        let signal = SignalRecord {
-            signal_id: format!("signal-{}", state.next_signal_id),
-            workflow_id,
-            run_id,
-            r#type,
-            payload,
-            received_at,
-            idempotency_key,
-            consumed_by_sequence: None,
-        };
-        state.next_signal_id += 1;
-        state.signals.push(signal.clone());
-        if let Some(instance) = state.instances.get(&key).cloned() {
-            refresh_signal_tasks_for_instance(state, &instance);
+        let instance = instance.clone();
+        let (signal, created) = append_signal_to_instance_unsaved(
+            state,
+            &instance,
+            AppendSignalInput {
+                workflow_id,
+                run_id,
+                r#type,
+                payload,
+                received_at,
+                idempotency_key,
+            },
+        );
+        if created {
+            save_engine(state)?;
         }
+        Ok((signal, created))
+    }
+
+    pub fn start_send_signal(
+        &mut self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        Ok(self.start_send_signal_with_status(input)?.0)
+    }
+
+    pub fn start_send_signal_with_status(
+        &mut self,
+        input: StartSendSignalInput,
+    ) -> Result<(StartSendSignalResult, bool), WorkflowError> {
+        let state = &mut self.state;
+        if let Some(target_run_id) = input.target_run_id.as_deref() {
+            if target_run_id != input.run_id {
+                return Err(WorkflowError::new(
+                    "start_send_signal target_run_id must match run_id",
+                ));
+            }
+        }
+
+        if let Some(signal) = find_signal_by_idempotency_key(
+            state,
+            &input.workflow_id,
+            &input.run_id,
+            &input.signal_type,
+            &input.signal_idempotency_key,
+        ) {
+            return Ok((
+                StartSendSignalResult::new(
+                    input.workflow_id.clone(),
+                    input.run_id.clone(),
+                    false,
+                    signal,
+                ),
+                false,
+            ));
+        }
+
+        let exact_key = instance_key(&input.workflow_id, &input.run_id);
+        if let Some(exact) = state.instances.get(&exact_key).cloned() {
+            if input.target_run_id.is_some() {
+                if exact.status != PersistedStatus::Running {
+                    return Err(WorkflowError::new(format!(
+                        "workflow run already closed: {}/{}",
+                        exact.workflow_id, exact.run_id
+                    )));
+                }
+                let (signal, created) = append_signal_to_instance_unsaved(
+                    state,
+                    &exact,
+                    AppendSignalInput {
+                        workflow_id: exact.workflow_id.clone(),
+                        run_id: exact.run_id.clone(),
+                        r#type: input.signal_type.clone(),
+                        payload: input.signal_payload.clone(),
+                        received_at: input.signal_received_at,
+                        idempotency_key: Some(input.signal_idempotency_key.clone()),
+                    },
+                );
+                if created {
+                    save_engine(state)?;
+                }
+                return Ok((
+                    StartSendSignalResult::new(exact.workflow_id, exact.run_id, false, signal),
+                    created,
+                ));
+            }
+            if exact.status != PersistedStatus::Running {
+                return Err(WorkflowError::new(format!(
+                    "workflow run already closed: {}/{}",
+                    exact.workflow_id, exact.run_id
+                )));
+            }
+        }
+
+        if let Some(running) = latest_running_workflow_run(state, &input.workflow_id).cloned() {
+            if input.target_run_id.is_some() {
+                return Err(WorkflowError::new(format!(
+                    "workflow ID {} already has running run {}",
+                    input.workflow_id, running.run_id
+                )));
+            }
+            let (signal, created) = append_signal_to_instance_unsaved(
+                state,
+                &running,
+                AppendSignalInput {
+                    workflow_id: running.workflow_id.clone(),
+                    run_id: running.run_id.clone(),
+                    r#type: input.signal_type.clone(),
+                    payload: input.signal_payload.clone(),
+                    received_at: input.signal_received_at,
+                    idempotency_key: Some(input.signal_idempotency_key.clone()),
+                },
+            );
+            if created {
+                save_engine(state)?;
+            }
+            return Ok((
+                StartSendSignalResult::new(running.workflow_id, running.run_id, false, signal),
+                created,
+            ));
+        }
+
+        let reuse_policy = input
+            .workflow_id_reuse_policy
+            .unwrap_or(WorkflowIdReusePolicy::NotRunning);
+        if let Some(latest) = latest_workflow_run(state, &input.workflow_id) {
+            if !should_create_workflow_run(reuse_policy, &latest.status) {
+                return Err(WorkflowError::new(format!(
+                    "workflow ID reuse policy {:?} prevents starting {}",
+                    reuse_policy, input.workflow_id
+                )));
+            }
+        }
+
+        let waits = stamp_signal_waits(&input.waits, &[], current_signal_counter(state));
+        let instance = PersistedInstance {
+            workflow_name: input.workflow_name,
+            workflow_version: input.workflow_version,
+            workflow_id: input.workflow_id.clone(),
+            run_id: input.run_id.clone(),
+            partition_shard: input.partition_shard,
+            sequence: 0,
+            status: PersistedStatus::Running,
+            common: Some(input.common),
+            phase: Some(input.phase),
+            output: None,
+            error: None,
+            cancel_reason: None,
+            waits,
+            effects: Vec::new(),
+            created_at: input.now,
+            updated_at: input.now,
+            parent: input.parent,
+        };
+        state.instances.insert(exact_key, instance.clone());
+        replace_tasks_for_instance(state, &instance);
+        let (signal, _) = append_signal_to_instance_unsaved(
+            state,
+            &instance,
+            AppendSignalInput {
+                workflow_id: input.workflow_id.clone(),
+                run_id: input.run_id.clone(),
+                r#type: input.signal_type,
+                payload: input.signal_payload,
+                received_at: input.signal_received_at,
+                idempotency_key: Some(input.signal_idempotency_key),
+            },
+        );
         save_engine(state)?;
-        Ok((signal, true))
+        Ok((
+            StartSendSignalResult::new(input.workflow_id, input.run_id, true, signal),
+            true,
+        ))
     }
 
     pub fn get_or_reserve_effect(
@@ -2412,6 +2556,7 @@ enum EngineOperation {
         options: LoadInstanceOptions,
     },
     AppendSignal(AppendSignalInput),
+    StartSendSignal(StartSendSignalInput),
     CancelChild(CancelChildInput),
     ReserveEffect(ReserveEffectInput),
     HeartbeatEffect(HeartbeatEffectInput),
@@ -2458,6 +2603,11 @@ enum EngineOutput {
     Signal {
         record: SignalRecord,
         created: bool,
+    },
+    StartSendSignal {
+        result: StartSendSignalResult,
+        mutated: bool,
+        instance: PersistedInstance,
     },
     EffectReservation(EffectReservation),
     FailEffect(FailEffectResult),
@@ -2535,6 +2685,19 @@ impl EngineOperation {
                     input.idempotency_key,
                 )
                 .map(|(record, created)| EngineOutput::Signal { record, created }),
+            EngineOperation::StartSendSignal(input) => {
+                let (result, mutated) = engine.start_send_signal_with_status(input)?;
+                let instance = engine
+                    .load_instance(&result.instance_ref())?
+                    .ok_or_else(|| {
+                        WorkflowError::new("start-send-signal instance missing from shard")
+                    })?;
+                Ok(EngineOutput::StartSendSignal {
+                    result,
+                    mutated,
+                    instance,
+                })
+            }
             EngineOperation::CancelChild(input) => {
                 engine.cancel_child(input)?;
                 Ok(EngineOutput::Unit)
@@ -3129,6 +3292,26 @@ impl ShardRouter {
         Ok((record, created))
     }
 
+    async fn start_send_signal_with_status(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<(StartSendSignalResult, bool), WorkflowError> {
+        let shard_id = input.partition_shard;
+        let output = self
+            .execute(shard_id, EngineOperation::StartSendSignal(input))
+            .await?;
+        let EngineOutput::StartSendSignal {
+            result,
+            mutated,
+            instance,
+        } = output
+        else {
+            unreachable!("start-send-signal operation returned wrong output");
+        };
+        self.cache_insert(instance)?;
+        Ok((result, mutated))
+    }
+
     async fn snapshot_store(&self) -> Result<Store, WorkflowError> {
         let mut stores = Vec::new();
         for shard_id in self.known_shard_ids()? {
@@ -3311,6 +3494,7 @@ enum JournalOperation {
     CreateInstance(CreateInstanceInput),
     CreateChildInstance(CreateChildInstanceInput),
     AppendSignal(AppendSignalInput),
+    StartSendSignal(StartSendSignalInput),
     CancelChild(CancelChildInput),
     ReserveEffect(ReserveEffectInput),
     PutEffectRecord {
@@ -3379,6 +3563,9 @@ fn apply_journal_operation(
                 input.received_at,
                 input.idempotency_key,
             )?;
+        }
+        JournalOperation::StartSendSignal(input) => {
+            provider.start_send_signal(input)?;
         }
         JournalOperation::CancelChild(input) => {
             provider.cancel_child(input)?;
@@ -3619,6 +3806,13 @@ impl ShardDurabilitySession for ShardRouterSession {
         input: AppendSignalInput,
     ) -> Result<(SignalRecord, bool), WorkflowError> {
         self.router.append_signal_with_status(input).await
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::start_send_signal(&self.router, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
@@ -3864,6 +4058,13 @@ impl DurabilityProvider for ShardRouter {
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         Ok(self.append_signal_with_status(input).await?.0)
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        Ok(self.start_send_signal_with_status(input).await?.0)
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
@@ -4126,6 +4327,13 @@ impl DurabilityProvider for NullDurabilityProvider {
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError> {
         <ShardRouter as DurabilityProvider>::append_signal(&self.inner, input).await
+    }
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError> {
+        <ShardRouter as DurabilityProvider>::start_send_signal(&self.inner, input).await
     }
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError> {
@@ -5260,6 +5468,69 @@ pub struct AppendSignalInput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StartSendSignalInput {
+    pub workflow_name: String,
+    pub workflow_version: u32,
+    pub workflow_id: String,
+    pub run_id: String,
+    pub partition_shard: u32,
+    pub common: JsonValue,
+    pub phase: PhaseSnapshot,
+    pub waits: Vec<DurableWait>,
+    pub now: DateTime<Utc>,
+    pub parent: Option<ParentLink>,
+    pub conflict_policy: Option<ConflictPolicy>,
+    pub workflow_id_reuse_policy: Option<WorkflowIdReusePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_run_id: Option<String>,
+    pub signal_type: String,
+    pub signal_payload: JsonValue,
+    pub signal_received_at: DateTime<Utc>,
+    pub signal_idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StartSendSignalResult {
+    #[serde(flatten)]
+    pub ref_: InstanceRef,
+    pub created: bool,
+    pub signal: SignalRecord,
+}
+
+impl StartSendSignalResult {
+    pub fn new(
+        workflow_id: impl Into<String>,
+        run_id: impl Into<String>,
+        created: bool,
+        signal: SignalRecord,
+    ) -> Self {
+        Self {
+            ref_: InstanceRef::new(workflow_id, run_id),
+            created,
+            signal,
+        }
+    }
+
+    pub fn instance_ref(&self) -> InstanceRef {
+        self.ref_.clone()
+    }
+}
+
+impl From<StartSendSignalResult> for InstanceRef {
+    fn from(value: StartSendSignalResult) -> Self {
+        value.ref_
+    }
+}
+
+impl Deref for StartSendSignalResult {
+    type Target = InstanceRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ref_
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadInstanceOptions {
     pub include_effects: bool,
 }
@@ -5372,6 +5643,11 @@ pub trait ShardDurabilitySession: Send + Sync {
         Ok((self.append_signal(input).await?, true))
     }
 
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError>;
+
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError>;
 
     async fn get_or_reserve_effect(
@@ -5466,6 +5742,11 @@ pub trait DurabilityProvider: Send + Sync {
     ) -> Result<GetWorkflowRunsResult, WorkflowError>;
 
     async fn append_signal(&self, input: AppendSignalInput) -> Result<SignalRecord, WorkflowError>;
+
+    async fn start_send_signal(
+        &self,
+        input: StartSendSignalInput,
+    ) -> Result<StartSendSignalResult, WorkflowError>;
 
     async fn cancel_child(&self, input: CancelChildInput) -> Result<(), WorkflowError>;
 
@@ -5654,6 +5935,62 @@ impl DurableRuntime {
                 parent: None,
                 conflict_policy: Some(ConflictPolicy::Fail),
                 workflow_id_reuse_policy: Some(options.workflow_id_reuse_policy),
+            })
+            .await
+    }
+
+    pub async fn start_send_signal<W, T>(
+        &self,
+        input: W::Input,
+        signal_type: impl Into<String>,
+        payload: T,
+        options: StartSendSignalOptions,
+    ) -> Result<StartSendSignalResult, WorkflowError>
+    where
+        W: Workflow,
+        T: Serialize,
+    {
+        if options.run_id.is_some() && options.workflow_id.is_none() {
+            return Err(WorkflowError::new(
+                "start_send_signal run_id requires workflow_id",
+            ));
+        }
+        self.register::<W>()?;
+        let workflow = self.workflow(W::NAME)?;
+        let input = serde_json::to_value(input)?;
+        let start = workflow.initial_value(input)?;
+        let now = self.now();
+        let target_run_id = options.run_id.clone();
+        let workflow_id = options
+            .workflow_id
+            .unwrap_or_else(|| format!("{}-{}", W::NAME, Uuid::new_v4()));
+        let run_id = options.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let signal_idempotency_key = options.idempotency_key.unwrap_or_else(|| run_id.clone());
+        let waits = workflow.materialize_waits(&start.common, &start.phase, now)?;
+
+        self.provider
+            .start_send_signal(StartSendSignalInput {
+                workflow_name: W::NAME.to_string(),
+                workflow_version: W::VERSION,
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+                partition_shard: workflow_partition_shard(
+                    &workflow_id,
+                    &run_id,
+                    self.options.shard_count,
+                ),
+                common: start.common,
+                phase: start.phase,
+                waits,
+                now,
+                parent: None,
+                conflict_policy: Some(ConflictPolicy::Fail),
+                workflow_id_reuse_policy: Some(options.workflow_id_reuse_policy),
+                target_run_id,
+                signal_type: signal_type.into(),
+                signal_payload: serde_json::to_value(payload)?,
+                signal_received_at: now,
+                signal_idempotency_key,
             })
             .await
     }
@@ -6390,6 +6727,14 @@ pub struct StartOptions {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct StartSendSignalOptions {
+    pub workflow_id: Option<String>,
+    pub run_id: Option<String>,
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SignalOptions {
     pub idempotency_key: Option<String>,
 }
@@ -7081,6 +7426,77 @@ fn latest_workflow_run<'a>(state: &'a Store, workflow_id: &str) -> Option<&'a Pe
         .max_by(|left, right| compare_workflow_runs(left, right))
 }
 
+fn latest_running_workflow_run<'a>(
+    state: &'a Store,
+    workflow_id: &str,
+) -> Option<&'a PersistedInstance> {
+    state
+        .instances
+        .values()
+        .filter(|instance| {
+            instance.workflow_id == workflow_id && instance.status == PersistedStatus::Running
+        })
+        .max_by(|left, right| compare_workflow_runs(left, right))
+}
+
+fn find_signal_by_idempotency_key(
+    state: &Store,
+    workflow_id: &str,
+    run_id: &str,
+    signal_type: &str,
+    idempotency_key: &str,
+) -> Option<SignalRecord> {
+    if idempotency_key.is_empty() {
+        return None;
+    }
+    state
+        .signals
+        .iter()
+        .find(|signal| {
+            signal.workflow_id == workflow_id
+                && signal.run_id == run_id
+                && signal.r#type == signal_type
+                && signal.idempotency_key.as_deref() == Some(idempotency_key)
+        })
+        .cloned()
+}
+
+fn append_signal_to_instance_unsaved(
+    state: &mut Store,
+    instance: &PersistedInstance,
+    input: AppendSignalInput,
+) -> (SignalRecord, bool) {
+    let idempotency_key = input.idempotency_key.filter(|key| !key.is_empty());
+    if let Some(idempotency_key) = &idempotency_key {
+        if let Some(signal) = find_signal_by_idempotency_key(
+            state,
+            &input.workflow_id,
+            &input.run_id,
+            &input.r#type,
+            idempotency_key,
+        ) {
+            return (signal, false);
+        }
+    }
+
+    let signal = SignalRecord {
+        signal_id: format!("signal-{}", state.next_signal_id),
+        workflow_id: input.workflow_id,
+        run_id: input.run_id,
+        r#type: input.r#type,
+        payload: input.payload,
+        received_at: input.received_at,
+        idempotency_key,
+        consumed_by_sequence: None,
+    };
+    state.next_signal_id += 1;
+    state.signals.push(signal.clone());
+    if instance.status == PersistedStatus::Running {
+        refresh_signal_tasks_for_instance(state, instance);
+    }
+    (signal, true)
+}
+
 fn encode_workflow_runs_cursor(
     instance: &PersistedInstance,
     direction: WorkflowRunDirection,
@@ -7446,6 +7862,8 @@ pub mod testing {
 
             assert_ordered_batch_claims_and_lean_reads(&provider, now).await;
             assert_signal_idempotency(&provider, now).await;
+            assert_start_send_signal(&provider, now).await;
+            assert_start_send_signal_target_run_id(&provider, now).await;
             assert_future_signal_delivery(&provider, now).await;
             assert_lost_activation_lease_preserves_signal(&provider, now).await;
             assert_eager_effect_retry_reclaims_activation(&provider, now).await;
@@ -7685,6 +8103,459 @@ pub mod testing {
                 .release()
                 .await
                 .expect("release idempotency shard failed");
+        }
+
+        async fn assert_start_send_signal<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            let started = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now,
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 1 }),
+                    signal_received_at: now,
+                    signal_idempotency_key: "run-1".to_string(),
+                })
+                .await
+                .expect("start-send create failed");
+            assert!(started.created);
+            assert_eq!(started.workflow_id, "start-send");
+            assert_eq!(started.run_id, "run-1");
+            assert_eq!(started.signal.idempotency_key.as_deref(), Some("run-1"));
+
+            let duplicate = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "ignored": true }),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(1),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 99 }),
+                    signal_received_at: now + chrono::Duration::seconds(1),
+                    signal_idempotency_key: "run-1".to_string(),
+                })
+                .await
+                .expect("start-send duplicate failed");
+            assert!(!duplicate.created);
+            assert_eq!(duplicate.signal.signal_id, started.signal.signal_id);
+
+            let existing = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-candidate".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "ignored": true }),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(2),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 2 }),
+                    signal_received_at: now + chrono::Duration::seconds(2),
+                    signal_idempotency_key: "run-candidate".to_string(),
+                })
+                .await
+                .expect("start-send existing failed");
+            assert!(!existing.created);
+            assert_eq!(existing.run_id, "run-1");
+            assert_eq!(existing.signal.run_id, "run-1");
+            assert_eq!(
+                existing.signal.idempotency_key.as_deref(),
+                Some("run-candidate")
+            );
+
+            let runs = provider
+                .get_workflow_runs(GetWorkflowRunsInput {
+                    id: "start-send".to_string(),
+                    cursor: None,
+                    limit: None,
+                    direction: None,
+                    include_effects: Some(false),
+                })
+                .await
+                .expect("start-send runs failed");
+            assert_eq!(runs.runs.len(), 1);
+
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "start-send-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("start-send shard claim failed")
+                .expect("start-send shard not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let claim = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("start_send".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("start-send claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("start-send signal activation missing");
+            let consume_signal_id = match &claim.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!("expected start-send signal activation, got {:?}", other),
+            };
+            let committed = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Completed {
+                        output: serde_json::json!({ "index": 1 }),
+                    },
+                    waits: Vec::new(),
+                    now: now + chrono::Duration::seconds(2),
+                    consume_signal_id: Some(consume_signal_id),
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("start-send commit failed");
+            assert!(committed.ok, "start-send commit conflict: {:?}", committed);
+
+            let blocked = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-rejected".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(2),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::FailedOnly),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 3 }),
+                    signal_received_at: now + chrono::Duration::seconds(2),
+                    signal_idempotency_key: "run-rejected".to_string(),
+                })
+                .await;
+            assert!(blocked.is_err());
+
+            let after_completed = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "start-send".to_string(),
+                    run_id: "run-2".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(5),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 4 }),
+                    signal_received_at: now + chrono::Duration::seconds(5),
+                    signal_idempotency_key: "run-2".to_string(),
+                })
+                .await
+                .expect("start-send after completed failed");
+            assert!(after_completed.created);
+            assert_eq!(after_completed.run_id, "run-2");
+
+            session
+                .release()
+                .await
+                .expect("release start-send shard failed");
+        }
+
+        async fn assert_start_send_signal_target_run_id<P>(provider: &P, now: DateTime<Utc>)
+        where
+            P: DurabilityProvider,
+        {
+            provider
+                .create_instance(CreateInstanceInput {
+                    workflow_name: "targeted_start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "targeted-start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now,
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: None,
+                })
+                .await
+                .expect("targeted start-send run-1 create failed");
+            provider
+                .create_instance(CreateInstanceInput {
+                    workflow_name: "targeted_start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "targeted-start-send".to_string(),
+                    run_id: "run-2".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(1),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::Always),
+                })
+                .await
+                .expect("targeted start-send run-2 create failed");
+
+            let targeted = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "targeted_start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "targeted-start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "ignored": true }),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(2),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: Some("run-1".to_string()),
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 1 }),
+                    signal_received_at: now + chrono::Duration::seconds(2),
+                    signal_idempotency_key: "target-run-1".to_string(),
+                })
+                .await
+                .expect("targeted start-send failed");
+            assert!(!targeted.created);
+            assert_eq!(targeted.run_id, "run-1");
+            assert_eq!(targeted.signal.run_id, "run-1");
+
+            let implicit = provider
+                .start_send_signal(StartSendSignalInput {
+                    workflow_name: "targeted_start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "targeted-start-send".to_string(),
+                    run_id: "run-candidate".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({ "ignored": true }),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(5),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                    target_run_id: None,
+                    signal_type: "finish".to_string(),
+                    signal_payload: serde_json::json!({ "index": 2 }),
+                    signal_received_at: now + chrono::Duration::seconds(5),
+                    signal_idempotency_key: "implicit-latest".to_string(),
+                })
+                .await
+                .expect("implicit start-send failed");
+            assert!(!implicit.created);
+            assert_eq!(implicit.run_id, "run-2");
+            assert_eq!(implicit.signal.run_id, "run-2");
+
+            let first_input = StartSendSignalInput {
+                workflow_name: "terminal_targeted_start_send".to_string(),
+                workflow_version: 1,
+                workflow_id: "terminal-targeted-start-send".to_string(),
+                run_id: "run-1".to_string(),
+                partition_shard: 0,
+                common: serde_json::json!({}),
+                phase: PhaseSnapshot {
+                    name: "waiting".to_string(),
+                    data: serde_json::json!({}),
+                },
+                waits: vec![mailbox_signal_wait("finish")],
+                now,
+                parent: None,
+                conflict_policy: Some(ConflictPolicy::Fail),
+                workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                target_run_id: Some("run-1".to_string()),
+                signal_type: "finish".to_string(),
+                signal_payload: serde_json::json!({ "index": 3 }),
+                signal_received_at: now,
+                signal_idempotency_key: "terminal-run-1".to_string(),
+            };
+            let first = provider
+                .start_send_signal(first_input.clone())
+                .await
+                .expect("terminal targeted start-send failed");
+            let lease = provider
+                .claim_shard(ClaimShardInput {
+                    shard_id: 0,
+                    owner_id: "terminal-target-worker".to_string(),
+                    now,
+                    lease_ms: 60_000,
+                })
+                .await
+                .expect("terminal target shard claim failed")
+                .expect("terminal target shard not claimed");
+            let session = provider.open_shard(OpenShardInput {
+                shard_id: lease.shard_id,
+                owner_id: Some(lease.owner_id.clone()),
+                lease_epoch: Some(lease.lease_epoch),
+            });
+            let claim = session
+                .claim_tasks(ClaimShardTasksInput {
+                    workflows: HashMap::from([("terminal_targeted_start_send".to_string(), 1)]),
+                    shard_count: 1,
+                    now,
+                    lease_ms: 60_000,
+                    limit: 1,
+                })
+                .await
+                .expect("terminal target claim failed")
+                .claims
+                .into_iter()
+                .next()
+                .expect("terminal target signal activation missing");
+            let consume_signal_id = match &claim.activation {
+                ClaimedActivation::Event {
+                    event: ReadyEvent::Signal { signal_id, .. },
+                    ..
+                } => signal_id.clone(),
+                other => panic!(
+                    "expected terminal target signal activation, got {:?}",
+                    other
+                ),
+            };
+            let committed = session
+                .commit_checkpoint(CommitCheckpointInput {
+                    workflow_id: "terminal-targeted-start-send".to_string(),
+                    run_id: "run-1".to_string(),
+                    expected_sequence: claim.activation.sequence(),
+                    activation_id: claim.activation.activation_id().to_string(),
+                    workflow_version: 1,
+                    next: InstanceStatusValue::Completed {
+                        output: serde_json::json!({ "index": 3 }),
+                    },
+                    waits: Vec::new(),
+                    now: now + chrono::Duration::seconds(2),
+                    consume_signal_id: Some(consume_signal_id),
+                    consume_child_record_id: None,
+                    effects: Vec::new(),
+                    child_starts: Vec::new(),
+                })
+                .await
+                .expect("terminal target commit failed");
+            assert!(
+                committed.ok,
+                "terminal target commit conflict: {:?}",
+                committed
+            );
+            session
+                .release()
+                .await
+                .expect("release terminal target shard failed");
+            provider
+                .create_instance(CreateInstanceInput {
+                    workflow_name: "terminal_targeted_start_send".to_string(),
+                    workflow_version: 1,
+                    workflow_id: "terminal-targeted-start-send".to_string(),
+                    run_id: "run-2".to_string(),
+                    partition_shard: 0,
+                    common: serde_json::json!({}),
+                    phase: PhaseSnapshot {
+                        name: "waiting".to_string(),
+                        data: serde_json::json!({}),
+                    },
+                    waits: vec![mailbox_signal_wait("finish")],
+                    now: now + chrono::Duration::seconds(5),
+                    parent: None,
+                    conflict_policy: Some(ConflictPolicy::Fail),
+                    workflow_id_reuse_policy: Some(WorkflowIdReusePolicy::NotRunning),
+                })
+                .await
+                .expect("terminal target run-2 create failed");
+
+            let retry = provider
+                .start_send_signal(first_input.clone())
+                .await
+                .expect("terminal target retry failed");
+            assert_eq!(retry.run_id, "run-1");
+            assert_eq!(retry.signal.signal_id, first.signal.signal_id);
+
+            let mut different = first_input;
+            different.signal_idempotency_key = "different-terminal-key".to_string();
+            assert!(provider.start_send_signal(different).await.is_err());
         }
 
         async fn assert_future_signal_delivery<P>(provider: &P, now: DateTime<Utc>)
@@ -8289,6 +9160,16 @@ pub mod testing {
             DurableWait::Run {
                 name: "__run".to_string(),
                 ready_at,
+            }
+        }
+
+        fn mailbox_signal_wait(name: &str) -> DurableWait {
+            DurableWait::Signal {
+                name: name.to_string(),
+                r#type: name.to_string(),
+                scope: WaitScope::Phase,
+                delivery: SignalDelivery::Mailbox,
+                after_signal_sequence: None,
             }
         }
 

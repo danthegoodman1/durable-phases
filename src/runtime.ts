@@ -18,6 +18,8 @@ import type {
   SignalRecord,
   ShardDurabilitySession,
   ShardLease,
+  StartSendSignalResult,
+  WorkflowIdReusePolicy,
 } from "./interface.js"
 import type { DurableLogFields, DurableMetricTags, DurableObservability } from "./observability.js"
 import {
@@ -75,6 +77,13 @@ export type DurableRuntimeOptions = DurableObservability & {
 }
 
 export type SignalOptions = {
+  idempotencyKey?: string
+}
+
+export type StartSendSignalOptions = {
+  workflowId?: string
+  runId?: string
+  workflowIdReusePolicy?: WorkflowIdReusePolicy
   idempotencyKey?: string
 }
 
@@ -357,6 +366,81 @@ export class DurableRuntime {
     })
     this.count("durable.workflow.start", { workflowName: workflow.name, workerId: this.workerId })
     return ref
+  }
+
+  async startSendSignal<W extends AnyWorkflow>(
+    workflow: W,
+    input: InputOf<W>,
+    type: string,
+    payload: unknown,
+    options: StartSendSignalOptions = {},
+  ): Promise<StartSendSignalResult> {
+    if (options.runId && !options.workflowId) {
+      throw new Error("startSendSignal runId requires workflowId")
+    }
+    this.registerWorkflows([workflow])
+    const parsedInput = workflow.input.parse(input)
+    const startCommand = workflow.initial(parsedInput)
+    const parsedPayload = this.parseSignalPayload(workflow, type, payload)
+    const now = this.now()
+    const workflowId = options.workflowId ?? `${workflow.name}-${randomUUID()}`
+    const runId = options.runId ?? randomUUID()
+    const partitionShard = workflowPartitionShard(workflowId, runId, this.shardCount)
+    const instance = this.initialInstance(workflow, workflowId, runId, partitionShard, startCommand, now)
+    const signalIdempotencyKey = options.idempotencyKey ?? runId
+    let result: StartSendSignalResult
+    try {
+      result = await this.shardSessionForShard(partitionShard).startSendSignal({
+        workflowName: workflow.name,
+        workflowVersion: workflow.version,
+        workflowId: instance.workflowId,
+        runId: instance.runId,
+        partitionShard,
+        ...(options.runId ? { targetRunId: options.runId } : {}),
+        common: instance.common!,
+        phase: instance.phase!,
+        waits: instance.waits,
+        now,
+        workflowIdReusePolicy: options.workflowIdReusePolicy ?? "not_running",
+        signalType: type,
+        signalPayload: toJson(parsedPayload),
+        signalReceivedAt: now,
+        signalIdempotencyKey,
+      })
+    } catch (error) {
+      this.log("warn", "workflow.start_send_signal", {
+        workflowName: workflow.name,
+        type,
+        status: "failed",
+        workerId: this.workerId,
+      })
+      this.count("durable.workflow.start_send_signal", {
+        workflowName: workflow.name,
+        workerId: this.workerId,
+        status: "failed",
+      })
+      throw error
+    }
+    const status = result.created
+      ? "started"
+      : result.signal.receivedAt === now
+        ? "signaled_existing"
+        : "deduped"
+    this.log("info", "workflow.start_send_signal", {
+      workflowName: workflow.name,
+      workflowId: result.workflowId,
+      runId: result.runId,
+      signalId: result.signal.signalId,
+      type,
+      status,
+      workerId: this.workerId,
+    })
+    this.count("durable.workflow.start_send_signal", {
+      workflowName: workflow.name,
+      workerId: this.workerId,
+      status,
+    })
+    return result
   }
 
   async getWorkflowRuns(input: GetWorkflowRunsInput): Promise<GetWorkflowRunsResult> {
