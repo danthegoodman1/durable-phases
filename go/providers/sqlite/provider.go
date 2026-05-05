@@ -159,40 +159,47 @@ func (p *Provider) persist(ctx context.Context) error {
 	if p.closed {
 		return fmt.Errorf("sqlite provider is closed")
 	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := p.appendSnapshotJournal(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+type sqliteExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (p *Provider) appendSnapshotJournal(ctx context.Context, execer sqliteExecer) error {
 	snapshot := p.engine.Snapshot()
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
 	}
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := tx.ExecContext(ctx, `INSERT INTO shard_journal (operation_json, created_at) VALUES (?, ?)`, string(raw), createdAt)
+	result, err := execer.ExecContext(ctx, `INSERT INTO shard_journal (operation_json, created_at) VALUES (?, ?)`, string(raw), createdAt)
 	if err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	entryID, err := result.LastInsertId()
 	if err != nil {
-		_ = tx.Rollback()
 		return err
 	}
 	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
-		if _, err := tx.ExecContext(ctx, `
+		_, err = execer.ExecContext(ctx, `
 INSERT INTO shard_snapshots (snapshot_id, last_entry_id, snapshot_json, created_at)
 VALUES (1, ?, ?, ?)
 ON CONFLICT(snapshot_id) DO UPDATE SET
   last_entry_id = excluded.last_entry_id,
   snapshot_json = excluded.snapshot_json,
   created_at = excluded.created_at
-`, entryID, string(raw), createdAt); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
+`, entryID, string(raw), createdAt)
 	}
-	return tx.Commit()
+	return err
 }
 
 func (p *Provider) ClaimShard(ctx context.Context, input durable.ClaimDispatchShardInput) (*durable.ShardLease, error) {
@@ -235,14 +242,37 @@ func (p *Provider) LoadInstance(ctx context.Context, ref durable.InstanceRef, op
 }
 
 func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalInput) (durable.SignalRecord, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return durable.SignalRecord{}, fmt.Errorf("sqlite provider is closed")
+	}
+	if _, err := p.db.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return durable.SignalRecord{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = p.db.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+	if err := p.reload(ctx); err != nil {
+		return durable.SignalRecord{}, err
+	}
 	out, created, err := p.engine.AppendSignalWithStatus(ctx, input)
 	if err != nil {
 		return out, err
 	}
-	if !created {
-		return out, nil
+	if created {
+		if err := p.appendSnapshotJournal(ctx, p.db); err != nil {
+			return out, err
+		}
 	}
-	return out, p.persist(ctx)
+	if _, err := p.db.ExecContext(ctx, `COMMIT`); err != nil {
+		return out, err
+	}
+	committed = true
+	return out, nil
 }
 
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {

@@ -15,6 +15,7 @@ import (
 	"github.com/danthegoodman1/durable-phases/go/internal/shardengine"
 	postgresprovider "github.com/danthegoodman1/durable-phases/go/providers/postgres"
 	sqliteprovider "github.com/danthegoodman1/durable-phases/go/providers/sqlite"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -481,6 +482,57 @@ func TestSQLiteProviderIdempotentSignalReplaySkipsDuplicateJournal(t *testing.T)
 	}
 }
 
+func TestSQLiteProviderIdempotentSignalDeduplicatesAcrossProviderInstances(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	providerA, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providerA.Close(ctx)
+	ref, err := providerA.CreateInstance(ctx, durable.CreateInstanceInput{
+		WorkflowName: "sqlite_signal_cross_provider", WorkflowVersion: 1, WorkflowID: "sqlite-signal-cross-provider", RunID: "run-1", PartitionShard: 0,
+		Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{durable.SignalWait("finish", "finish", false)}, Now: t0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerB, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providerB.Close(ctx)
+
+	first, err := providerA.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"sender": "a"}, ReceivedAt: t0, IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := providerB.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"sender": "b"}, ReceivedAt: t0.Add(time.Second), IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.SignalID != first.SignalID || duplicate.Payload.(map[string]any)["sender"] != "a" {
+		t.Fatalf("duplicate = %#v, want original %#v", duplicate, first)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var journalEntries int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM shard_journal`).Scan(&journalEntries); err != nil {
+		t.Fatal(err)
+	}
+	if journalEntries != 2 {
+		t.Fatalf("journal entries = %d, want 2", journalEntries)
+	}
+}
+
 func TestSQLiteShardFileProviderRestartsFromJournals(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -551,6 +603,63 @@ func TestPostgresProviderRestartsFromJournalWhenConfigured(t *testing.T) {
 	}
 	if instance == nil || instance.Common.(map[string]any)["value"] != "saved" {
 		t.Fatalf("restarted postgres instance = %#v", instance)
+	}
+}
+
+func TestPostgresProviderIdempotentSignalDeduplicatesAcrossProviderInstances(t *testing.T) {
+	url := os.Getenv("DURABLE_POSTGRES_URL")
+	if url == "" {
+		t.Skip("DURABLE_POSTGRES_URL is not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("durable_go_signal_idempotency_%d", time.Now().UnixNano())
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	defer pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+
+	providerA, err := postgresprovider.New(ctx, postgresprovider.Options{ConnectionString: url, Schema: schema, PhysicalPartitions: 2, SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providerA.Close(ctx)
+	ref, err := providerA.CreateInstance(ctx, durable.CreateInstanceInput{
+		WorkflowName: "postgres_signal_cross_provider", WorkflowVersion: 1, WorkflowID: "postgres-signal-cross-provider", RunID: "run-1", PartitionShard: 0,
+		Common: map[string]any{}, Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}, Waits: []durable.DurableWait{durable.SignalWait("finish", "finish", false)}, Now: t0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerB, err := postgresprovider.New(ctx, postgresprovider.Options{ConnectionString: url, Schema: schema, PhysicalPartitions: 2, SnapshotInterval: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providerB.Close(ctx)
+
+	first, err := providerA.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"sender": "a"}, ReceivedAt: t0, IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := providerB.AppendSignal(ctx, durable.AppendSignalInput{
+		WorkflowID: ref.WorkflowID, RunID: ref.RunID, Type: "finish", Payload: map[string]any{"sender": "b"}, ReceivedAt: t0.Add(time.Second), IdempotencyKey: "request-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.SignalID != first.SignalID || duplicate.Payload.(map[string]any)["sender"] != "a" {
+		t.Fatalf("duplicate = %#v, want original %#v", duplicate, first)
+	}
+
+	var journalEntries int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*)::int FROM "%s".shard_journal_p00 WHERE shard_id = 0`, schema)).Scan(&journalEntries); err != nil {
+		t.Fatal(err)
+	}
+	if journalEntries != 2 {
+		t.Fatalf("journal entries = %d, want 2", journalEntries)
 	}
 }
 

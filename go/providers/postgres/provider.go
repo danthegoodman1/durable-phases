@@ -34,6 +34,7 @@ type Provider struct {
 	pool               *pgxpool.Pool
 	ownsPool           bool
 	engine             *shardengine.Provider
+	appliedEntries     map[int]int64
 	schema             string
 	physicalPartitions int
 	snapshotInterval   int64
@@ -83,6 +84,7 @@ func New(ctx context.Context, options Options) (*Provider, error) {
 		pool:               pool,
 		ownsPool:           ownsPool,
 		engine:             shardengine.New(),
+		appliedEntries:     map[int]int64{},
 		schema:             schema,
 		physicalPartitions: partitions,
 		snapshotInterval:   options.SnapshotInterval,
@@ -229,15 +231,22 @@ func (p *Provider) reload(ctx context.Context) error {
 		}
 	}
 	sortRows(rows)
+	engine := shardengine.New()
+	appliedEntries := map[int]int64{}
 	for _, item := range rows {
 		var operation shardengine.JournalOperation
 		if err := json.Unmarshal(item.raw, &operation); err != nil {
 			return err
 		}
-		if err := shardengine.ApplyJournalOperation(ctx, p.engine, operation); err != nil {
+		if err := shardengine.ApplyJournalOperation(ctx, engine, operation); err != nil {
 			return err
 		}
+		if item.entryID > appliedEntries[item.shardID] {
+			appliedEntries[item.shardID] = item.entryID
+		}
 	}
+	p.engine = engine
+	p.appliedEntries = appliedEntries
 	return nil
 }
 
@@ -290,6 +299,7 @@ RETURNING entry_id
 	if err != nil {
 		return err
 	}
+	p.appliedEntries[shardID] = entryID
 	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
 		snapshotRaw, err := json.Marshal(p.engine.Snapshot())
 		if err != nil {
@@ -305,6 +315,99 @@ ON CONFLICT (shard_id) DO UPDATE SET
 `, p.table("shard_snapshots", partition)), shardID, entryID, string(snapshotRaw), createdAt); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (p *Provider) lockShardHead(ctx context.Context, tx pgx.Tx, shardID int) error {
+	partition := p.partitionForShard(shardID)
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (shard_id, last_entry_id, updated_at)
+VALUES ($1, 0, $2)
+ON CONFLICT (shard_id) DO NOTHING
+`, p.table("shard_heads", partition)), shardID, now); err != nil {
+		return err
+	}
+	var current int64
+	return tx.QueryRow(ctx, fmt.Sprintf(`
+SELECT last_entry_id
+FROM %s
+WHERE shard_id = $1
+FOR UPDATE
+`, p.table("shard_heads", partition)), shardID).Scan(&current)
+}
+
+func (p *Provider) catchUpShardLocked(ctx context.Context, tx pgx.Tx, shardID int) error {
+	partition := p.partitionForShard(shardID)
+	applied := p.appliedEntries[shardID]
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
+SELECT entry_id, operation_json, created_at
+FROM %s
+WHERE shard_id = $1 AND entry_id > $2
+ORDER BY entry_id
+`, p.table("shard_journal", partition)), shardID, applied)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var entryID int64
+		var raw []byte
+		var createdAt time.Time
+		if err := rows.Scan(&entryID, &raw, &createdAt); err != nil {
+			return err
+		}
+		var operation shardengine.JournalOperation
+		if err := json.Unmarshal(raw, &operation); err != nil {
+			return err
+		}
+		if err := shardengine.ApplyJournalOperation(ctx, p.engine, operation); err != nil {
+			return err
+		}
+		p.appliedEntries[shardID] = entryID
+	}
+	return rows.Err()
+}
+
+func (p *Provider) appendJournalTxLocked(ctx context.Context, tx pgx.Tx, shardID int, operation shardengine.JournalOperation) error {
+	raw, err := json.Marshal(operation)
+	if err != nil {
+		return err
+	}
+	createdAt := time.Now().UTC()
+	partition := p.partitionForShard(shardID)
+	var entryID int64
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`
+UPDATE %s
+SET last_entry_id = last_entry_id + 1,
+    updated_at = $2
+WHERE shard_id = $1
+RETURNING last_entry_id
+`, p.table("shard_heads", partition)), shardID, createdAt).Scan(&entryID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (shard_id, entry_id, operation_json, created_at)
+VALUES ($1, $2, $3, $4)
+`, p.table("shard_journal", partition)), shardID, entryID, string(raw), createdAt); err != nil {
+		return err
+	}
+	p.appliedEntries[shardID] = entryID
+	if p.snapshotInterval > 0 && entryID%p.snapshotInterval == 0 {
+		snapshotRaw, err := json.Marshal(p.engine.Snapshot())
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (shard_id, last_entry_id, snapshot_json, created_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (shard_id) DO UPDATE SET
+  last_entry_id = EXCLUDED.last_entry_id,
+  snapshot_json = EXCLUDED.snapshot_json,
+  created_at = EXCLUDED.created_at
+`, p.table("shard_snapshots", partition)), shardID, entryID, string(snapshotRaw), createdAt)
+		return err
 	}
 	return nil
 }
@@ -362,12 +465,41 @@ func (p *Provider) AppendSignal(ctx context.Context, input durable.AppendSignalI
 		return durable.SignalRecord{}, err
 	}
 	shardID := p.shardForRef(durable.InstanceRef{WorkflowID: input.WorkflowID, RunID: input.RunID})
-	created := true
-	return mutate(p, ctx, shardID, operation, func() (durable.SignalRecord, error) {
-		out, nextCreated, err := p.engine.AppendSignalWithStatus(ctx, input)
-		created = nextCreated
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return durable.SignalRecord{}, fmt.Errorf("postgres provider is closed")
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return durable.SignalRecord{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := p.lockShardHead(ctx, tx, shardID); err != nil {
+		return durable.SignalRecord{}, err
+	}
+	if err := p.catchUpShardLocked(ctx, tx, shardID); err != nil {
+		return durable.SignalRecord{}, err
+	}
+	out, created, err := p.engine.AppendSignalWithStatus(ctx, input)
+	if err != nil {
 		return out, err
-	}, func(durable.SignalRecord) bool { return created })
+	}
+	if created {
+		if err := p.appendJournalTxLocked(ctx, tx, shardID, operation); err != nil {
+			return out, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return out, err
+	}
+	committed = true
+	return out, nil
 }
 func (p *Provider) ClaimReadyActivations(ctx context.Context, shardIDs []int, input durable.ClaimShardTasksInput) (durable.ClaimShardTasksResult, error) {
 	operation, err := shardengine.NewJournalOperation("claimReadyActivations", shardengine.ClaimReadyActivationsOperationInput{ShardIDs: shardIDs, Input: input})
