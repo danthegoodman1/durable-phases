@@ -45,11 +45,14 @@ import type {
   JsonValue,
   PhaseSnapshot,
   Schema,
+  SignalEachWait,
   SignalWait,
+  SignalWaitInfo,
   StartCommand,
   StartWorkflowResult,
   TransitionCommand,
   WaitDefinition,
+  WaitSelectorArgs,
 } from "./workflow.js"
 import {
   clone,
@@ -381,12 +384,12 @@ export class DurableRuntime {
     this.registerWorkflows([workflow])
     const parsedInput = workflow.input.parse(input)
     const startCommand = workflow.initial(parsedInput)
-    const parsedPayload = this.parseSignalPayload(workflow, type, payload)
     const now = this.now()
     const workflowId = options.workflowId ?? `${workflow.name}-${randomUUID()}`
     const runId = options.runId ?? randomUUID()
     const partitionShard = workflowPartitionShard(workflowId, runId, this.shardCount)
     const instance = this.initialInstance(workflow, workflowId, runId, partitionShard, startCommand, now)
+    const parsedPayload = await this.parseStartSendSignalPayload(workflow, instance, type, payload, options)
     const signalIdempotencyKey = options.idempotencyKey ?? runId
     let result: StartSendSignalResult
     try {
@@ -1212,16 +1215,21 @@ export class DurableRuntime {
     } else {
       const event = activation.event
       const waitDefinition = this.waitDefinition(workflow, latest, activation.wait)
+      const waitInfo = signalWaitInfo(activation.wait)
       if (event.kind === "signal") {
-        if (waitDefinition.kind !== "signal") {
+        if (waitDefinition.kind !== "signal" && waitDefinition.kind !== "signal_each") {
           throw new Error("Signal delivered to non-signal wait")
         }
         consumeSignalId = event.consumeSignalId
+        const parsedEventPayload = shouldValidateMatchedSignalPayload(waitDefinition, activation.wait)
+          ? waitDefinition.schema.parse(trustedJsonCopy(event.payload))
+          : trustedJsonCopy(event.payload)
         transition = await waitDefinition.handler({
           ctx,
           common,
           data,
-          event: trustedJsonCopy(event.payload),
+          event: parsedEventPayload,
+          wait: waitInfo,
         })
       } else if (event.kind === "timer") {
         transition = await callWaitHandler(waitDefinition, {
@@ -2449,13 +2457,13 @@ export class DurableRuntime {
     const waits: DurableWait[] = []
     for (const name of Object.keys(workflow.on ?? {}).sort()) {
       const wait = workflow.on?.[name]
-      waits.push({
-        kind: "signal",
-        name,
-        type: name,
-        scope: "global",
-        ...(wait?.delivery === "future" ? { delivery: wait.delivery } : {}),
-      })
+      if (!wait) {
+        continue
+      }
+      waits.push(this.materializeSignalWait(name, wait, "global", {
+        common: snapshot.common,
+        data: snapshot.phase.data,
+      }))
     }
 
     const phaseDefinition = workflow.phases[snapshot.phase.name]
@@ -2465,6 +2473,7 @@ export class DurableRuntime {
 
     if (phaseDefinition.mode === "run") {
       waits.push({ kind: "run", name: "__run", readyAt: instance.updatedAt })
+      validateMaterializedWaits(waits)
       return waits
     }
 
@@ -2472,13 +2481,16 @@ export class DurableRuntime {
       left.localeCompare(right),
     )) {
       if (wait.kind === "signal") {
-        waits.push({
-          kind: "signal",
-          name,
-          type: name,
-          scope: "phase",
-          ...(wait.delivery === "future" ? { delivery: wait.delivery } : {}),
-        })
+        waits.push(this.materializeSignalWait(name, wait, "phase", {
+          common: snapshot.common,
+          data: snapshot.phase.data,
+        }))
+      } else if (wait.kind === "signal_each") {
+        const args = { common: snapshot.common, data: snapshot.phase.data }
+        for (const item of wait.items(args)) {
+          const materialized = this.materializeSignalEachWait(name, wait, item, args)
+          waits.push(materialized)
+        }
       } else if (wait.kind === "timer") {
         const fireAt = wait.selector({
           common: snapshot.common,
@@ -2505,7 +2517,42 @@ export class DurableRuntime {
       }
     }
 
+    validateMaterializedWaits(waits)
     return waits
+  }
+
+  private materializeSignalWait(
+    handlerName: string,
+    wait: SignalWait<any>,
+    scope: "phase" | "global",
+    args: WaitSelectorArgs,
+  ): Extract<DurableWait, { kind: "signal" }> {
+    const name = resolveWaitSelector(wait.name, args, handlerName)
+    const type = resolveWaitSelector(wait.type, args, handlerName)
+    return buildSignalWait({
+      handlerName,
+      name,
+      type,
+      scope,
+      delivery: wait.delivery,
+      meta: resolveOptionalWaitSelector(wait.meta, args),
+    })
+  }
+
+  private materializeSignalEachWait<Item>(
+    handlerName: string,
+    wait: SignalEachWait<any, Item>,
+    item: Item,
+    args: WaitSelectorArgs,
+  ): Extract<DurableWait, { kind: "signal" }> {
+    return buildSignalWait({
+      handlerName,
+      name: wait.name(item, args),
+      type: wait.type(item, args),
+      scope: "phase",
+      delivery: wait.delivery,
+      meta: wait.meta ? wait.meta(item, args) : item,
+    })
   }
 
   private waitDefinition(
@@ -2513,10 +2560,11 @@ export class DurableRuntime {
     instance: ActivationInstanceSnapshot,
     wait: Exclude<DurableWait, { kind: "run" }>,
   ): WaitDefinition {
+    const definitionName = wait.kind === "signal" ? wait.handler ?? wait.name : wait.name
     if (wait.kind === "signal" && wait.scope === "global") {
-      const definition = workflow.on?.[wait.name]
+      const definition = workflow.on?.[definitionName]
       if (!definition) {
-        throw new Error(`Unknown global wait ${wait.name} on workflow ${workflow.name}`)
+        throw new Error(`Unknown global wait ${definitionName} on workflow ${workflow.name}`)
       }
       return definition
     }
@@ -2526,9 +2574,9 @@ export class DurableRuntime {
       throw new Error(`Running workflow ${instance.workflowId} has no phase`)
     }
 
-    const definition = workflow.phases[phaseName]?.on?.[wait.name]
+    const definition = workflow.phases[phaseName]?.on?.[definitionName]
     if (!definition) {
-      throw new Error(`Unknown wait ${wait.name} on phase ${phaseName}`)
+      throw new Error(`Unknown wait ${definitionName} on phase ${phaseName}`)
     }
     return definition
   }
@@ -2573,14 +2621,14 @@ export class DurableRuntime {
   }
 
   private parseSignalPayload(workflow: AnyWorkflow, type: string, payload: unknown): unknown {
-    const candidates: SignalWait[] = []
+    const candidates: Array<SignalWait | SignalEachWait> = []
     if (workflow.on?.[type]) {
       candidates.push(workflow.on[type])
     }
 
     for (const phaseDefinition of Object.values(workflow.phases)) {
       const wait = phaseDefinition.on?.[type]
-      if (wait?.kind === "signal") {
+      if (wait?.kind === "signal" || wait?.kind === "signal_each") {
         candidates.push(wait)
       }
     }
@@ -2612,7 +2660,7 @@ export class DurableRuntime {
       )
       if (wait) {
         const definition = this.waitDefinition(workflow, instance, wait)
-        if (definition.kind !== "signal") {
+        if (definition.kind !== "signal" && definition.kind !== "signal_each") {
           throw new Error(`Signal wait ${wait.name} is not a signal definition`)
         }
         return definition.schema.parse(payload)
@@ -2620,6 +2668,86 @@ export class DurableRuntime {
     }
 
     return this.parseSignalPayload(workflow, type, payload)
+  }
+
+  private async parseStartSendSignalPayload(
+    workflow: AnyWorkflow,
+    initialInstance: PersistedInstance,
+    type: string,
+    payload: unknown,
+    options: StartSendSignalOptions,
+  ): Promise<unknown> {
+    const targetInstance = await this.startSendSignalTargetInstance(workflow, initialInstance, options)
+    if (targetInstance) {
+      return this.parseSignalPayloadForInstance(workflow, targetInstance, type, payload)
+    }
+
+    try {
+      const activeWait = initialInstance.waits.find(
+        (candidate): candidate is Extract<DurableWait, { kind: "signal" }> =>
+          candidate.kind === "signal" && candidate.type === type,
+      )
+      if (activeWait && (activeWait.handler !== undefined || activeWait.type !== activeWait.name)) {
+        return this.parseSignalPayloadForInstance(workflow, initialInstance, type, payload)
+      }
+      return this.parseSignalPayload(workflow, type, payload)
+    } catch (error) {
+      if (hasDynamicSignalDefinitions(workflow) && isUnknownSignalError(error, type, workflow.name)) {
+        return payload
+      }
+      throw error
+    }
+  }
+
+  private async startSendSignalTargetInstance(
+    workflow: AnyWorkflow,
+    initialInstance: PersistedInstance,
+    options: StartSendSignalOptions,
+  ): Promise<PersistedInstance | null> {
+    if (options.runId) {
+      const target = await this.shardSessionForRef({
+        workflowId: initialInstance.workflowId,
+        runId: options.runId,
+      }).readInstance({
+        workflowId: initialInstance.workflowId,
+        runId: options.runId,
+      })
+      if (target?.status !== "running") {
+        return null
+      }
+      assertWorkflowMatchesStartSendTarget(workflow, target)
+      return target
+    }
+
+    if (!options.workflowId) {
+      return null
+    }
+
+    const target = await this.latestRunningWorkflowRun(options.workflowId)
+    if (!target) {
+      return null
+    }
+    assertWorkflowMatchesStartSendTarget(workflow, target)
+    return target
+  }
+
+  private async latestRunningWorkflowRun(workflowId: string): Promise<PersistedInstance | null> {
+    let cursor: string | undefined
+    do {
+      const page = await this.shardSessionForWorkflowId(workflowId).getWorkflowRuns({
+        id: workflowId,
+        direction: "desc",
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })
+      const running = page.runs.find((run) => run.status === "running")
+      if (running) {
+        return running
+      }
+      cursor = page.cursor
+    } while (cursor)
+
+    return null
   }
 
   private async requireInstance(ref: InstanceRef | string): Promise<PersistedInstance> {
@@ -3009,4 +3137,116 @@ function callWaitHandler(
   args: HandlerArgs<any>,
 ): Promise<TransitionCommand> | TransitionCommand {
   return wait.handler(args)
+}
+
+function resolveWaitSelector<T>(
+  selector: T | ((args: WaitSelectorArgs) => T) | undefined,
+  args: WaitSelectorArgs,
+  fallback: T,
+): T {
+  return typeof selector === "function" ? (selector as (args: WaitSelectorArgs) => T)(args) : selector ?? fallback
+}
+
+function resolveOptionalWaitSelector<T>(
+  selector: T | ((args: WaitSelectorArgs) => T) | undefined,
+  args: WaitSelectorArgs,
+): T | undefined {
+  return typeof selector === "function" ? (selector as (args: WaitSelectorArgs) => T)(args) : selector
+}
+
+function buildSignalWait(input: {
+  handlerName: string
+  name: string
+  type: string
+  scope: "phase" | "global"
+  delivery?: "mailbox" | "future"
+  meta?: unknown
+}): Extract<DurableWait, { kind: "signal" }> {
+  const wait: Extract<DurableWait, { kind: "signal" }> = {
+    kind: "signal",
+    name: input.name,
+    type: input.type,
+    scope: input.scope,
+  }
+  if (input.handlerName !== input.name) {
+    wait.handler = input.handlerName
+  }
+  if (input.delivery === "future") {
+    wait.delivery = input.delivery
+  }
+  if (input.meta !== undefined) {
+    wait.meta = toJson(input.meta)
+  }
+  return wait
+}
+
+function signalWaitInfo(wait: Exclude<DurableWait, { kind: "run" }>): SignalWaitInfo | undefined {
+  if (wait.kind !== "signal") {
+    return undefined
+  }
+  return {
+    kind: "signal",
+    name: wait.name,
+    type: wait.type,
+    scope: wait.scope,
+    handler: wait.handler ?? wait.name,
+    ...(wait.delivery ? { delivery: wait.delivery } : {}),
+    ...(wait.meta !== undefined ? { meta: trustedJsonCopy(wait.meta) } : {}),
+  }
+}
+
+function validateMaterializedWaits(waits: DurableWait[]): void {
+  const signalTypes = new Set<string>()
+  for (const wait of waits) {
+    if (wait.kind !== "signal") {
+      continue
+    }
+    if (!wait.name) {
+      throw new Error("Signal wait name must be non-empty")
+    }
+    if (!wait.type) {
+      throw new Error(`Signal wait ${wait.name} type must be non-empty`)
+    }
+    if (signalTypes.has(wait.type)) {
+      throw new Error(`Duplicate active signal type ${wait.type}`)
+    }
+    signalTypes.add(wait.type)
+  }
+}
+
+function shouldValidateMatchedSignalPayload(
+  definition: SignalWait | SignalEachWait,
+  wait: Exclude<DurableWait, { kind: "run" }>,
+): boolean {
+  return definition.kind === "signal_each" ||
+    (wait.kind === "signal" &&
+      (wait.handler !== undefined || wait.meta !== undefined || wait.type !== wait.name))
+}
+
+function assertWorkflowMatchesStartSendTarget(workflow: AnyWorkflow, target: PersistedInstance): void {
+  if (target.workflowName === workflow.name && target.workflowVersion === workflow.version) {
+    return
+  }
+
+  throw new Error(
+    `startSendSignal target ${target.workflowId}/${target.runId} belongs to ${target.workflowName}@${target.workflowVersion}, not ${workflow.name}@${workflow.version}`,
+  )
+}
+
+function hasDynamicSignalDefinitions(workflow: AnyWorkflow): boolean {
+  const definitions = [
+    ...Object.values(workflow.on ?? {}),
+    ...Object.values(workflow.phases).flatMap((phaseDefinition) =>
+      Object.values(phaseDefinition.on ?? {}),
+    ),
+  ]
+  return definitions.some((definition) =>
+    definition.kind === "signal_each" ||
+    (definition.kind === "signal" &&
+      (definition.name !== undefined || definition.type !== undefined || definition.meta !== undefined))
+  )
+}
+
+function isUnknownSignalError(error: unknown, type: string, workflowName: string): boolean {
+  return error instanceof Error && error.message === `Unknown signal ${type} on workflow ${workflowName}`
 }

@@ -179,6 +179,9 @@ func (r *Runtime) Start(ctx context.Context, workflow Workflow, input JSON, opti
 	if err != nil {
 		return StartWorkflowResult{}, err
 	}
+	if err := ValidateDurableWaits(waits); err != nil {
+		return StartWorkflowResult{}, err
+	}
 	session := r.provider.OpenShard(OpenShardInput{ShardID: partitionShard})
 	ref, err := session.CreateInstance(ctx, CreateInstanceInput{
 		WorkflowName:          workflow.Name(),
@@ -229,6 +232,9 @@ func (r *Runtime) StartSendSignal(ctx context.Context, workflow Workflow, input 
 	partitionShard := WorkflowPartitionShard(workflowID, runID, r.options.ShardCount)
 	waits, err := workflow.MaterializeWaits(ctx, start.Common, start.Phase, now)
 	if err != nil {
+		return StartSendSignalResult{}, err
+	}
+	if err := ValidateDurableWaits(waits); err != nil {
 		return StartSendSignalResult{}, err
 	}
 	session := r.provider.OpenShard(OpenShardInput{ShardID: partitionShard})
@@ -712,7 +718,14 @@ func waitsForStatus(ctx context.Context, workflow Workflow, status InstanceStatu
 	if status.Status != "running" || status.Phase == nil {
 		return nil, nil
 	}
-	return workflow.MaterializeWaits(ctx, status.Common, *status.Phase, now)
+	waits, err := workflow.MaterializeWaits(ctx, status.Common, *status.Phase, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateDurableWaits(waits); err != nil {
+		return nil, err
+	}
+	return waits, nil
 }
 
 func snapshotFromInstance(instance PersistedInstance) InstanceStatus {
@@ -1013,6 +1026,9 @@ func (c *Context) ChildStart(ctx context.Context, key string, workflow Workflow,
 	partitionShard := WorkflowPartitionShard(workflowID, runID, c.shardCount)
 	waits, err := workflow.MaterializeWaits(ctx, start.Common, start.Phase, now)
 	if err != nil {
+		return ChildHandleAny{}, err
+	}
+	if err := ValidateDurableWaits(waits); err != nil {
 		return ChildHandleAny{}, err
 	}
 	if options.ParentClosePolicy == "" {

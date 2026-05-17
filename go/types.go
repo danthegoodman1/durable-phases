@@ -182,6 +182,8 @@ type DurableWait struct {
 	ReadyAt             time.Time      `json:"readyAt,omitempty"`
 	Type                string         `json:"type,omitempty"`
 	Scope               string         `json:"scope,omitempty"`
+	Handler             string         `json:"handler,omitempty"`
+	Meta                JSON           `json:"meta,omitempty"`
 	Delivery            SignalDelivery `json:"delivery,omitempty"`
 	AfterSignalSequence *int64         `json:"afterSignalSequence,omitempty"`
 	FireAt              time.Time      `json:"fireAt,omitempty"`
@@ -200,6 +202,8 @@ const (
 
 type SignalWaitOptions struct {
 	Delivery SignalDelivery
+	Handler  string
+	Meta     JSON
 }
 
 func RunWait(readyAt time.Time) DurableWait {
@@ -215,7 +219,7 @@ func SignalWaitWithOptions(name, typ string, global bool, options SignalWaitOpti
 	if global {
 		scope = "global"
 	}
-	return DurableWait{Kind: "signal", Name: name, Type: typ, Scope: scope, Delivery: options.Delivery}
+	return DurableWait{Kind: "signal", Name: name, Type: typ, Scope: scope, Handler: options.Handler, Meta: options.Meta, Delivery: options.Delivery}
 }
 
 func TimerWait(name string, fireAt time.Time) DurableWait {
@@ -421,14 +425,15 @@ type Workflow interface {
 }
 
 type ReadyEvent struct {
-	Kind            string      `json:"kind"`
-	SignalID        string      `json:"signalId,omitempty"`
-	Payload         JSON        `json:"payload,omitempty"`
-	OccurredAt      time.Time   `json:"occurredAt"`
-	ConsumeSignalID string      `json:"consumeSignalId,omitempty"`
-	FiredAt         time.Time   `json:"firedAt,omitempty"`
-	ChildRecordID   string      `json:"childRecordId,omitempty"`
-	Event           *ChildEvent `json:"event,omitempty"`
+	Kind            string       `json:"kind"`
+	SignalID        string       `json:"signalId,omitempty"`
+	Payload         JSON         `json:"payload,omitempty"`
+	OccurredAt      time.Time    `json:"occurredAt"`
+	ConsumeSignalID string       `json:"consumeSignalId,omitempty"`
+	FiredAt         time.Time    `json:"firedAt,omitempty"`
+	ChildRecordID   string       `json:"childRecordId,omitempty"`
+	Event           *ChildEvent  `json:"event,omitempty"`
+	Wait            *DurableWait `json:"wait,omitempty"`
 }
 
 type CreateInstanceInput struct {
@@ -882,6 +887,41 @@ func SafeID(value string) string {
 
 func ValidateSignalPayload[T any](payload any) (T, error) {
 	return DecodeJSON[T](payload)
+}
+
+func SignalWaitHandler(wait DurableWait) string {
+	if wait.Handler != "" {
+		return wait.Handler
+	}
+	return wait.Name
+}
+
+func WaitMeta[T any](event ReadyEvent) (T, error) {
+	var out T
+	if event.Wait == nil {
+		return out, fmt.Errorf("ready event has no durable wait")
+	}
+	return DecodeJSON[T](event.Wait.Meta)
+}
+
+func ValidateDurableWaits(waits []DurableWait) error {
+	seenSignalTypes := map[string]struct{}{}
+	for _, wait := range waits {
+		if wait.Kind != "signal" {
+			continue
+		}
+		if wait.Name == "" {
+			return fmt.Errorf("signal wait name must be non-empty")
+		}
+		if wait.Type == "" {
+			return fmt.Errorf("signal wait %s type must be non-empty", wait.Name)
+		}
+		if _, ok := seenSignalTypes[wait.Type]; ok {
+			return fmt.Errorf("duplicate active signal type %s", wait.Type)
+		}
+		seenSignalTypes[wait.Type] = struct{}{}
+	}
+	return nil
 }
 
 func Errf(format string, args ...any) error {

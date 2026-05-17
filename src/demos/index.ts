@@ -1,6 +1,7 @@
 import { pathToFileURL } from "node:url"
 import { runChildWorkflowDemo } from "./child-workflow.js"
 import { runCustomRunnerDemo } from "./custom-runner.js"
+import { runDynamicSignalsDemo } from "./dynamic-signals.js"
 import { runImmediateAndSignalDemo } from "./immediate-and-signal.js"
 import { runMigrationDemo } from "./migration.js"
 import { runStayLoopDemo } from "./stay-loop.js"
@@ -8,6 +9,7 @@ import { runTimerStayRestartDemo } from "./timer-stay-restart.js"
 
 export async function runAllDemos(): Promise<void> {
   await runImmediateAndSignalDemo()
+  await runDynamicSignalsDemo()
   await runTimerStayRestartDemo()
   await runStayLoopDemo()
   await runCustomRunnerDemo()

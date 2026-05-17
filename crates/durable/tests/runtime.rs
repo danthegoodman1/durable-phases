@@ -170,6 +170,83 @@ pub struct FutureSignalEvent {
     value: i32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerInput {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerOutput {
+    first: String,
+    second: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerOne {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerTwo {
+    first: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerTextEvent {
+    value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameHandlerNumberEvent {
+    value: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicSignalInput {
+    job_id: String,
+    approvers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicSignalOutput {
+    provider_status: String,
+    approvals: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicSignalState {
+    job_id: String,
+    pending: Vec<String>,
+    approvals: HashMap<String, String>,
+    provider_status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderResultEvent {
+    status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalEvent {
+    decision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DuplicateDynamicState {
+    pending: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicFutureInput {
+    job_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicFutureBoot {
+    job_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DynamicFutureWaiting {
+    job_id: String,
+}
+
 workflow! {
     pub workflow FutureSignalMacroWorkflow {
         name: "future_signal_macro",
@@ -195,6 +272,190 @@ workflow! {
             on {
                 finish: signal<FutureSignalEvent>(delivery = future) async |event| {
                     complete!(FutureSignalOutput { value: event.value })
+                },
+            }
+        }
+    }
+}
+
+workflow! {
+    pub workflow SameHandlerAcrossPhasesWorkflow {
+        name: "same_handler_across_phases",
+        version: 1,
+        input: SameHandlerInput,
+        output: SameHandlerOutput,
+        common: Empty,
+
+        initial(_input) {
+            start! {
+                common: Empty {},
+                phase: one(SameHandlerOne {}),
+            }
+        }
+
+        phase one(_data: SameHandlerOne) {
+            on {
+                finish: signal<SameHandlerTextEvent> async |event| {
+                    go!(two(SameHandlerTwo { first: event.value }))
+                },
+            }
+        }
+
+        phase two(data: SameHandlerTwo) {
+            on {
+                finish: signal<SameHandlerNumberEvent> async |data, event| {
+                    complete!(SameHandlerOutput {
+                        first: data.first,
+                        second: event.value,
+                    })
+                },
+            }
+        }
+    }
+}
+
+workflow! {
+    pub workflow DynamicSignalWorkflow {
+        name: "dynamic_signal_workflow",
+        version: 1,
+        input: DynamicSignalInput,
+        output: DynamicSignalOutput,
+        common: Empty,
+
+        initial(input) {
+            start! {
+                common: Empty {},
+                phase: waiting(DynamicSignalState {
+                    job_id: input.job_id,
+                    pending: input.approvers,
+                    approvals: HashMap::new(),
+                    provider_status: "pending".to_string(),
+                }),
+            }
+        }
+
+        phase waiting(data: DynamicSignalState) {
+            on {
+                provider_result: signal<ProviderResultEvent> {
+                    name: format!("provider:{}", data.job_id),
+                    type: format!("provider_result:{}", data.job_id),
+                    meta: data.job_id.clone(),
+                } async |ctx, data, event, wait| {
+                    let job_id: String = ctx.wait_meta()?;
+                    assert_eq!(job_id, data.job_id);
+                    assert_eq!(
+                        wait,
+                        durable::DurableWait::Signal {
+                            name: format!("provider:{}", data.job_id),
+                            r#type: format!("provider_result:{}", data.job_id),
+                            scope: durable::WaitScope::Phase,
+                            handler: Some("provider_result".to_string()),
+                            meta: Some(serde_json::json!(data.job_id.clone())),
+                            delivery: durable::SignalDelivery::Mailbox,
+                            after_signal_sequence: None,
+                        }
+                    );
+                    durable::stay!(waiting(DynamicSignalState {
+                        provider_status: event.status,
+                        ..data
+                    }))
+                },
+
+                for approver_id in data.pending.clone() {
+                    approval: signal<ApprovalEvent> {
+                        name: format!("approval:{approver_id}"),
+                        type: format!("approval:{approver_id}"),
+                        meta: approver_id.clone(),
+                    } async |ctx, data, event| {
+                        let approver_id: String = ctx.wait_meta()?;
+                        let mut approvals = data.approvals;
+                        approvals.insert(approver_id.clone(), event.decision);
+                        let pending = data
+                            .pending
+                            .into_iter()
+                            .filter(|id| id != &approver_id)
+                            .collect::<Vec<_>>();
+                        if pending.is_empty() {
+                            durable::complete!(DynamicSignalOutput {
+                                provider_status: data.provider_status,
+                                approvals,
+                            })
+                        } else {
+                            durable::stay!(waiting(DynamicSignalState {
+                                job_id: data.job_id,
+                                pending,
+                                approvals,
+                                provider_status: data.provider_status,
+                            }))
+                        }
+                    },
+                },
+            }
+        }
+    }
+}
+
+workflow! {
+    pub workflow DynamicFutureSignalWorkflow {
+        name: "dynamic_future_signal_workflow",
+        version: 1,
+        input: DynamicFutureInput,
+        output: FutureSignalOutput,
+        common: Empty,
+
+        initial(input) {
+            start! {
+                common: Empty {},
+                phase: boot(DynamicFutureBoot { job_id: input.job_id }),
+            }
+        }
+
+        phase boot(data: DynamicFutureBoot) {
+            run async |data| {
+                go!(waiting(DynamicFutureWaiting { job_id: data.job_id }))
+            }
+        }
+
+        phase waiting(data: DynamicFutureWaiting) {
+            on {
+                done: signal<FutureSignalEvent> {
+                    type: format!("done:{}", data.job_id),
+                    delivery: future,
+                } async |event| {
+                    complete!(FutureSignalOutput { value: event.value })
+                },
+            }
+        }
+    }
+}
+
+workflow! {
+    pub workflow DuplicateDynamicSignalWorkflow {
+        name: "duplicate_dynamic_signal_workflow",
+        version: 1,
+        input: Empty,
+        output: Empty,
+        common: Empty,
+
+        initial(_input) {
+            start! {
+                common: Empty {},
+                phase: waiting(DuplicateDynamicState {
+                    pending: vec!["a".to_string(), "b".to_string()],
+                }),
+            }
+        }
+
+        phase waiting(data: DuplicateDynamicState) {
+            on {
+                for approver_id in data.pending.clone() {
+                    approval: signal<ApprovalEvent> {
+                        name: format!("approval:{approver_id}"),
+                        type: "approval".to_string(),
+                        meta: approver_id.clone(),
+                    } async |_event| {
+                        durable::stay!(waiting(data))
+                    },
                 },
             }
         }
@@ -317,6 +578,8 @@ fn mailbox_signal_wait(name: &str, signal_type: &str) -> DurableWait {
         name: name.to_string(),
         r#type: signal_type.to_string(),
         scope: durable::WaitScope::Phase,
+        handler: None,
+        meta: None,
         delivery: durable::SignalDelivery::Mailbox,
         after_signal_sequence: None,
     }
@@ -1229,6 +1492,264 @@ async fn workflow_macro_supports_future_only_signal_waits() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn workflow_macro_dispatches_same_signal_handler_name_by_phase() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+
+    let ref_ = runtime
+        .start::<SameHandlerAcrossPhasesWorkflow>(
+            SameHandlerInput {},
+            StartOptions {
+                workflow_id: Some("same-handler-across-phases".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .signal(
+            &ref_,
+            "finish",
+            SameHandlerTextEvent {
+                value: "first".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime.drain(DrainOptions::default()).await.unwrap();
+    let second_phase = load_runtime_instance(&runtime, &ref_).await;
+    assert_eq!(second_phase.phase.as_ref().unwrap().name, "two");
+
+    runtime
+        .signal(&ref_, "finish", SameHandlerNumberEvent { value: 7 })
+        .await
+        .unwrap();
+    runtime.drain(DrainOptions::default()).await.unwrap();
+    let completed = load_runtime_instance(&runtime, &ref_).await;
+    assert_eq!(completed.status, PersistedStatus::Completed);
+    let output = completed.output.as_ref().unwrap();
+    assert_eq!(output["first"], "first");
+    assert_eq!(output["second"], 7);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn workflow_macro_supports_dynamic_signal_waits_and_metadata() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let first = make_runtime(&path, &clock);
+
+    let ref_ = first
+        .start::<DynamicSignalWorkflow>(
+            DynamicSignalInput {
+                job_id: "job-1".to_string(),
+                approvers: vec!["ada".to_string(), "grace".to_string()],
+            },
+            StartOptions {
+                workflow_id: Some("dynamic-signal-workflow".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let initial = load_runtime_instance(&first, &ref_).await;
+    assert!(initial.waits.iter().any(|wait| {
+        matches!(
+            wait,
+            DurableWait::Signal {
+                name,
+                r#type,
+                handler: Some(handler),
+                meta: Some(meta),
+                ..
+            } if name == "provider:job-1"
+                && r#type == "provider_result:job-1"
+                && handler == "provider_result"
+                && meta == &serde_json::json!("job-1")
+        )
+    }));
+    assert!(initial.waits.iter().any(|wait| {
+        matches!(
+            wait,
+            DurableWait::Signal {
+                name,
+                r#type,
+                handler: Some(handler),
+                meta: Some(meta),
+                ..
+            } if name == "approval:ada"
+                && r#type == "approval:ada"
+                && handler == "approval"
+                && meta == &serde_json::json!("ada")
+        )
+    }));
+
+    let restarted = make_runtime(&path, &clock);
+    restarted.register::<DynamicSignalWorkflow>().unwrap();
+    restarted
+        .signal(
+            &ref_,
+            "provider_result:job-1",
+            ProviderResultEvent {
+                status: "ready".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    restarted.drain(DrainOptions::default()).await.unwrap();
+    restarted
+        .signal(
+            &ref_,
+            "approval:ada",
+            ApprovalEvent {
+                decision: "yes".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    restarted.drain(DrainOptions::default()).await.unwrap();
+    let running = load_runtime_instance(&restarted, &ref_).await;
+    assert_eq!(running.status, PersistedStatus::Running);
+    assert!(
+        !running.waits.iter().any(|wait| {
+            matches!(wait, DurableWait::Signal { r#type, .. } if r#type == "approval:ada")
+        }),
+        "waits after ada approval: {:?}",
+        running.waits
+    );
+
+    restarted
+        .signal(
+            &ref_,
+            "approval:grace",
+            ApprovalEvent {
+                decision: "yes".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    restarted.drain(DrainOptions::default()).await.unwrap();
+    let completed = load_runtime_instance(&restarted, &ref_).await;
+    assert_eq!(completed.status, PersistedStatus::Completed);
+    assert_eq!(
+        completed.output.as_ref().unwrap()["provider_status"],
+        "ready"
+    );
+    assert_eq!(
+        completed.output.as_ref().unwrap()["approvals"]["ada"],
+        "yes"
+    );
+    assert_eq!(
+        completed.output.as_ref().unwrap()["approvals"]["grace"],
+        "yes"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn workflow_macro_rejects_duplicate_dynamic_signal_types() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+
+    let error = runtime
+        .start::<DuplicateDynamicSignalWorkflow>(
+            Empty {},
+            StartOptions {
+                workflow_id: Some("duplicate-dynamic-signals".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .message
+        .contains("duplicate active signal type approval"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn workflow_macro_preserves_future_cursors_for_dynamic_signal_waits() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let clock = ManualClock::new();
+    let runtime = make_runtime(&path, &clock);
+
+    let ref_ = runtime
+        .start::<DynamicFutureSignalWorkflow>(
+            DynamicFutureInput {
+                job_id: "job-1".to_string(),
+            },
+            StartOptions {
+                workflow_id: Some("dynamic-future-signal".to_string()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let old_signal = runtime
+        .provider()
+        .append_signal(AppendSignalInput {
+            workflow_id: ref_.workflow_id.clone(),
+            run_id: ref_.run_id.clone(),
+            r#type: "done:job-1".to_string(),
+            payload: serde_json::json!({ "value": 1 }),
+            received_at: clock.now(),
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+
+    runtime
+        .drain(DrainOptions {
+            max_activations: Some(1),
+        })
+        .await
+        .unwrap();
+    let waiting = load_runtime_instance(&runtime, &ref_).await;
+    match &waiting.waits[0] {
+        DurableWait::Signal {
+            r#type,
+            delivery,
+            after_signal_sequence,
+            ..
+        } => {
+            assert_eq!(r#type, "done:job-1");
+            assert_eq!(*delivery, durable::SignalDelivery::Future);
+            assert_eq!(*after_signal_sequence, Some(1));
+        }
+        other => panic!("expected dynamic future signal wait, got {:?}", other),
+    }
+
+    let drained = runtime.drain(DrainOptions::default()).await.unwrap();
+    assert_eq!(drained.activations, 0);
+    runtime
+        .signal(&ref_, "done:job-1", FutureSignalEvent { value: 2 })
+        .await
+        .unwrap();
+    runtime.drain(DrainOptions::default()).await.unwrap();
+    let completed = load_runtime_instance(&runtime, &ref_).await;
+    assert_eq!(completed.status, PersistedStatus::Completed);
+    assert_eq!(completed.output.unwrap()["value"], 2);
+    assert_eq!(
+        runtime_signals(&runtime)
+            .await
+            .iter()
+            .find(|signal| signal.signal_id == old_signal.signal_id)
+            .unwrap()
+            .consumed_by_sequence,
+        None
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn uses_checkpoint_for_bounded_loop_pattern() {
     let _guard = TEST_LOCK.lock().unwrap();
     parent_child::reset_processed();
@@ -1571,6 +2092,8 @@ async fn sqlite_provider_recovers_from_snapshot_plus_journal_tail() {
                 name: "continue".to_string(),
                 r#type: "continue".to_string(),
                 scope: durable::WaitScope::Phase,
+                handler: None,
+                meta: None,
                 delivery: durable::SignalDelivery::Mailbox,
                 after_signal_sequence: None,
             }],
@@ -2842,6 +3365,8 @@ async fn shard_directory_routes_signals_to_custom_partition_shard() {
                 name: "continue".to_string(),
                 r#type: "continue".to_string(),
                 scope: durable::WaitScope::Phase,
+                handler: None,
+                meta: None,
                 delivery: durable::SignalDelivery::Mailbox,
                 after_signal_sequence: None,
             }],

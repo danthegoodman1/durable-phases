@@ -103,6 +103,140 @@ func (w directSignalWorkflow) Migrate(context.Context, int, durable.MigrationArg
 	return nil, nil
 }
 
+type dynamicSignalWorkflow struct{}
+
+type dynamicSignalState struct {
+	JobID          string            `json:"jobId"`
+	Pending        []string          `json:"pending"`
+	Approvals      map[string]string `json:"approvals"`
+	ProviderStatus string            `json:"providerStatus"`
+}
+
+func (w dynamicSignalWorkflow) Name() string { return "dynamic_signal_workflow" }
+func (w dynamicSignalWorkflow) Version() int { return 1 }
+func (w dynamicSignalWorkflow) Initial(_ context.Context, input durable.JSON) (durable.Start, error) {
+	raw, err := durable.DecodeJSON[struct {
+		JobID     string   `json:"jobId"`
+		Approvers []string `json:"approvers"`
+	}](input)
+	if err != nil {
+		return durable.Start{}, err
+	}
+	return durable.Start{Phase: durable.PhaseSnapshot{Name: "waiting", Data: dynamicSignalState{
+		JobID: raw.JobID, Pending: raw.Approvers, Approvals: map[string]string{}, ProviderStatus: "pending",
+	}}}, nil
+}
+func (w dynamicSignalWorkflow) MaterializeWaits(_ context.Context, _ durable.JSON, phase durable.PhaseSnapshot, _ time.Time) ([]durable.DurableWait, error) {
+	if phase.Name != "waiting" {
+		return nil, nil
+	}
+	data, err := durable.DecodeJSON[dynamicSignalState](phase.Data)
+	if err != nil {
+		return nil, err
+	}
+	waits := []durable.DurableWait{
+		durable.SignalWaitWithOptions(
+			"provider:"+data.JobID,
+			"provider_result:"+data.JobID,
+			false,
+			durable.SignalWaitOptions{Handler: "provider_result", Meta: map[string]any{"jobId": data.JobID}},
+		),
+	}
+	for _, approverID := range data.Pending {
+		waits = append(waits, durable.SignalWaitWithOptions(
+			"approval:"+approverID,
+			"approval:"+approverID,
+			false,
+			durable.SignalWaitOptions{Handler: "approval", Meta: approverID},
+		))
+	}
+	return waits, nil
+}
+func (w dynamicSignalWorkflow) DispatchRun(context.Context, *durable.Context, durable.JSON, durable.PhaseSnapshot) (durable.Transition, error) {
+	return durable.Fail(durable.Errf("unexpected run")), nil
+}
+func (w dynamicSignalWorkflow) DispatchEvent(_ context.Context, _ *durable.Context, _ durable.JSON, phase durable.PhaseSnapshot, waitName string, event durable.ReadyEvent) (durable.Transition, error) {
+	data, err := durable.DecodeJSON[dynamicSignalState](phase.Data)
+	if err != nil {
+		return durable.Transition{}, err
+	}
+	switch waitName {
+	case "provider_result":
+		meta, err := durable.WaitMeta[map[string]string](event)
+		if err != nil {
+			return durable.Transition{}, err
+		}
+		payload, err := durable.DecodeJSON[struct {
+			Status string `json:"status"`
+		}](event.Payload)
+		if err != nil {
+			return durable.Transition{}, err
+		}
+		if meta["jobId"] != data.JobID {
+			return durable.Fail(durable.Errf("unexpected provider meta")), nil
+		}
+		data.ProviderStatus = payload.Status
+		return durable.Stay(durable.PhaseSnapshot{Name: "waiting", Data: data}), nil
+	case "approval":
+		approverID, err := durable.WaitMeta[string](event)
+		if err != nil {
+			return durable.Transition{}, err
+		}
+		payload, err := durable.DecodeJSON[struct {
+			Decision string `json:"decision"`
+		}](event.Payload)
+		if err != nil {
+			return durable.Transition{}, err
+		}
+		data.Approvals[approverID] = payload.Decision
+		nextPending := data.Pending[:0]
+		for _, id := range data.Pending {
+			if id != approverID {
+				nextPending = append(nextPending, id)
+			}
+		}
+		data.Pending = nextPending
+		if len(data.Pending) == 0 {
+			return durable.Complete(map[string]any{"providerStatus": data.ProviderStatus, "approvals": data.Approvals}), nil
+		}
+		return durable.Stay(durable.PhaseSnapshot{Name: "waiting", Data: data}), nil
+	default:
+		return durable.Fail(durable.Errf("unexpected wait %s", waitName)), nil
+	}
+}
+func (w dynamicSignalWorkflow) Query(context.Context, string, durable.QueryContext) (durable.JSON, error) {
+	return nil, nil
+}
+func (w dynamicSignalWorkflow) Migrate(context.Context, int, durable.MigrationArgs) (*durable.MigrationResult, error) {
+	return nil, nil
+}
+
+type duplicateDynamicSignalWorkflow struct{}
+
+func (w duplicateDynamicSignalWorkflow) Name() string { return "duplicate_dynamic_signal_workflow" }
+func (w duplicateDynamicSignalWorkflow) Version() int { return 1 }
+func (w duplicateDynamicSignalWorkflow) Initial(context.Context, durable.JSON) (durable.Start, error) {
+	return durable.Start{Phase: durable.PhaseSnapshot{Name: "waiting", Data: map[string]any{}}}, nil
+}
+func (w duplicateDynamicSignalWorkflow) MaterializeWaits(context.Context, durable.JSON, durable.PhaseSnapshot, time.Time) ([]durable.DurableWait, error) {
+	return []durable.DurableWait{
+		durable.SignalWaitWithOptions("approval:a", "approval", false, durable.SignalWaitOptions{Handler: "approval", Meta: "a"}),
+		durable.SignalWaitWithOptions("approval:b", "approval", false, durable.SignalWaitOptions{Handler: "approval", Meta: "b"}),
+	}, nil
+}
+func (w duplicateDynamicSignalWorkflow) DispatchRun(context.Context, *durable.Context, durable.JSON, durable.PhaseSnapshot) (durable.Transition, error) {
+	return durable.Fail(durable.Errf("unexpected run")), nil
+}
+func (w duplicateDynamicSignalWorkflow) DispatchEvent(context.Context, *durable.Context, durable.JSON, durable.PhaseSnapshot, string, durable.ReadyEvent) (durable.Transition, error) {
+	return durable.Fail(durable.Errf("unexpected event")), nil
+}
+func (w duplicateDynamicSignalWorkflow) Query(context.Context, string, durable.QueryContext) (durable.JSON, error) {
+	return nil, nil
+}
+func (w duplicateDynamicSignalWorkflow) Migrate(context.Context, int, durable.MigrationArgs) (*durable.MigrationResult, error) {
+	return nil, nil
+}
+
 func forceTerminal(t *testing.T, ctx context.Context, provider durable.DurabilityProvider, ref durable.InstanceRef, next durable.InstanceStatus, now time.Time) {
 	t.Helper()
 	instance, err := provider.LoadInstance(ctx, ref, durable.LoadInstanceOptions{})
@@ -157,6 +291,15 @@ func forceTerminal(t *testing.T, ctx context.Context, provider durable.Durabilit
 	if !result.OK {
 		t.Fatalf("terminal commit failed: %#v", result)
 	}
+}
+
+func hasSignalWait(waits []durable.DurableWait, name, typ, handler string) bool {
+	for _, wait := range waits {
+		if wait.Kind == "signal" && wait.Name == name && wait.Type == typ && durable.SignalWaitHandler(wait) == handler {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRuntimeSignalFlowAndQuery(t *testing.T) {
@@ -318,6 +461,99 @@ func TestRuntimeStartSendSignal(t *testing.T) {
 	}
 	if instance.Status != "completed" || instance.Output.(map[string]any)["value"] != "early" {
 		t.Fatalf("early completed = %#v", instance)
+	}
+}
+
+func TestRuntimeDynamicSignalWaits(t *testing.T) {
+	ctx := context.Background()
+	clock := &manualClock{now: t0}
+	path := filepath.Join(t.TempDir(), "dynamic.sqlite")
+	provider, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := durable.NewRuntime(provider, durable.RuntimeOptions{WorkerID: "dynamic-a", Clock: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := dynamicSignalWorkflow{}
+	ref, err := runtime.Start(ctx, workflow, map[string]any{
+		"jobId":     "job-1",
+		"approvers": []string{"ada", "grace"},
+	}, durable.StartOptions{WorkflowID: "dynamic-signals"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := provider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSignalWait(instance.Waits, "provider:job-1", "provider_result:job-1", "provider_result") {
+		t.Fatalf("missing provider wait: %#v", instance.Waits)
+	}
+	if !hasSignalWait(instance.Waits, "approval:ada", "approval:ada", "approval") {
+		t.Fatalf("missing approval wait: %#v", instance.Waits)
+	}
+
+	restartedProvider, err := sqliteprovider.New(path, sqliteprovider.Options{SnapshotInterval: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := durable.NewRuntime(restartedProvider, durable.RuntimeOptions{
+		WorkerID:  "dynamic-b",
+		Clock:     clock.Now,
+		Workflows: []durable.Workflow{workflow},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Signal(ctx, workflow, ref, "provider_result:job-1", map[string]any{"status": "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Drain(ctx, durable.DrainOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Signal(ctx, workflow, ref, "approval:ada", map[string]any{"decision": "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Drain(ctx, durable.DrainOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := restartedProvider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasSignalWait(running.Waits, "approval:ada", "approval:ada", "approval") {
+		t.Fatalf("approval:ada wait still active: %#v", running.Waits)
+	}
+	if _, err := restarted.Signal(ctx, workflow, ref, "approval:grace", map[string]any{"decision": "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Drain(ctx, durable.DrainOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := restartedProvider.LoadInstance(ctx, ref.InstanceRef, durable.LoadInstanceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != "completed" {
+		t.Fatalf("status = %s, instance = %#v", completed.Status, completed)
+	}
+	output := completed.Output.(map[string]any)
+	if output["providerStatus"] != "ready" {
+		t.Fatalf("output = %#v", output)
+	}
+}
+
+func TestRuntimeRejectsDuplicateDynamicSignalTypes(t *testing.T) {
+	ctx := context.Background()
+	runtime, err := durable.NewRuntime(shardengine.New(), durable.RuntimeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runtime.Start(ctx, duplicateDynamicSignalWorkflow{}, map[string]any{}, durable.StartOptions{WorkflowID: "duplicate-dynamic"})
+	if err == nil || !strings.Contains(err.Error(), "duplicate active signal type approval") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

@@ -1229,6 +1229,12 @@ func (p *Provider) insertTaskLocked(instance durable.PersistedInstance, input ta
 	}
 	if input.wait != nil {
 		task.WaitName = input.wait.Name
+		if input.wait.Kind == "signal" {
+			task.WaitName = durable.SignalWaitHandler(*input.wait)
+		}
+		if task.Event != nil {
+			task.Event.Wait = clonePtr(input.wait)
+		}
 	}
 	p.tasks[taskID] = task
 	addIndex(p.taskIDsByRef, refKey(task.WorkflowID, task.RunID), taskID)

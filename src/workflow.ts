@@ -120,6 +120,7 @@ export type HandlerArgs<Event = unknown> = {
   common: any
   data: any
   event: Event
+  wait?: SignalWaitInfo
 }
 
 export type RunArgs = {
@@ -156,9 +157,40 @@ export type SignalWaitOptions = {
   delivery?: SignalDelivery
 }
 
+export type WaitSelectorArgs = {
+  common: any
+  data: any
+}
+
+export type WaitSelector<T> = T | ((args: WaitSelectorArgs) => T)
+
+export type SignalWaitInfo = {
+  kind: "signal"
+  name: string
+  type: string
+  scope: "phase" | "global"
+  handler: string
+  delivery?: SignalDelivery
+  meta?: JsonValue
+}
+
 export type SignalWait<Event = unknown> = {
   kind: "signal"
   schema: Schema<Event>
+  name?: WaitSelector<string>
+  type?: WaitSelector<string>
+  meta?: JsonValue | ((args: WaitSelectorArgs) => unknown)
+  delivery?: SignalDelivery
+  handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand
+}
+
+export type SignalEachWait<Event = unknown, Item = unknown> = {
+  kind: "signal_each"
+  schema: Schema<Event>
+  items: (args: WaitSelectorArgs) => Iterable<Item>
+  name: (item: Item, args: WaitSelectorArgs) => string
+  type: (item: Item, args: WaitSelectorArgs) => string
+  meta?: (item: Item, args: WaitSelectorArgs) => unknown
   delivery?: SignalDelivery
   handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand
 }
@@ -175,7 +207,7 @@ export type ChildWait = {
   handler: (args: HandlerArgs<ChildEvent>) => Promise<TransitionCommand> | TransitionCommand
 }
 
-export type WaitDefinition = SignalWait<any> | TimerWait | ChildWait
+export type WaitDefinition = SignalWait<any> | SignalEachWait<any, any> | TimerWait | ChildWait
 
 export type PhaseDefinition = {
   state: Schema<any>
@@ -267,13 +299,68 @@ export function phase(definition: {
   }
 }
 
-export function signal<Event>(
-  schema: Schema<Event>,
-  handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand,
-  options: SignalWaitOptions = {},
-): SignalWait<Event> {
-  return { kind: "signal", schema, handler, delivery: options.delivery }
+export type DynamicSignalDefinition<Event> = SignalWaitOptions & {
+  schema: Schema<Event>
+  name?: WaitSelector<string>
+  type: WaitSelector<string>
+  meta?: JsonValue | ((args: WaitSelectorArgs) => unknown)
+  handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand
 }
+
+export type SignalEachDefinition<Event, Item> = SignalWaitOptions & {
+  items: (args: WaitSelectorArgs) => Iterable<Item>
+  schema: Schema<Event>
+  name: (item: Item, args: WaitSelectorArgs) => string
+  type: (item: Item, args: WaitSelectorArgs) => string
+  meta?: (item: Item, args: WaitSelectorArgs) => unknown
+  handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand
+}
+
+type SignalFunction = {
+  <Event>(
+    schema: Schema<Event>,
+    handler: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand,
+    options?: SignalWaitOptions,
+  ): SignalWait<Event>
+  <Event>(definition: DynamicSignalDefinition<Event>): SignalWait<Event>
+  each<Event, Item>(definition: SignalEachDefinition<Event, Item>): SignalEachWait<Event, Item>
+}
+
+const signalImpl = <Event>(
+  schemaOrDefinition: Schema<Event> | DynamicSignalDefinition<Event>,
+  handler?: (args: HandlerArgs<Event>) => Promise<TransitionCommand> | TransitionCommand,
+  options: SignalWaitOptions = {},
+): SignalWait<Event> => {
+  if (handler) {
+    return { kind: "signal", schema: schemaOrDefinition as Schema<Event>, handler, delivery: options.delivery }
+  }
+
+  const definition = schemaOrDefinition as DynamicSignalDefinition<Event>
+  return {
+    kind: "signal",
+    schema: definition.schema,
+    name: definition.name,
+    type: definition.type,
+    meta: definition.meta,
+    delivery: definition.delivery,
+    handler: definition.handler,
+  }
+}
+
+export const signal: SignalFunction = Object.assign(signalImpl, {
+  each<Event, Item>(definition: SignalEachDefinition<Event, Item>): SignalEachWait<Event, Item> {
+    return {
+      kind: "signal_each",
+      schema: definition.schema,
+      items: definition.items,
+      name: definition.name,
+      type: definition.type,
+      meta: definition.meta,
+      delivery: definition.delivery,
+      handler: definition.handler,
+    }
+  },
+})
 
 export function timer(
   selector: (args: { common: any; data: any }) => string | null,

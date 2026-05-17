@@ -8,6 +8,7 @@ import (
 
 var examples = []string{
 	"immediate-and-signal",
+	"dynamic-signals",
 	"timer-stay-restart",
 	"stay-loop",
 	"child-workflow",

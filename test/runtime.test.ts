@@ -1001,6 +1001,298 @@ describe("durable workflow PoC", () => {
     await expect(provider.listSignals()).resolves.toEqual([])
   })
 
+  it("materializes dynamic signal names, types, fanout, and metadata across restart", async () => {
+    const path = await storePath()
+    const firstProvider = testProvider(path)
+    const DynamicSignalsWorkflow = defineWorkflow({
+      name: "dynamic_signals",
+      version: 1,
+      input: z.object({ jobId: z.string(), approvers: z.array(z.string()) }),
+      output: z.object({ providerStatus: z.string(), approvals: z.record(z.string(), z.string()) }),
+      initial(input) {
+        return start({
+          phase: "waiting",
+          data: {
+            jobId: input.jobId,
+            providerStatus: "pending",
+            pending: input.approvers,
+            approvals: {},
+          },
+        })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({
+            jobId: z.string(),
+            providerStatus: z.string(),
+            pending: z.array(z.string()),
+            approvals: z.record(z.string(), z.string()),
+          }),
+          on: {
+            provider_result: signal({
+              schema: z.object({ status: z.string() }),
+              name: ({ data }) => `provider:${data.jobId}`,
+              type: ({ data }) => `provider_result:${data.jobId}`,
+              meta: ({ data }) => ({ kind: "provider", jobId: data.jobId }),
+              handler: async ({ data, event, wait }) => {
+                expect(wait).toMatchObject({
+                  name: `provider:${data.jobId}`,
+                  type: `provider_result:${data.jobId}`,
+                  handler: "provider_result",
+                  meta: { kind: "provider", jobId: data.jobId },
+                })
+                return stay({ providerStatus: event.status })
+              },
+            }),
+            approval: signal.each({
+              items: ({ data }) => data.pending as string[],
+              schema: z.object({ decision: z.string() }),
+              name: (approverId) => `approval:${approverId}`,
+              type: (approverId) => `approval:${approverId}`,
+              handler: async ({ data, event, wait }) => {
+                const approverId = z.string().parse(wait?.meta)
+                const approvals = { ...data.approvals, [approverId]: event.decision }
+                const pending = data.pending.filter((id: string) => id !== approverId)
+                if (pending.length === 0) {
+                  return complete({ providerStatus: data.providerStatus, approvals })
+                }
+                return stay({ pending, approvals })
+              },
+            }),
+          },
+        }),
+      },
+    })
+
+    const firstRuntime = new DurableRuntime(firstProvider)
+    const ref = await firstRuntime.start(DynamicSignalsWorkflow, {
+      jobId: "job-1",
+      approvers: ["ada", "grace"],
+    }, { workflowId: "dynamic-signals" })
+
+    const persisted = await firstProvider.loadInstance(ref)
+    expect(persisted?.waits).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "signal",
+        name: "provider:job-1",
+        type: "provider_result:job-1",
+        handler: "provider_result",
+        meta: { kind: "provider", jobId: "job-1" },
+      }),
+      expect.objectContaining({
+        kind: "signal",
+        name: "approval:ada",
+        type: "approval:ada",
+        handler: "approval",
+        meta: "ada",
+      }),
+    ]))
+
+    const restartedProvider = testProvider(path)
+    const runtime = new DurableRuntime(restartedProvider)
+    await expect(runtime.signal(DynamicSignalsWorkflow, ref, "approval:ada", { decision: 1 }))
+      .rejects.toThrow()
+
+    await runtime.signal(DynamicSignalsWorkflow, ref, "provider_result:job-1", { status: "ready" })
+    await runtime.drain()
+    await runtime.signal(DynamicSignalsWorkflow, ref, "approval:ada", { decision: "yes" })
+    await runtime.drain()
+
+    let running = await restartedProvider.loadInstance(ref)
+    expect(running?.status).toBe("running")
+    expect(running?.waits).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "approval:ada" }),
+    ]))
+
+    await runtime.signal(DynamicSignalsWorkflow, ref, "approval:grace", { decision: "yes" })
+    await runtime.drain()
+    const completed = await restartedProvider.loadInstance(ref)
+    expect(completed?.status).toBe("completed")
+    expect(completed?.output).toEqual({
+      providerStatus: "ready",
+      approvals: { ada: "yes", grace: "yes" },
+    })
+  })
+
+  it("startSendSignal validates existing active dynamic signal waits before persistence", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const DynamicStartSendWorkflow = defineWorkflow({
+      name: "dynamic_start_send_validation",
+      version: 1,
+      input: z.object({ jobId: z.string() }),
+      output: z.object({ status: z.string() }),
+      initial(input) {
+        return start({ phase: "waiting", data: { jobId: input.jobId } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ jobId: z.string() }),
+          on: {
+            provider_result: signal({
+              schema: z.object({ status: z.string() }),
+              type: ({ data }) => `provider_result:${data.jobId}`,
+              handler: async ({ event }) => complete({ status: event.status }),
+            }),
+          },
+        }),
+      },
+    })
+
+    const runtime = new DurableRuntime(provider, { workflows: [DynamicStartSendWorkflow] })
+    const ref = await runtime.start(DynamicStartSendWorkflow, { jobId: "job-1" }, {
+      workflowId: "dynamic-start-send",
+    })
+
+    await expect(
+      runtime.startSendSignal(
+        DynamicStartSendWorkflow,
+        { jobId: "ignored" },
+        "provider_result:job-1",
+        { status: 1 },
+        { workflowId: "dynamic-start-send", idempotencyKey: "invalid" },
+      ),
+    ).rejects.toThrow()
+    await expect(provider.listSignals()).resolves.toEqual([])
+
+    const sent = await runtime.startSendSignal(
+      DynamicStartSendWorkflow,
+      { jobId: "ignored" },
+      "provider_result:job-1",
+      { status: "ready" },
+      { workflowId: "dynamic-start-send", idempotencyKey: "valid" },
+    )
+    expect(sent).toMatchObject({
+      workflowId: "dynamic-start-send",
+      runId: ref.runId,
+      created: false,
+      signal: { payload: { status: "ready" } },
+    })
+    await runtime.drain()
+    expect((await provider.loadInstance(ref))?.output).toEqual({ status: "ready" })
+  })
+
+  it("validates provider-appended dynamic signal payloads at dispatch", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const calls: string[] = []
+    const DynamicDispatchWorkflow = defineWorkflow({
+      name: "dynamic_dispatch_validation",
+      version: 1,
+      input: z.object({ jobId: z.string() }),
+      output: z.object({ status: z.string() }),
+      initial(input) {
+        return start({ phase: "waiting", data: { jobId: input.jobId } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ jobId: z.string() }),
+          on: {
+            provider_result: signal({
+              schema: z.object({ status: z.string() }),
+              type: ({ data }) => `provider_result:${data.jobId}`,
+              handler: async ({ event }) => {
+                calls.push(event.status)
+                return complete({ status: event.status })
+              },
+            }),
+          },
+        }),
+      },
+    })
+
+    const runtime = new DurableRuntime(provider, { workflows: [DynamicDispatchWorkflow] })
+    const ref = await runtime.start(DynamicDispatchWorkflow, { jobId: "job-1" }, {
+      workflowId: "dynamic-dispatch",
+    })
+    await provider.appendSignal({
+      ...ref,
+      type: "provider_result:job-1",
+      payload: { status: 1 },
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    })
+
+    await expect(runtime.drain({ maxActivations: 1 })).rejects.toThrow()
+    expect(calls).toEqual([])
+    expect((await provider.loadInstance(ref))?.status).toBe("running")
+  })
+
+  it("rejects duplicate active dynamic signal types", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const DuplicateWorkflow = defineWorkflow({
+      name: "duplicate_dynamic_signal_types",
+      version: 1,
+      input: z.object({}),
+      output: z.object({}),
+      initial() {
+        return start({ phase: "waiting", data: { pending: ["a", "b"] } })
+      },
+      phases: {
+        waiting: phase({
+          state: z.object({ pending: z.array(z.string()) }),
+          on: {
+            approval: signal.each({
+              items: ({ data }) => data.pending as string[],
+              schema: z.object({}),
+              name: (id) => `approval:${id}`,
+              type: () => "approval",
+              handler: async () => stay(),
+            }),
+          },
+        }),
+      },
+    })
+
+    await expect(new DurableRuntime(provider).start(DuplicateWorkflow, {}))
+      .rejects.toThrow("Duplicate active signal type approval")
+  })
+
+  it("preserves future-delivery cursors for dynamic signal waits", async () => {
+    const path = await storePath()
+    const provider = testProvider(path)
+    const FutureWorkflow = defineWorkflow({
+      name: "dynamic_future_signal",
+      version: 1,
+      input: z.object({ jobId: z.string() }),
+      output: z.object({ value: z.string() }),
+      initial(input) {
+        return start({ phase: "boot", data: { jobId: input.jobId } })
+      },
+      phases: {
+        boot: phase({
+          state: z.object({ jobId: z.string() }),
+          run: async ({ data }) => go("waiting", data),
+        }),
+        waiting: phase({
+          state: z.object({ jobId: z.string() }),
+          on: {
+            done: signal({
+              schema: z.object({ value: z.string() }),
+              type: ({ data }) => `done:${data.jobId}`,
+              delivery: "future",
+              handler: async ({ event }) => complete({ value: event.value }),
+            }),
+          },
+        }),
+      },
+    })
+
+    const runtime = new DurableRuntime(provider)
+    const ref = await runtime.start(FutureWorkflow, { jobId: "job-1" }, { workflowId: "dynamic-future" })
+    await provider.appendSignal({
+      ...ref,
+      type: "done:job-1",
+      payload: { value: "old" },
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    })
+    await runtime.drain()
+    expect((await provider.loadInstance(ref))?.status).toBe("running")
+    await runtime.signal(FutureWorkflow, ref, "done:job-1", { value: "new" })
+    await runtime.drain()
+    expect((await provider.loadInstance(ref))?.output).toEqual({ value: "new" })
+  })
+
   it("emits runtime and provider observability without high-cardinality metric tags", async () => {
     const path = await storePath()
     const observed = observabilityCollector()

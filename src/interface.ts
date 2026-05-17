@@ -19,6 +19,8 @@ export type DurableWait =
       name: string
       type: string
       scope: "phase" | "global"
+      handler?: string
+      meta?: JsonValue
       delivery?: SignalDelivery
       afterSignalSequence?: number
     }

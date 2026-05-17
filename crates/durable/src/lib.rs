@@ -170,6 +170,12 @@ pub enum WaitSpec {
     Signal {
         name: String,
         signal_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<JsonValue>,
         #[serde(default, skip_serializing_if = "SignalDelivery::is_mailbox")]
         delivery: SignalDelivery,
     },
@@ -201,6 +207,9 @@ impl WaitSpec {
         Self::Signal {
             name: name.into(),
             signal_type: type_name::<T>().to_string(),
+            r#type: options.r#type,
+            handler: options.handler,
+            meta: options.meta,
             delivery: options.delivery,
         }
     }
@@ -726,6 +735,7 @@ where
             }
         }
 
+        validate_materialized_waits(&waits)?;
         Ok(waits)
     }
 
@@ -871,6 +881,10 @@ pub enum DurableWait {
         name: String,
         r#type: String,
         scope: WaitScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handler: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<JsonValue>,
         #[serde(default, skip_serializing_if = "SignalDelivery::is_mailbox")]
         delivery: SignalDelivery,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -915,9 +929,12 @@ impl SignalDelivery {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignalWaitOptions {
     pub delivery: SignalDelivery,
+    pub r#type: Option<String>,
+    pub handler: Option<String>,
+    pub meta: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1029,6 +1046,7 @@ struct MemoryTask {
     sequence: u64,
     kind: MemoryTaskKind,
     wait_name: Option<String>,
+    wait: Option<DurableWait>,
     event: Option<ReadyEvent>,
     ready_at: DateTime<Utc>,
     sort_key: String,
@@ -2438,6 +2456,7 @@ impl ShardEngine {
                     sequence: candidate.sequence,
                     activation_time: input.now,
                     wait_name: candidate.wait_name.clone().unwrap_or_default(),
+                    wait: candidate.wait.clone(),
                     event: candidate
                         .event
                         .clone()
@@ -4426,6 +4445,7 @@ fn stamp_signal_waits(
                 scope,
                 delivery,
                 after_signal_sequence,
+                ..
             } = &mut wait
             {
                 if *delivery != SignalDelivery::Future {
@@ -4440,6 +4460,7 @@ fn stamp_signal_waits(
                         scope: previous_scope,
                         delivery: SignalDelivery::Future,
                         after_signal_sequence: Some(previous_after),
+                        ..
                     } if previous_name == name
                         && previous_type == r#type
                         && previous_scope == scope =>
@@ -4547,6 +4568,7 @@ fn refresh_migration_tasks(
                 event_id: format!("migration-{worker_version}"),
                 ready_at: now,
                 wait_name: None,
+                wait: None,
                 event: None,
                 task_suffix: None,
                 sort_key: task_sort_key(&[
@@ -4572,6 +4594,7 @@ fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &
                     event_id: name.clone(),
                     ready_at: *ready_at,
                     wait_name: None,
+                    wait: None,
                     event: None,
                     task_suffix: None,
                     sort_key: task_sort_key(&[
@@ -4593,6 +4616,7 @@ fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &
                     event_id: format!("{}:{}", name, format_time(*fire_at)),
                     ready_at: *fire_at,
                     wait_name: Some(name.clone()),
+                    wait: Some(wait.clone()),
                     event: Some(ReadyEvent::Timer {
                         fired_at: *fire_at,
                         occurred_at: *fire_at,
@@ -4630,7 +4654,8 @@ fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &
                     kind: MemoryTaskKind::Event,
                     event_id: signal.signal_id.clone(),
                     ready_at: signal.received_at,
-                    wait_name: Some(name.clone()),
+                    wait_name: Some(signal_wait_handler(wait)),
+                    wait: Some(wait.clone()),
                     event: Some(ReadyEvent::Signal {
                         signal_id: signal.signal_id.clone(),
                         payload: signal.payload.clone(),
@@ -4689,6 +4714,7 @@ fn insert_task_for_wait(state: &mut Store, instance: &PersistedInstance, wait: &
                     event_id: child.child_record_id.clone(),
                     ready_at: occurred_at,
                     wait_name: Some(name.clone()),
+                    wait: Some(wait.clone()),
                     event: Some(ReadyEvent::Child {
                         child_record_id: child.child_record_id.clone(),
                         occurred_at,
@@ -4724,6 +4750,7 @@ struct InsertTaskInput {
     event_id: String,
     ready_at: DateTime<Utc>,
     wait_name: Option<String>,
+    wait: Option<DurableWait>,
     event: Option<ReadyEvent>,
     task_suffix: Option<String>,
     sort_key: String,
@@ -4762,6 +4789,7 @@ fn insert_task(state: &mut Store, instance: &PersistedInstance, input: InsertTas
             sequence: instance.sequence,
             kind: input.kind,
             wait_name: input.wait_name,
+            wait: input.wait,
             event: input.event,
             ready_at: input.ready_at,
             sort_key: input.sort_key,
@@ -5433,6 +5461,8 @@ pub enum ClaimedActivation {
         sequence: u64,
         activation_time: DateTime<Utc>,
         wait_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<DurableWait>,
         event: ReadyEvent,
         lease_until: DateTime<Utc>,
     },
@@ -6370,6 +6400,7 @@ impl DurableRuntime {
                 instance: claim.instance,
                 activation_id,
                 wait_name: None,
+                wait: None,
                 event: None,
                 lease,
             })),
@@ -6383,6 +6414,7 @@ impl DurableRuntime {
                 instance: claim.instance,
                 activation_id,
                 wait_name: None,
+                wait: None,
                 event: None,
                 lease,
             })),
@@ -6390,6 +6422,7 @@ impl DurableRuntime {
                 activation_id,
                 workflow_name,
                 wait_name,
+                wait,
                 event,
                 ..
             } => Ok(Some(ReadyActivation {
@@ -6398,6 +6431,7 @@ impl DurableRuntime {
                 instance: claim.instance,
                 activation_id,
                 wait_name: Some(wait_name),
+                wait,
                 event: Some(event),
                 lease,
             })),
@@ -6573,6 +6607,7 @@ impl DurableRuntime {
             clock: self.clock.clone(),
             worker_id: self.options.worker_id.clone(),
             shard_count: self.options.shard_count,
+            current_wait: activation.wait.clone(),
         };
 
         let (transition, consume_signal_id, consume_child_record_id) = match activation.kind {
@@ -6858,11 +6893,33 @@ pub struct DurableContext {
     clock: Clock,
     worker_id: String,
     shard_count: u32,
+    current_wait: Option<DurableWait>,
 }
 
 impl DurableContext {
     pub fn now(&self) -> DateTime<Utc> {
         (self.clock)()
+    }
+
+    pub fn wait(&self) -> Option<&DurableWait> {
+        self.current_wait.as_ref()
+    }
+
+    pub fn wait_meta<T>(&self) -> Result<T, WorkflowError>
+    where
+        T: DeserializeOwned,
+    {
+        let wait = self
+            .current_wait
+            .as_ref()
+            .ok_or_else(|| WorkflowError::new("activation has no durable wait"))?;
+        match wait {
+            DurableWait::Signal {
+                meta: Some(meta), ..
+            } => Ok(serde_json::from_value(meta.clone())?),
+            DurableWait::Signal { .. } => Err(WorkflowError::new("signal wait has no metadata")),
+            _ => Err(WorkflowError::new("current wait is not a signal wait")),
+        }
     }
 
     pub async fn activity<T, F, Fut>(&mut self, key: &str, f: F) -> Result<T, WorkflowError>
@@ -7253,6 +7310,7 @@ struct ReadyActivation {
     instance: PersistedInstance,
     activation_id: String,
     wait_name: Option<String>,
+    wait: Option<DurableWait>,
     event: Option<ReadyEvent>,
     lease: ActivationClaimLease,
 }
@@ -7309,13 +7367,25 @@ where
 
 fn wait_spec_to_durable(wait: WaitSpec, scope: WaitScope) -> DurableWait {
     match wait {
-        WaitSpec::Signal { name, delivery, .. } => DurableWait::Signal {
-            r#type: name.clone(),
+        WaitSpec::Signal {
             name,
-            scope,
+            r#type,
+            handler,
+            meta,
             delivery,
-            after_signal_sequence: None,
-        },
+            ..
+        } => {
+            let wait_type = r#type.unwrap_or_else(|| name.clone());
+            DurableWait::Signal {
+                r#type: wait_type,
+                name,
+                scope,
+                handler,
+                meta,
+                delivery,
+                after_signal_sequence: None,
+            }
+        }
         WaitSpec::Timer { name, fire_at } => DurableWait::Timer { name, fire_at },
         WaitSpec::Child {
             name,
@@ -7331,6 +7401,40 @@ fn wait_spec_to_durable(wait: WaitSpec, scope: WaitScope) -> DurableWait {
             run_id,
         },
     }
+}
+
+fn signal_wait_handler(wait: &DurableWait) -> String {
+    match wait {
+        DurableWait::Signal {
+            handler: Some(handler),
+            ..
+        } if !handler.is_empty() => handler.clone(),
+        DurableWait::Signal { name, .. } => name.clone(),
+        _ => String::new(),
+    }
+}
+
+fn validate_materialized_waits(waits: &[DurableWait]) -> Result<(), WorkflowError> {
+    let mut signal_types = BTreeSet::new();
+    for wait in waits {
+        if let DurableWait::Signal { name, r#type, .. } = wait {
+            if name.is_empty() {
+                return Err(WorkflowError::new("signal wait name must be non-empty"));
+            }
+            if r#type.is_empty() {
+                return Err(WorkflowError::new(format!(
+                    "signal wait {name} type must be non-empty"
+                )));
+            }
+            if !signal_types.insert(r#type.clone()) {
+                return Err(WorkflowError::new(format!(
+                    "duplicate active signal type {type_}",
+                    type_ = r#type
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compare_signals(left: &&SignalRecord, right: &&SignalRecord) -> std::cmp::Ordering {
@@ -7947,6 +8051,8 @@ pub mod testing {
                     name: "finish".to_string(),
                     r#type: "finish".to_string(),
                     scope: WaitScope::Phase,
+                    handler: None,
+                    meta: None,
                     delivery: SignalDelivery::Mailbox,
                     after_signal_sequence: None,
                 }],
@@ -8051,6 +8157,8 @@ pub mod testing {
                         name: "finish".to_string(),
                         r#type: "finish".to_string(),
                         scope: WaitScope::Phase,
+                        handler: None,
+                        meta: None,
                         delivery: SignalDelivery::Mailbox,
                         after_signal_sequence: None,
                     }],
@@ -8877,6 +8985,8 @@ pub mod testing {
                     name: "finish".to_string(),
                     r#type: "finish".to_string(),
                     scope: WaitScope::Phase,
+                    handler: None,
+                    meta: None,
                     delivery: SignalDelivery::Mailbox,
                     after_signal_sequence: None,
                 }],
@@ -9168,6 +9278,8 @@ pub mod testing {
                 name: name.to_string(),
                 r#type: name.to_string(),
                 scope: WaitScope::Phase,
+                handler: None,
+                meta: None,
                 delivery: SignalDelivery::Mailbox,
                 after_signal_sequence: None,
             }
@@ -9189,6 +9301,8 @@ pub mod testing {
                 name: name.to_string(),
                 r#type: name.to_string(),
                 scope: WaitScope::Phase,
+                handler: None,
+                meta: None,
                 delivery: SignalDelivery::Future,
                 after_signal_sequence,
             }

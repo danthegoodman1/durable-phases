@@ -2,6 +2,8 @@
 mod child_workflow;
 #[path = "custom-runner.rs"]
 mod custom_runner;
+#[path = "dynamic-signals.rs"]
+mod dynamic_signals;
 #[path = "immediate-and-signal.rs"]
 mod immediate_and_signal;
 #[path = "migration.rs"]
@@ -16,6 +18,7 @@ use durable::WorkflowError;
 #[tokio::main]
 async fn main() -> Result<(), WorkflowError> {
     immediate_and_signal::run_immediate_and_signal_demo().await?;
+    dynamic_signals::run_dynamic_signals_demo().await?;
     timer_stay_restart::run_timer_stay_restart_demo().await?;
     stay_loop::run_stay_loop_demo().await?;
     custom_runner::run_custom_runner_demo().await?;
